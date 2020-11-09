@@ -21,6 +21,7 @@
 
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
+#include "access/xlogarchive.h"
 #include "common/archive.h"
 #include "miscadmin.h"
 #include "postmaster/startup.h"
@@ -63,8 +64,8 @@ RestoreArchivedFile(char *path, const char *xlogfname,
 	TimeLineID	restartTli;
 
 	/*
-	 * Ignore restore_command when not in archive recovery (meaning
-	 * we are in crash recovery).
+	 * Ignore restore_command when not in archive recovery (meaning we are in
+	 * crash recovery).
 	 */
 	if (!ArchiveRecoveryRequested)
 		goto not_available;
@@ -201,10 +202,10 @@ RestoreArchivedFile(char *path, const char *xlogfname,
 				else
 					elevel = FATAL;
 				ereport(elevel,
-						(errmsg("archive file \"%s\" has wrong size: %lu instead of %lu",
+						(errmsg("archive file \"%s\" has wrong size: %lld instead of %lld",
 								xlogfname,
-								(unsigned long) stat_buf.st_size,
-								(unsigned long) expectedSize)));
+								(long long int) stat_buf.st_size,
+								(long long int) expectedSize)));
 				return false;
 			}
 			else
@@ -322,7 +323,7 @@ ExecuteRecoveryCommand(const char *command, const char *commandName, bool failOn
 				case 'r':
 					/* %r: filename of last restartpoint */
 					sp++;
-					StrNCpy(dp, lastRestartPointFname, endp - dp);
+					strlcpy(dp, lastRestartPointFname, endp - dp);
 					dp += strlen(dp);
 					break;
 				case '%':
@@ -571,17 +572,24 @@ XLogArchiveCheckDone(const char *xlog)
 {
 	char		archiveStatusPath[MAXPGPATH];
 	struct stat stat_buf;
-	bool		inRecovery = RecoveryInProgress();
+
+	/* The file is always deletable if archive_mode is "off". */
+	if (!XLogArchivingActive())
+		return true;
 
 	/*
-	 * The file is always deletable if archive_mode is "off".  On standbys
-	 * archiving is disabled if archive_mode is "on", and enabled with
-	 * "always".  On a primary, archiving is enabled if archive_mode is "on"
-	 * or "always".
+	 * During archive recovery, the file is deletable if archive_mode is not
+	 * "always".
 	 */
-	if (!((XLogArchivingActive() && !inRecovery) ||
-		  (XLogArchivingAlways() && inRecovery)))
+	if (!XLogArchivingAlways() &&
+		GetRecoveryState() == RECOVERY_STATE_ARCHIVE)
 		return true;
+
+	/*
+	 * At this point of the logic, note that we are either a primary with
+	 * archive_mode set to "on" or "always", or a standby with archive_mode
+	 * set to "always".
+	 */
 
 	/* First check for .done --- this means archiver is done with it */
 	StatusFilePath(archiveStatusPath, xlog, ".done");

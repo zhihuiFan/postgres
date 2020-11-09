@@ -66,9 +66,7 @@
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
 #include "commands/policy.h"
-#include "commands/proclang.h"
 #include "commands/publicationcmds.h"
-#include "commands/schemacmds.h"
 #include "commands/seclabel.h"
 #include "commands/sequence.h"
 #include "commands/trigger.h"
@@ -78,6 +76,7 @@
 #include "rewrite/rewriteRemove.h"
 #include "storage/lmgr.h"
 #include "utils/acl.h"
+#include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -200,8 +199,6 @@ static void reportDependentObjects(const ObjectAddresses *targetObjects,
 static void deleteOneObject(const ObjectAddress *object,
 							Relation *depRel, int32 flags);
 static void doDeletion(const ObjectAddress *object, int flags);
-static void AcquireDeletionLock(const ObjectAddress *object, int flags);
-static void ReleaseDeletionLock(const ObjectAddress *object);
 static bool find_expr_references_walker(Node *node,
 										find_expr_references_context *context);
 static void eliminate_duplicate_dependencies(ObjectAddresses *addrs);
@@ -435,6 +432,84 @@ performMultipleDeletions(const ObjectAddresses *objects,
 	/* And clean up */
 	free_object_addresses(targetObjects);
 
+	table_close(depRel, RowExclusiveLock);
+}
+
+/*
+ * Call a function for all objects that 'object' depend on.  If the function
+ * returns true, refobjversion will be updated in the catalog.
+ */
+void
+visitDependenciesOf(const ObjectAddress *object,
+					VisitDependenciesOfCB callback,
+					void *userdata)
+{
+	Relation	depRel;
+	ScanKeyData key[3];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	ObjectAddress otherObject;
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_classid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(object->classId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_objid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(object->objectId));
+	ScanKeyInit(&key[2],
+				Anum_pg_depend_objsubid,
+				BTEqualStrategyNumber, F_INT4EQ,
+				Int32GetDatum(object->objectSubId));
+
+	depRel = table_open(DependRelationId, RowExclusiveLock);
+	scan = systable_beginscan(depRel, DependDependerIndexId, true,
+							  NULL, 3, key);
+
+	while (HeapTupleIsValid(tup = systable_getnext(scan)))
+	{
+		Form_pg_depend foundDep = (Form_pg_depend) GETSTRUCT(tup);
+		char	   *new_version;
+		Datum		depversion;
+		bool		isnull;
+
+		otherObject.classId = foundDep->refclassid;
+		otherObject.objectId = foundDep->refobjid;
+		otherObject.objectSubId = foundDep->refobjsubid;
+
+		depversion = heap_getattr(tup, Anum_pg_depend_refobjversion,
+								  RelationGetDescr(depRel), &isnull);
+
+		/* Does the callback want to update the version? */
+		if (callback(&otherObject,
+					 isnull ? NULL : TextDatumGetCString(depversion),
+					 &new_version,
+					 userdata))
+		{
+			Datum		values[Natts_pg_depend];
+			bool		nulls[Natts_pg_depend];
+			bool		replaces[Natts_pg_depend];
+
+			memset(values, 0, sizeof(values));
+			memset(nulls, false, sizeof(nulls));
+			memset(replaces, false, sizeof(replaces));
+
+			if (new_version)
+				values[Anum_pg_depend_refobjversion - 1] =
+					CStringGetTextDatum(new_version);
+			else
+				nulls[Anum_pg_depend_refobjversion - 1] = true;
+			replaces[Anum_pg_depend_refobjversion - 1] = true;
+
+			tup = heap_modify_tuple(tup, RelationGetDescr(depRel), values,
+									nulls, replaces);
+			CatalogTupleUpdate(depRel, &tup->t_self, tup);
+
+			heap_freetuple(tup);
+		}
+	}
+	systable_endscan(scan);
 	table_close(depRel, RowExclusiveLock);
 }
 
@@ -747,8 +822,8 @@ findDependentObjects(const ObjectAddress *object,
 				if (!object_address_present_add_flags(object, objflags,
 													  targetObjects))
 					elog(ERROR, "deletion of owning object %s failed to delete %s",
-						 getObjectDescription(&otherObject),
-						 getObjectDescription(object));
+						 getObjectDescription(&otherObject, false),
+						 getObjectDescription(object, false));
 
 				/* And we're done here. */
 				return;
@@ -794,11 +869,11 @@ findDependentObjects(const ObjectAddress *object,
 				 * the depender fields...
 				 */
 				elog(ERROR, "incorrect use of PIN dependency with %s",
-					 getObjectDescription(object));
+					 getObjectDescription(object, false));
 				break;
 			default:
 				elog(ERROR, "unrecognized dependency type '%c' for %s",
-					 foundDep->deptype, getObjectDescription(object));
+					 foundDep->deptype, getObjectDescription(object, false));
 				break;
 		}
 	}
@@ -816,14 +891,14 @@ findDependentObjects(const ObjectAddress *object,
 		char	   *otherObjDesc;
 
 		if (OidIsValid(partitionObject.classId))
-			otherObjDesc = getObjectDescription(&partitionObject);
+			otherObjDesc = getObjectDescription(&partitionObject, false);
 		else
-			otherObjDesc = getObjectDescription(&owningObject);
+			otherObjDesc = getObjectDescription(&owningObject, false);
 
 		ereport(ERROR,
 				(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 				 errmsg("cannot drop %s because %s requires it",
-						getObjectDescription(object), otherObjDesc),
+						getObjectDescription(object, false), otherObjDesc),
 				 errhint("You can drop %s instead.", otherObjDesc)));
 	}
 
@@ -933,12 +1008,12 @@ findDependentObjects(const ObjectAddress *object,
 				ereport(ERROR,
 						(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 						 errmsg("cannot drop %s because it is required by the database system",
-								getObjectDescription(object))));
+								getObjectDescription(object, false))));
 				subflags = 0;	/* keep compiler quiet */
 				break;
 			default:
 				elog(ERROR, "unrecognized dependency type '%c' for %s",
-					 foundDep->deptype, getObjectDescription(object));
+					 foundDep->deptype, getObjectDescription(object, false));
 				subflags = 0;	/* keep compiler quiet */
 				break;
 		}
@@ -1056,12 +1131,13 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 			!(extra->flags & DEPFLAG_PARTITION))
 		{
 			const ObjectAddress *object = &targetObjects->refs[i];
-			char	   *otherObjDesc = getObjectDescription(&extra->dependee);
+			char	   *otherObjDesc = getObjectDescription(&extra->dependee,
+															false);
 
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("cannot drop %s because %s requires it",
-							getObjectDescription(object), otherObjDesc),
+							getObjectDescription(object, false), otherObjDesc),
 					 errhint("You can drop %s instead.", otherObjDesc)));
 		}
 	}
@@ -1109,7 +1185,7 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 		if (extra->flags & DEPFLAG_SUBOBJECT)
 			continue;
 
-		objDesc = getObjectDescription(obj);
+		objDesc = getObjectDescription(obj, false);
 
 		/*
 		 * If, at any stage of the recursive search, we reached the object via
@@ -1133,7 +1209,8 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 		}
 		else if (behavior == DROP_RESTRICT)
 		{
-			char	   *otherDesc = getObjectDescription(&extra->dependee);
+			char	   *otherDesc = getObjectDescription(&extra->dependee,
+														 false);
 
 			if (numReportedClient < MAX_REPORTED_DEPS)
 			{
@@ -1191,7 +1268,7 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("cannot drop %s because other objects depend on it",
-							getObjectDescription(origObject)),
+							getObjectDescription(origObject, false)),
 					 errdetail("%s", clientdetail.data),
 					 errdetail_log("%s", logdetail.data),
 					 errhint("Use DROP ... CASCADE to drop the dependent objects too.")));
@@ -1223,6 +1300,62 @@ reportDependentObjects(const ObjectAddresses *targetObjects,
 
 	pfree(clientdetail.data);
 	pfree(logdetail.data);
+}
+
+/*
+ * Drop an object by OID.  Works for most catalogs, if no special processing
+ * is needed.
+ */
+static void
+DropObjectById(const ObjectAddress *object)
+{
+	int			cacheId;
+	Relation	rel;
+	HeapTuple	tup;
+
+	cacheId = get_object_catcache_oid(object->classId);
+
+	rel = table_open(object->classId, RowExclusiveLock);
+
+	/*
+	 * Use the system cache for the oid column, if one exists.
+	 */
+	if (cacheId >= 0)
+	{
+		tup = SearchSysCache1(cacheId, ObjectIdGetDatum(object->objectId));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for %s %u",
+				 get_object_class_descr(object->classId), object->objectId);
+
+		CatalogTupleDelete(rel, &tup->t_self);
+
+		ReleaseSysCache(tup);
+	}
+	else
+	{
+		ScanKeyData skey[1];
+		SysScanDesc scan;
+
+		ScanKeyInit(&skey[0],
+					get_object_attnum_oid(object->classId),
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(object->objectId));
+
+		scan = systable_beginscan(rel, get_object_oid_index(object->classId), true,
+								  NULL, 1, skey);
+
+		/* we expect exactly one match */
+		tup = systable_getnext(scan);
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "could not find tuple for %s %u",
+				 get_object_class_descr(object->classId), object->objectId);
+
+		CatalogTupleDelete(rel, &tup->t_self);
+
+		systable_endscan(scan);
+	}
+
+	table_close(rel, RowExclusiveLock);
 }
 
 /*
@@ -1378,28 +1511,12 @@ doDeletion(const ObjectAddress *object, int flags)
 			RemoveTypeById(object->objectId);
 			break;
 
-		case OCLASS_CAST:
-			DropCastById(object->objectId);
-			break;
-
-		case OCLASS_COLLATION:
-			RemoveCollationById(object->objectId);
-			break;
-
 		case OCLASS_CONSTRAINT:
 			RemoveConstraintById(object->objectId);
 			break;
 
-		case OCLASS_CONVERSION:
-			RemoveConversionById(object->objectId);
-			break;
-
 		case OCLASS_DEFAULT:
 			RemoveAttrDefaultById(object->objectId);
-			break;
-
-		case OCLASS_LANGUAGE:
-			DropProceduralLanguageById(object->objectId);
 			break;
 
 		case OCLASS_LARGEOBJECT:
@@ -1410,26 +1527,6 @@ doDeletion(const ObjectAddress *object, int flags)
 			RemoveOperatorById(object->objectId);
 			break;
 
-		case OCLASS_OPCLASS:
-			RemoveOpClassById(object->objectId);
-			break;
-
-		case OCLASS_OPFAMILY:
-			RemoveOpFamilyById(object->objectId);
-			break;
-
-		case OCLASS_AM:
-			RemoveAccessMethodById(object->objectId);
-			break;
-
-		case OCLASS_AMOP:
-			RemoveAmOpEntryById(object->objectId);
-			break;
-
-		case OCLASS_AMPROC:
-			RemoveAmProcEntryById(object->objectId);
-			break;
-
 		case OCLASS_REWRITE:
 			RemoveRewriteRuleById(object->objectId);
 			break;
@@ -1438,73 +1535,47 @@ doDeletion(const ObjectAddress *object, int flags)
 			RemoveTriggerById(object->objectId);
 			break;
 
-		case OCLASS_SCHEMA:
-			RemoveSchemaById(object->objectId);
-			break;
-
 		case OCLASS_STATISTIC_EXT:
 			RemoveStatisticsById(object->objectId);
-			break;
-
-		case OCLASS_TSPARSER:
-			RemoveTSParserById(object->objectId);
-			break;
-
-		case OCLASS_TSDICT:
-			RemoveTSDictionaryById(object->objectId);
-			break;
-
-		case OCLASS_TSTEMPLATE:
-			RemoveTSTemplateById(object->objectId);
 			break;
 
 		case OCLASS_TSCONFIG:
 			RemoveTSConfigurationById(object->objectId);
 			break;
 
-			/*
-			 * OCLASS_ROLE, OCLASS_DATABASE, OCLASS_TBLSPACE intentionally not
-			 * handled here
-			 */
-
-		case OCLASS_FDW:
-			RemoveForeignDataWrapperById(object->objectId);
-			break;
-
-		case OCLASS_FOREIGN_SERVER:
-			RemoveForeignServerById(object->objectId);
-			break;
-
-		case OCLASS_USER_MAPPING:
-			RemoveUserMappingById(object->objectId);
-			break;
-
-		case OCLASS_DEFACL:
-			RemoveDefaultACLById(object->objectId);
-			break;
-
 		case OCLASS_EXTENSION:
 			RemoveExtensionById(object->objectId);
-			break;
-
-		case OCLASS_EVENT_TRIGGER:
-			RemoveEventTriggerById(object->objectId);
 			break;
 
 		case OCLASS_POLICY:
 			RemovePolicyById(object->objectId);
 			break;
 
-		case OCLASS_PUBLICATION:
-			RemovePublicationById(object->objectId);
-			break;
-
 		case OCLASS_PUBLICATION_REL:
 			RemovePublicationRelById(object->objectId);
 			break;
 
+		case OCLASS_CAST:
+		case OCLASS_COLLATION:
+		case OCLASS_CONVERSION:
+		case OCLASS_LANGUAGE:
+		case OCLASS_OPCLASS:
+		case OCLASS_OPFAMILY:
+		case OCLASS_AM:
+		case OCLASS_AMOP:
+		case OCLASS_AMPROC:
+		case OCLASS_SCHEMA:
+		case OCLASS_TSPARSER:
+		case OCLASS_TSDICT:
+		case OCLASS_TSTEMPLATE:
+		case OCLASS_FDW:
+		case OCLASS_FOREIGN_SERVER:
+		case OCLASS_USER_MAPPING:
+		case OCLASS_DEFACL:
+		case OCLASS_EVENT_TRIGGER:
+		case OCLASS_PUBLICATION:
 		case OCLASS_TRANSFORM:
-			DropTransformById(object->objectId);
+			DropObjectById(object);
 			break;
 
 			/*
@@ -1527,11 +1598,14 @@ doDeletion(const ObjectAddress *object, int flags)
 /*
  * AcquireDeletionLock - acquire a suitable lock for deleting an object
  *
+ * Accepts the same flags as performDeletion (though currently only
+ * PERFORM_DELETION_CONCURRENTLY does anything).
+ *
  * We use LockRelation for relations, LockDatabaseObject for everything
- * else.  Note that dependency.c is not concerned with deleting any kind of
- * shared-across-databases object, so we have no need for LockSharedObject.
+ * else.  Shared-across-databases objects are not currently supported
+ * because no caller cares, but could be modified to use LockSharedObject.
  */
-static void
+void
 AcquireDeletionLock(const ObjectAddress *object, int flags)
 {
 	if (object->classId == RelationRelationId)
@@ -1557,8 +1631,10 @@ AcquireDeletionLock(const ObjectAddress *object, int flags)
 
 /*
  * ReleaseDeletionLock - release an object deletion lock
+ *
+ * Companion to AcquireDeletionLock.
  */
-static void
+void
 ReleaseDeletionLock(const ObjectAddress *object)
 {
 	if (object->classId == RelationRelationId)
@@ -1567,6 +1643,38 @@ ReleaseDeletionLock(const ObjectAddress *object)
 		/* assume we should lock the whole object not a sub-object */
 		UnlockDatabaseObject(object->classId, object->objectId, 0,
 							 AccessExclusiveLock);
+}
+
+/*
+ * Record dependencies on a list of collations, optionally with their current
+ * version.
+ */
+void
+recordDependencyOnCollations(ObjectAddress *myself,
+							 List *collations,
+							 bool record_version)
+{
+	ObjectAddresses *addrs;
+	ListCell   *lc;
+
+	if (list_length(collations) == 0)
+		return;
+
+	addrs = new_object_addresses();
+	foreach(lc, collations)
+	{
+		ObjectAddress referenced;
+
+		ObjectAddressSet(referenced, CollationRelationId, lfirst_oid(lc));
+
+		add_exact_object_address(&referenced, addrs);
+	}
+
+	eliminate_duplicate_dependencies(addrs);
+	recordMultipleDependencies(myself, addrs->refs, addrs->numrefs,
+							   DEPENDENCY_NORMAL, record_version);
+
+	free_object_addresses(addrs);
 }
 
 /*
@@ -1603,8 +1711,10 @@ recordDependencyOnExpr(const ObjectAddress *depender,
 
 	/* And record 'em */
 	recordMultipleDependencies(depender,
-							   context.addrs->refs, context.addrs->numrefs,
-							   behavior);
+							   context.addrs->refs,
+							   context.addrs->numrefs,
+							   behavior,
+							   false);
 
 	free_object_addresses(context.addrs);
 }
@@ -1631,7 +1741,8 @@ recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 								Node *expr, Oid relId,
 								DependencyType behavior,
 								DependencyType self_behavior,
-								bool reverse_self)
+								bool reverse_self,
+								bool record_version)
 {
 	find_expr_references_context context;
 	RangeTblEntry rte;
@@ -1690,8 +1801,10 @@ recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 		/* Record the self-dependencies with the appropriate direction */
 		if (!reverse_self)
 			recordMultipleDependencies(depender,
-									   self_addrs->refs, self_addrs->numrefs,
-									   self_behavior);
+									   self_addrs->refs,
+									   self_addrs->numrefs,
+									   self_behavior,
+									   record_version);
 		else
 		{
 			/* Can't use recordMultipleDependencies, so do it the hard way */
@@ -1710,8 +1823,10 @@ recordDependencyOnSingleRelExpr(const ObjectAddress *depender,
 
 	/* Record the external dependencies */
 	recordMultipleDependencies(depender,
-							   context.addrs->refs, context.addrs->numrefs,
-							   behavior);
+							   context.addrs->refs,
+							   context.addrs->numrefs,
+							   behavior,
+							   record_version);
 
 	free_object_addresses(context.addrs);
 }
@@ -1767,6 +1882,29 @@ find_expr_references_walker(Node *node,
 			/* If it's a plain relation, reference this column */
 			add_object_address(OCLASS_CLASS, rte->relid, var->varattno,
 							   context->addrs);
+
+			/* Top-level collation if valid */
+			if (OidIsValid(var->varcollid))
+				add_object_address(OCLASS_COLLATION, var->varcollid, 0,
+								   context->addrs);
+			/* Otherwise, it may be a type with internal collations */
+			else if (var->vartype >= FirstNormalObjectId)
+			{
+				List	   *collations;
+				ListCell   *lc;
+
+				collations = GetTypeCollations(var->vartype);
+
+				foreach(lc, collations)
+				{
+					Oid			coll = lfirst_oid(lc);
+
+					if (OidIsValid(coll))
+						add_object_address(OCLASS_COLLATION,
+										   lfirst_oid(lc), 0,
+										   context->addrs);
+				}
+			}
 		}
 
 		/*
@@ -1791,11 +1929,9 @@ find_expr_references_walker(Node *node,
 		/*
 		 * We must also depend on the constant's collation: it could be
 		 * different from the datatype's, if a CollateExpr was const-folded to
-		 * a simple constant.  However we can save work in the most common
-		 * case where the collation is "default", since we know that's pinned.
+		 * a simple constant.
 		 */
-		if (OidIsValid(con->constcollid) &&
-			con->constcollid != DEFAULT_COLLATION_OID)
+		if (OidIsValid(con->constcollid))
 			add_object_address(OCLASS_COLLATION, con->constcollid, 0,
 							   context->addrs);
 
@@ -1884,8 +2020,7 @@ find_expr_references_walker(Node *node,
 		add_object_address(OCLASS_TYPE, param->paramtype, 0,
 						   context->addrs);
 		/* and its collation, just as for Consts */
-		if (OidIsValid(param->paramcollid) &&
-			param->paramcollid != DEFAULT_COLLATION_OID)
+		if (OidIsValid(param->paramcollid))
 			add_object_address(OCLASS_COLLATION, param->paramcollid, 0,
 							   context->addrs);
 	}
@@ -1972,8 +2107,7 @@ find_expr_references_walker(Node *node,
 			add_object_address(OCLASS_TYPE, fselect->resulttype, 0,
 							   context->addrs);
 		/* the collation might not be referenced anywhere else, either */
-		if (OidIsValid(fselect->resultcollid) &&
-			fselect->resultcollid != DEFAULT_COLLATION_OID)
+		if (OidIsValid(fselect->resultcollid))
 			add_object_address(OCLASS_COLLATION, fselect->resultcollid, 0,
 							   context->addrs);
 	}
@@ -2003,8 +2137,7 @@ find_expr_references_walker(Node *node,
 		add_object_address(OCLASS_TYPE, relab->resulttype, 0,
 						   context->addrs);
 		/* the collation might not be referenced anywhere else, either */
-		if (OidIsValid(relab->resultcollid) &&
-			relab->resultcollid != DEFAULT_COLLATION_OID)
+		if (OidIsValid(relab->resultcollid))
 			add_object_address(OCLASS_COLLATION, relab->resultcollid, 0,
 							   context->addrs);
 	}
@@ -2016,8 +2149,7 @@ find_expr_references_walker(Node *node,
 		add_object_address(OCLASS_TYPE, iocoerce->resulttype, 0,
 						   context->addrs);
 		/* the collation might not be referenced anywhere else, either */
-		if (OidIsValid(iocoerce->resultcollid) &&
-			iocoerce->resultcollid != DEFAULT_COLLATION_OID)
+		if (OidIsValid(iocoerce->resultcollid))
 			add_object_address(OCLASS_COLLATION, iocoerce->resultcollid, 0,
 							   context->addrs);
 	}
@@ -2029,8 +2161,7 @@ find_expr_references_walker(Node *node,
 		add_object_address(OCLASS_TYPE, acoerce->resulttype, 0,
 						   context->addrs);
 		/* the collation might not be referenced anywhere else, either */
-		if (OidIsValid(acoerce->resultcollid) &&
-			acoerce->resultcollid != DEFAULT_COLLATION_OID)
+		if (OidIsValid(acoerce->resultcollid))
 			add_object_address(OCLASS_COLLATION, acoerce->resultcollid, 0,
 							   context->addrs);
 		/* fall through to examine arguments */
@@ -2118,8 +2249,7 @@ find_expr_references_walker(Node *node,
 		if (OidIsValid(wc->endInRangeFunc))
 			add_object_address(OCLASS_PROC, wc->endInRangeFunc, 0,
 							   context->addrs);
-		if (OidIsValid(wc->inRangeColl) &&
-			wc->inRangeColl != DEFAULT_COLLATION_OID)
+		if (OidIsValid(wc->inRangeColl))
 			add_object_address(OCLASS_COLLATION, wc->inRangeColl, 0,
 							   context->addrs);
 		/* fall through to examine substructure */
@@ -2264,7 +2394,7 @@ find_expr_references_walker(Node *node,
 		{
 			Oid			collid = lfirst_oid(ct);
 
-			if (OidIsValid(collid) && collid != DEFAULT_COLLATION_OID)
+			if (OidIsValid(collid))
 				add_object_address(OCLASS_COLLATION, collid, 0,
 								   context->addrs);
 		}
@@ -2286,7 +2416,7 @@ find_expr_references_walker(Node *node,
 		{
 			Oid			collid = lfirst_oid(ct);
 
-			if (OidIsValid(collid) && collid != DEFAULT_COLLATION_OID)
+			if (OidIsValid(collid))
 				add_object_address(OCLASS_COLLATION, collid, 0,
 								   context->addrs);
 		}
@@ -2683,7 +2813,8 @@ record_object_address_dependencies(const ObjectAddress *depender,
 	eliminate_duplicate_dependencies(referenced);
 	recordMultipleDependencies(depender,
 							   referenced->refs, referenced->numrefs,
-							   behavior);
+							   behavior,
+							   false);
 }
 
 /*

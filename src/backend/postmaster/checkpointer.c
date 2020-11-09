@@ -198,7 +198,7 @@ CheckpointerMain(void)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, ReqCheckpointHandler); /* request checkpoint */
 	pqsignal(SIGTERM, SIG_IGN); /* ignore SIGTERM */
-	pqsignal(SIGQUIT, SignalHandlerForCrashExit);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	pqsignal(SIGALRM, SIG_IGN);
 	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
@@ -208,9 +208,6 @@ CheckpointerMain(void)
 	 * Reset some signals that are accepted by postmaster but not here
 	 */
 	pqsignal(SIGCHLD, SIG_DFL);
-
-	/* We allow SIGQUIT (quickdie) at all times */
-	sigdelset(&BlockSig, SIGQUIT);
 
 	/*
 	 * Initialize so that first time-driven event happens at the correct time.
@@ -231,7 +228,20 @@ CheckpointerMain(void)
 	/*
 	 * If an exception is encountered, processing resumes here.
 	 *
-	 * See notes in postgres.c about the design of this coding.
+	 * You might wonder why this isn't coded as an infinite loop around a
+	 * PG_TRY construct.  The reason is that this is the bottom of the
+	 * exception stack, and so with PG_TRY there would be no exception handler
+	 * in force at all during the CATCH part.  By leaving the outermost setjmp
+	 * always active, we have at least some chance of recovering from an error
+	 * during error recovery.  (If we get into an infinite loop thereby, it
+	 * will soon be stopped by overflow of elog.c's internal state stack.)
+	 *
+	 * Note that we use sigsetjmp(..., 1), so that the prevailing signal mask
+	 * (to wit, BlockSig) will be restored when longjmp'ing to here.  Thus,
+	 * signals other than SIGQUIT will be blocked until we complete error
+	 * recovery.  It might seem that this policy makes the HOLD_INTERRUPTS()
+	 * call redundant, but it is not since InterruptPending might be set
+	 * already.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -494,6 +504,16 @@ CheckpointerMain(void)
 		 */
 		pgstat_send_bgwriter();
 
+		/* Send WAL statistics to the stats collector. */
+		pgstat_send_wal();
+
+		/*
+		 * If any checkpoint flags have been set, redo the loop to handle the
+		 * checkpoint without sleeping.
+		 */
+		if (((volatile CheckpointerShmemStruct *) CheckpointerShmem)->ckpt_flags)
+			continue;
+
 		/*
 		 * Sleep until we are signaled or it's time for another checkpoint or
 		 * xlog file switch.
@@ -533,29 +553,29 @@ HandleCheckpointerInterrupts(void)
 		ProcessConfigFile(PGC_SIGHUP);
 
 		/*
-		 * Checkpointer is the last process to shut down, so we ask it to
-		 * hold the keys for a range of other tasks required most of which
-		 * have nothing to do with checkpointing at all.
+		 * Checkpointer is the last process to shut down, so we ask it to hold
+		 * the keys for a range of other tasks required most of which have
+		 * nothing to do with checkpointing at all.
 		 *
-		 * For various reasons, some config values can change dynamically
-		 * so the primary copy of them is held in shared memory to make
-		 * sure all backends see the same value.  We make Checkpointer
-		 * responsible for updating the shared memory copy if the
-		 * parameter setting changes because of SIGHUP.
+		 * For various reasons, some config values can change dynamically so
+		 * the primary copy of them is held in shared memory to make sure all
+		 * backends see the same value.  We make Checkpointer responsible for
+		 * updating the shared memory copy if the parameter setting changes
+		 * because of SIGHUP.
 		 */
 		UpdateSharedMemoryConfig();
 	}
 	if (ShutdownRequestPending)
 	{
 		/*
-		 * From here on, elog(ERROR) should end with exit(1), not send
-		 * control back to the sigsetjmp block above
+		 * From here on, elog(ERROR) should end with exit(1), not send control
+		 * back to the sigsetjmp block above
 		 */
 		ExitOnAnyError = true;
 		/* Close down the database */
 		ShutdownXLOG(0, 0);
 		/* Normal exit from the checkpointer is here */
-		proc_exit(0);		/* done */
+		proc_exit(0);			/* done */
 	}
 }
 
@@ -812,7 +832,7 @@ ReqCheckpointHandler(SIGNAL_ARGS)
 	int			save_errno = errno;
 
 	/*
-	 * The signalling process should have set ckpt_flags nonzero, so all we
+	 * The signaling process should have set ckpt_flags nonzero, so all we
 	 * need do is ensure that our main loop gets kicked out of any wait.
 	 */
 	SetLatch(MyLatch);

@@ -26,6 +26,7 @@
 #include "access/amapi.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
+#include "access/reloptions.h"
 #include "access/relscan.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
@@ -52,6 +53,7 @@
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
@@ -74,8 +76,10 @@
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/pg_locale.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
+#include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
@@ -105,7 +109,7 @@ static TupleDesc ConstructTupleDescriptor(Relation heapRelation,
 										  Oid *classObjectId);
 static void InitializeAttributeOids(Relation indexRelation,
 									int numatts, Oid indexoid);
-static void AppendAttributeTuples(Relation indexRelation, int numatts);
+static void AppendAttributeTuples(Relation indexRelation, Datum *attopts);
 static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 								Oid parentIndexId,
 								IndexInfo *indexInfo,
@@ -129,7 +133,6 @@ static void SetReindexProcessing(Oid heapOid, Oid indexOid);
 static void ResetReindexProcessing(void);
 static void SetReindexPending(List *indexes);
 static void RemoveReindexPending(Oid indexOid);
-static void ResetReindexPending(void);
 
 
 /*
@@ -484,12 +487,11 @@ InitializeAttributeOids(Relation indexRelation,
  * ----------------------------------------------------------------
  */
 static void
-AppendAttributeTuples(Relation indexRelation, int numatts)
+AppendAttributeTuples(Relation indexRelation, Datum *attopts)
 {
 	Relation	pg_attribute;
 	CatalogIndexState indstate;
 	TupleDesc	indexTupDesc;
-	int			i;
 
 	/*
 	 * open the attribute relation and its indexes
@@ -503,14 +505,7 @@ AppendAttributeTuples(Relation indexRelation, int numatts)
 	 */
 	indexTupDesc = RelationGetDescr(indexRelation);
 
-	for (i = 0; i < numatts; i++)
-	{
-		Form_pg_attribute attr = TupleDescAttr(indexTupDesc, i);
-
-		Assert(attr->attnum == i + 1);
-
-		InsertPgAttributeTuple(pg_attribute, attr, indstate);
-	}
+	InsertPgAttributeTuples(pg_attribute, indexTupDesc, InvalidOid, attopts, indstate);
 
 	CatalogCloseIndexes(indstate);
 
@@ -588,6 +583,7 @@ UpdateIndexRelation(Oid indexoid,
 	}
 	else
 		predDatum = (Datum) 0;
+
 
 	/*
 	 * open the system catalog index relation
@@ -976,7 +972,7 @@ index_create(Relation heapRelation,
 	/*
 	 * append ATTRIBUTE tuples for the index
 	 */
-	AppendAttributeTuples(indexRelation, indexInfo->ii_NumIndexAttrs);
+	AppendAttributeTuples(indexRelation, indexInfo->ii_OpclassOptions);
 
 	/* ----------------
 	 *	  update pg_index
@@ -1025,10 +1021,11 @@ index_create(Relation heapRelation,
 	{
 		ObjectAddress myself,
 					referenced;
+		ObjectAddresses *addrs;
+		List	   *colls = NIL,
+				   *colls_no_version = NIL;
 
-		myself.classId = RelationRelationId;
-		myself.objectId = indexRelationId;
-		myself.objectSubId = 0;
+		ObjectAddressSet(myself, RelationRelationId, indexRelationId);
 
 		if ((flags & INDEX_CREATE_ADD_CONSTRAINT) != 0)
 		{
@@ -1063,17 +1060,17 @@ index_create(Relation heapRelation,
 		{
 			bool		have_simple_col = false;
 
+			addrs = new_object_addresses();
+
 			/* Create auto dependencies on simply-referenced columns */
 			for (i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
 			{
 				if (indexInfo->ii_IndexAttrNumbers[i] != 0)
 				{
-					referenced.classId = RelationRelationId;
-					referenced.objectId = heapRelationId;
-					referenced.objectSubId = indexInfo->ii_IndexAttrNumbers[i];
-
-					recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);
-
+					ObjectAddressSubSet(referenced, RelationRelationId,
+										heapRelationId,
+										indexInfo->ii_IndexAttrNumbers[i]);
+					add_exact_object_address(&referenced, addrs);
 					have_simple_col = true;
 				}
 			}
@@ -1086,12 +1083,13 @@ index_create(Relation heapRelation,
 			 */
 			if (!have_simple_col)
 			{
-				referenced.classId = RelationRelationId;
-				referenced.objectId = heapRelationId;
-				referenced.objectSubId = 0;
-
-				recordDependencyOn(&myself, &referenced, DEPENDENCY_AUTO);
+				ObjectAddressSet(referenced, RelationRelationId,
+								 heapRelationId);
+				add_exact_object_address(&referenced, addrs);
 			}
+
+			record_object_address_dependencies(&myself, addrs, DEPENDENCY_AUTO);
+			free_object_addresses(addrs);
 		}
 
 		/*
@@ -1102,43 +1100,74 @@ index_create(Relation heapRelation,
 		 */
 		if (OidIsValid(parentIndexRelid))
 		{
-			referenced.classId = RelationRelationId;
-			referenced.objectId = parentIndexRelid;
-			referenced.objectSubId = 0;
-
+			ObjectAddressSet(referenced, RelationRelationId, parentIndexRelid);
 			recordDependencyOn(&myself, &referenced, DEPENDENCY_PARTITION_PRI);
 
-			referenced.classId = RelationRelationId;
-			referenced.objectId = heapRelationId;
-			referenced.objectSubId = 0;
-
+			ObjectAddressSet(referenced, RelationRelationId, heapRelationId);
 			recordDependencyOn(&myself, &referenced, DEPENDENCY_PARTITION_SEC);
 		}
 
-		/* Store dependency on collations */
-		/* The default collation is pinned, so don't bother recording it */
+		/* Get dependencies on collations for all index keys. */
 		for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
 		{
-			if (OidIsValid(collationObjectId[i]) &&
-				collationObjectId[i] != DEFAULT_COLLATION_OID)
-			{
-				referenced.classId = CollationRelationId;
-				referenced.objectId = collationObjectId[i];
-				referenced.objectSubId = 0;
+			Oid			colloid = collationObjectId[i];
 
-				recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+			if (OidIsValid(colloid))
+			{
+				Oid			opclass = classObjectId[i];
+
+				/*
+				 * The *_pattern_ops opclasses are special: they explicitly do
+				 * not depend on collation order so we can save some effort.
+				 *
+				 * XXX With more analysis, we could also skip version tracking
+				 * for some cases like hash indexes with deterministic
+				 * collations, because they will never need to order strings.
+				 */
+				if (opclass == TEXT_BTREE_PATTERN_OPS_OID ||
+					opclass == VARCHAR_BTREE_PATTERN_OPS_OID ||
+					opclass == BPCHAR_BTREE_PATTERN_OPS_OID)
+					colls_no_version = lappend_oid(colls_no_version, colloid);
+				else
+					colls = lappend_oid(colls, colloid);
+			}
+			else
+			{
+				Form_pg_attribute att = TupleDescAttr(indexTupDesc, i);
+
+				Assert(i < indexTupDesc->natts);
+
+				/*
+				 * Even though there is no top-level collation, there may be
+				 * collations affecting ordering inside types, so look there
+				 * too.
+				 */
+				colls = list_concat(colls, GetTypeCollations(att->atttypid));
 			}
 		}
 
+		/*
+		 * If we have anything in both lists, keep just the versioned one to
+		 * avoid some duplication.
+		 */
+		if (colls_no_version != NIL && colls != NIL)
+			colls_no_version = list_difference_oid(colls_no_version, colls);
+
+		/* Store the versioned and unversioned collation dependencies. */
+		if (colls_no_version != NIL)
+			recordDependencyOnCollations(&myself, colls_no_version, false);
+		if (colls != NIL)
+			recordDependencyOnCollations(&myself, colls, true);
+
 		/* Store dependency on operator classes */
+		addrs = new_object_addresses();
 		for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
 		{
-			referenced.classId = OperatorClassRelationId;
-			referenced.objectId = classObjectId[i];
-			referenced.objectSubId = 0;
-
-			recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+			ObjectAddressSet(referenced, OperatorClassRelationId, classObjectId[i]);
+			add_exact_object_address(&referenced, addrs);
 		}
+		record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
+		free_object_addresses(addrs);
 
 		/* Store dependencies on anything mentioned in index expressions */
 		if (indexInfo->ii_Expressions)
@@ -1147,7 +1176,7 @@ index_create(Relation heapRelation,
 											(Node *) indexInfo->ii_Expressions,
 											heapRelationId,
 											DEPENDENCY_NORMAL,
-											DEPENDENCY_AUTO, false);
+											DEPENDENCY_AUTO, false, true);
 		}
 
 		/* Store dependencies on anything mentioned in predicate */
@@ -1157,7 +1186,7 @@ index_create(Relation heapRelation,
 											(Node *) indexInfo->ii_Predicate,
 											heapRelationId,
 											DEPENDENCY_NORMAL,
-											DEPENDENCY_AUTO, false);
+											DEPENDENCY_AUTO, false, true);
 		}
 	}
 	else
@@ -1188,6 +1217,13 @@ index_create(Relation heapRelation,
 		Assert(indexRelation->rd_indexcxt != NULL);
 
 	indexRelation->rd_index->indnkeyatts = indexInfo->ii_NumIndexKeyAttrs;
+
+	/* Validate opclass-specific options */
+	if (indexInfo->ii_OpclassOptions)
+		for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
+			(void) index_opclass_options(indexRelation, i + 1,
+										 indexInfo->ii_OpclassOptions[i],
+										 true);
 
 	/*
 	 * If this is bootstrap (initdb) time, then we don't actually fill in the
@@ -1227,6 +1263,129 @@ index_create(Relation heapRelation,
 	index_close(indexRelation, NoLock);
 
 	return indexRelationId;
+}
+
+typedef struct do_collation_version_check_context
+{
+	Oid			relid;
+	List	   *warned_colls;
+} do_collation_version_check_context;
+
+/*
+ * Raise a warning if the recorded and current collation version don't match.
+ * This is a callback for visitDependenciesOf().
+ */
+static bool
+do_collation_version_check(const ObjectAddress *otherObject,
+						   const char *version,
+						   char **new_version,
+						   void *data)
+{
+	do_collation_version_check_context *context = data;
+	char	   *current_version;
+
+	/* We only care about dependencies on collations with a version. */
+	if (!version || otherObject->classId != CollationRelationId)
+		return false;
+
+	/* Ask the provider for the current version.  Give up if unsupported. */
+	current_version = get_collation_version_for_oid(otherObject->objectId);
+	if (!current_version)
+		return false;
+
+	/*
+	 * We don't expect too many duplicates, but it's possible, and we don't
+	 * want to generate duplicate warnings.
+	 */
+	if (list_member_oid(context->warned_colls, otherObject->objectId))
+		return false;
+
+	/* Do they match? */
+	if (strcmp(current_version, version) != 0)
+	{
+		/*
+		 * The version has changed, probably due to an OS/library upgrade or
+		 * streaming replication between different OS/library versions.
+		 */
+		ereport(WARNING,
+				(errmsg("index \"%s\" depends on collation \"%s\" version \"%s\", but the current version is \"%s\"",
+						get_rel_name(context->relid),
+						get_collation_name(otherObject->objectId),
+						version,
+						current_version),
+				 errdetail("The index may be corrupted due to changes in sort order."),
+				 errhint("REINDEX to avoid the risk of corruption.")));
+
+		/* Remember not to complain about this collation again. */
+		context->warned_colls = lappend_oid(context->warned_colls,
+											otherObject->objectId);
+	}
+
+	return false;
+}
+
+/* index_check_collation_versions
+ *		Check the collation version for all dependencies on the given index.
+ */
+void
+index_check_collation_versions(Oid relid)
+{
+	do_collation_version_check_context context;
+	ObjectAddress object;
+
+	/*
+	 * The callback needs the relid for error messages, and some scratch space
+	 * to avoid duplicate warnings.
+	 */
+	context.relid = relid;
+	context.warned_colls = NIL;
+
+	object.classId = RelationRelationId;
+	object.objectId = relid;
+	object.objectSubId = 0;
+
+	visitDependenciesOf(&object, &do_collation_version_check, &context);
+
+	list_free(context.warned_colls);
+}
+
+/*
+ * Update the version for collations.  A callback for visitDependenciesOf().
+ */
+static bool
+do_collation_version_update(const ObjectAddress *otherObject,
+							const char *version,
+							char **new_version,
+							void *data)
+{
+	Oid		   *coll = data;
+
+	/* We only care about dependencies on collations with versions. */
+	if (!version || otherObject->classId != CollationRelationId)
+		return false;
+
+	/* If we're only trying to update one collation, skip others. */
+	if (OidIsValid(*coll) && otherObject->objectId != *coll)
+		return false;
+
+	*new_version = get_collation_version_for_oid(otherObject->objectId);
+
+	return true;
+}
+
+/*
+ * Record the current versions of one or all collations that an index depends
+ * on.  InvalidOid means all.
+ */
+void
+index_update_collation_versions(Oid relid, Oid coll)
+{
+	ObjectAddress object;
+
+	object.classId = RelationRelationId;
+	object.objectId = relid;
+	object.objectSubId = 0;
+	visitDependenciesOf(&object, &do_collation_version_update, &coll);
 }
 
 /*
@@ -1527,16 +1686,20 @@ index_concurrently_swap(Oid newIndexId, Oid oldIndexId, const char *oldName)
 	newIndexForm->indimmediate = oldIndexForm->indimmediate;
 	oldIndexForm->indimmediate = true;
 
+	/* Preserve indisreplident in the new index */
+	newIndexForm->indisreplident = oldIndexForm->indisreplident;
+
 	/* Preserve indisclustered in the new index */
 	newIndexForm->indisclustered = oldIndexForm->indisclustered;
 
 	/*
-	 * Mark the new index as valid, and the old index as invalid similarly
-	 * to what index_set_state_flags() does.
+	 * Mark the new index as valid, and the old index as invalid similarly to
+	 * what index_set_state_flags() does.
 	 */
 	newIndexForm->indisvalid = true;
 	oldIndexForm->indisvalid = false;
 	oldIndexForm->indisclustered = false;
+	oldIndexForm->indisreplident = false;
 
 	CatalogTupleUpdate(pg_index, &oldIndexTuple->t_self, oldIndexTuple);
 	CatalogTupleUpdate(pg_index, &newIndexTuple->t_self, newIndexTuple);
@@ -1685,6 +1848,10 @@ index_concurrently_swap(Oid newIndexId, Oid oldIndexId, const char *oldName)
 	changeDependenciesOf(RelationRelationId, oldIndexId, newIndexId);
 	changeDependenciesOn(RelationRelationId, oldIndexId, newIndexId);
 
+	/* Now we have the old index's collation versions, so fix that. */
+	CommandCounterIncrement();
+	index_update_collation_versions(newIndexId, InvalidOid);
+
 	/*
 	 * Copy over statistics from old to new index
 	 */
@@ -1709,6 +1876,9 @@ index_concurrently_swap(Oid newIndexId, Oid oldIndexId, const char *oldName)
 			}
 		}
 	}
+
+	/* Copy data of pg_statistic from the old index to the new one */
+	CopyStatistics(oldIndexId, newIndexId);
 
 	/* Close relations */
 	table_close(pg_class, RowExclusiveLock);
@@ -2336,6 +2506,8 @@ BuildIndexInfo(Relation index)
 								 &ii->ii_ExclusionStrats);
 	}
 
+	ii->ii_OpclassOptions = RelationGetIndexRawAttOptions(index);
+
 	return ii;
 }
 
@@ -2732,6 +2904,15 @@ index_update_stats(Relation rel,
 
 	/* Should this be a more comprehensive test? */
 	Assert(rd_rel->relkind != RELKIND_PARTITIONED_INDEX);
+
+	/*
+	 * As a special hack, if we are dealing with an empty table and the
+	 * existing reltuples is -1, we leave that alone.  This ensures that
+	 * creating an index as part of CREATE TABLE doesn't cause the table to
+	 * prematurely look like it's been vacuumed.
+	 */
+	if (reltuples == 0 && rd_rel->reltuples < 0)
+		reltuples = -1;
 
 	/* Apply required updates, if any, to copied tuple */
 
@@ -3299,18 +3480,10 @@ validate_index_callback(ItemPointer itemptr, void *opaque)
  * index_set_state_flags - adjust pg_index state flags
  *
  * This is used during CREATE/DROP INDEX CONCURRENTLY to adjust the pg_index
- * flags that denote the index's state.  Because the update is not
- * transactional and will not roll back on error, this must only be used as
- * the last step in a transaction that has not made any transactional catalog
- * updates!
+ * flags that denote the index's state.
  *
- * Note that heap_inplace_update does send a cache inval message for the
+ * Note that CatalogTupleUpdate() sends a cache invalidation message for the
  * tuple, so other sessions will hear about the update as soon as we commit.
- *
- * NB: In releases prior to PostgreSQL 9.4, the use of a non-transactional
- * update here would have been unsafe; now that MVCC rules apply even for
- * system catalog scans, we could potentially use a transactional update here
- * instead.
  */
 void
 index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
@@ -3318,9 +3491,6 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 	Relation	pg_index;
 	HeapTuple	indexTuple;
 	Form_pg_index indexForm;
-
-	/* Assert that current xact hasn't done any transactional updates */
-	Assert(GetTopTransactionIdIfAny() == InvalidTransactionId);
 
 	/* Open pg_index and fetch a writable copy of the index's tuple */
 	pg_index = table_open(IndexRelationId, RowExclusiveLock);
@@ -3360,10 +3530,13 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 			 * CONCURRENTLY that failed partway through.)
 			 *
 			 * Note: the CLUSTER logic assumes that indisclustered cannot be
-			 * set on any invalid index, so clear that flag too.
+			 * set on any invalid index, so clear that flag too.  Similarly,
+			 * ALTER TABLE assumes that indisreplident cannot be set for
+			 * invalid indexes.
 			 */
 			indexForm->indisvalid = false;
 			indexForm->indisclustered = false;
+			indexForm->indisreplident = false;
 			break;
 		case INDEX_DROP_SET_DEAD:
 
@@ -3375,13 +3548,15 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 			 * the index at all.
 			 */
 			Assert(!indexForm->indisvalid);
+			Assert(!indexForm->indisclustered);
+			Assert(!indexForm->indisreplident);
 			indexForm->indisready = false;
 			indexForm->indislive = false;
 			break;
 	}
 
-	/* ... and write it back in-place */
-	heap_inplace_update(pg_index, indexTuple);
+	/* ... and update it */
+	CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
 
 	table_close(pg_index, RowExclusiveLock);
 }
@@ -3434,8 +3609,20 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	 * Open and lock the parent heap relation.  ShareLock is sufficient since
 	 * we only need to be sure no schema or data changes are going on.
 	 */
-	heapId = IndexGetRelation(indexId, false);
-	heapRelation = table_open(heapId, ShareLock);
+	heapId = IndexGetRelation(indexId,
+							  (options & REINDEXOPT_MISSING_OK) != 0);
+	/* if relation is missing, leave */
+	if (!OidIsValid(heapId))
+		return;
+
+	if ((options & REINDEXOPT_MISSING_OK) != 0)
+		heapRelation = try_table_open(heapId, ShareLock);
+	else
+		heapRelation = table_open(heapId, ShareLock);
+
+	/* if relation is gone, leave */
+	if (!heapRelation)
+		return;
 
 	if (progress)
 	{
@@ -3458,11 +3645,12 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 									 iRel->rd_rel->relam);
 
 	/*
-	 * The case of reindexing partitioned tables and indexes is handled
-	 * differently by upper layers, so this case shouldn't arise.
+	 * Partitioned indexes should never get processed here, as they have no
+	 * physical storage.
 	 */
 	if (iRel->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
-		elog(ERROR, "unsupported relation kind for index \"%s\"",
+		elog(ERROR, "cannot reindex partitioned index \"%s.%s\"",
+			 get_namespace_name(RelationGetNamespace(iRel)),
 			 RelationGetRelationName(iRel));
 
 	/*
@@ -3511,25 +3699,18 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 		indexInfo->ii_ExclusionStrats = NULL;
 	}
 
-	/* ensure SetReindexProcessing state isn't leaked */
-	PG_TRY();
-	{
-		/* Suppress use of the target index while rebuilding it */
-		SetReindexProcessing(heapId, indexId);
+	/* Suppress use of the target index while rebuilding it */
+	SetReindexProcessing(heapId, indexId);
 
-		/* Create a new physical relation for the index */
-		RelationSetNewRelfilenode(iRel, persistence);
+	/* Create a new physical relation for the index */
+	RelationSetNewRelfilenode(iRel, persistence);
 
-		/* Initialize the index and rebuild */
-		/* Note: we do not need to re-establish pkey setting */
-		index_build(heapRelation, iRel, indexInfo, true, true);
-	}
-	PG_FINALLY();
-	{
-		/* Make sure flag gets cleared on error exit */
-		ResetReindexProcessing();
-	}
-	PG_END_TRY();
+	/* Initialize the index and rebuild */
+	/* Note: we do not need to re-establish pkey setting */
+	index_build(heapRelation, iRel, indexInfo, true, true);
+
+	/* Re-allow use of target index */
+	ResetReindexProcessing();
 
 	/*
 	 * If the index is marked invalid/not-ready/dead (ie, it's from a failed
@@ -3623,6 +3804,9 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	/* Close rels, but keep locks */
 	index_close(iRel, NoLock);
 	table_close(heapRelation, NoLock);
+
+	/* Record the current versions of all depended-on collations. */
+	index_update_collation_versions(indexId, InvalidOid);
 }
 
 /*
@@ -3666,7 +3850,9 @@ reindex_relation(Oid relid, int flags, int options)
 	Relation	rel;
 	Oid			toast_relid;
 	List	   *indexIds;
+	char		persistence;
 	bool		result;
+	ListCell   *indexId;
 	int			i;
 
 	/*
@@ -3674,23 +3860,23 @@ reindex_relation(Oid relid, int flags, int options)
 	 * to prevent schema and data changes in it.  The lock level used here
 	 * should match ReindexTable().
 	 */
-	rel = table_open(relid, ShareLock);
+	if ((options & REINDEXOPT_MISSING_OK) != 0)
+		rel = try_table_open(relid, ShareLock);
+	else
+		rel = table_open(relid, ShareLock);
+
+	/* if relation is gone, leave */
+	if (!rel)
+		return false;
 
 	/*
-	 * This may be useful when implemented someday; but that day is not today.
-	 * For now, avoid erroring out when called in a multi-table context
-	 * (REINDEX SCHEMA) and happen to come across a partitioned table.  The
-	 * partitions may be reindexed on their own anyway.
+	 * Partitioned tables should never get processed here, as they have no
+	 * physical storage.
 	 */
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-	{
-		ereport(WARNING,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("REINDEX of partitioned tables is not yet implemented, skipping \"%s\"",
-						RelationGetRelationName(rel))));
-		table_close(rel, ShareLock);
-		return false;
-	}
+		elog(ERROR, "cannot reindex partitioned table \"%s.%s\"",
+			 get_namespace_name(RelationGetNamespace(rel)),
+			 RelationGetRelationName(rel));
 
 	toast_relid = rel->rd_rel->reltoastrelid;
 
@@ -3701,77 +3887,65 @@ reindex_relation(Oid relid, int flags, int options)
 	 */
 	indexIds = RelationGetIndexList(rel);
 
-	PG_TRY();
+	if (flags & REINDEX_REL_SUPPRESS_INDEX_USE)
 	{
-		ListCell   *indexId;
-		char		persistence;
-
-		if (flags & REINDEX_REL_SUPPRESS_INDEX_USE)
-		{
-			/* Suppress use of all the indexes until they are rebuilt */
-			SetReindexPending(indexIds);
-
-			/*
-			 * Make the new heap contents visible --- now things might be
-			 * inconsistent!
-			 */
-			CommandCounterIncrement();
-		}
+		/* Suppress use of all the indexes until they are rebuilt */
+		SetReindexPending(indexIds);
 
 		/*
-		 * Compute persistence of indexes: same as that of owning rel, unless
-		 * caller specified otherwise.
+		 * Make the new heap contents visible --- now things might be
+		 * inconsistent!
 		 */
-		if (flags & REINDEX_REL_FORCE_INDEXES_UNLOGGED)
-			persistence = RELPERSISTENCE_UNLOGGED;
-		else if (flags & REINDEX_REL_FORCE_INDEXES_PERMANENT)
-			persistence = RELPERSISTENCE_PERMANENT;
-		else
-			persistence = rel->rd_rel->relpersistence;
-
-		/* Reindex all the indexes. */
-		i = 1;
-		foreach(indexId, indexIds)
-		{
-			Oid			indexOid = lfirst_oid(indexId);
-			Oid			indexNamespaceId = get_rel_namespace(indexOid);
-
-			/*
-			 * Skip any invalid indexes on a TOAST table.  These can only be
-			 * duplicate leftovers from a failed REINDEX CONCURRENTLY, and if
-			 * rebuilt it would not be possible to drop them anymore.
-			 */
-			if (IsToastNamespace(indexNamespaceId) &&
-				!get_index_isvalid(indexOid))
-			{
-				ereport(WARNING,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot reindex invalid index \"%s.%s\" on TOAST table, skipping",
-								get_namespace_name(indexNamespaceId),
-								get_rel_name(indexOid))));
-				continue;
-			}
-
-			reindex_index(indexOid, !(flags & REINDEX_REL_CHECK_CONSTRAINTS),
-						  persistence, options);
-
-			CommandCounterIncrement();
-
-			/* Index should no longer be in the pending list */
-			Assert(!ReindexIsProcessingIndex(indexOid));
-
-			/* Set index rebuild count */
-			pgstat_progress_update_param(PROGRESS_CLUSTER_INDEX_REBUILD_COUNT,
-										 i);
-			i++;
-		}
+		CommandCounterIncrement();
 	}
-	PG_FINALLY();
+
+	/*
+	 * Compute persistence of indexes: same as that of owning rel, unless
+	 * caller specified otherwise.
+	 */
+	if (flags & REINDEX_REL_FORCE_INDEXES_UNLOGGED)
+		persistence = RELPERSISTENCE_UNLOGGED;
+	else if (flags & REINDEX_REL_FORCE_INDEXES_PERMANENT)
+		persistence = RELPERSISTENCE_PERMANENT;
+	else
+		persistence = rel->rd_rel->relpersistence;
+
+	/* Reindex all the indexes. */
+	i = 1;
+	foreach(indexId, indexIds)
 	{
-		/* Make sure list gets cleared on error exit */
-		ResetReindexPending();
+		Oid			indexOid = lfirst_oid(indexId);
+		Oid			indexNamespaceId = get_rel_namespace(indexOid);
+
+		/*
+		 * Skip any invalid indexes on a TOAST table.  These can only be
+		 * duplicate leftovers from a failed REINDEX CONCURRENTLY, and if
+		 * rebuilt it would not be possible to drop them anymore.
+		 */
+		if (IsToastNamespace(indexNamespaceId) &&
+			!get_index_isvalid(indexOid))
+		{
+			ereport(WARNING,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot reindex invalid index \"%s.%s\" on TOAST table, skipping",
+							get_namespace_name(indexNamespaceId),
+							get_rel_name(indexOid))));
+			continue;
+		}
+
+		reindex_index(indexOid, !(flags & REINDEX_REL_CHECK_CONSTRAINTS),
+					  persistence, options);
+
+		CommandCounterIncrement();
+
+		/* Index should no longer be in the pending list */
+		Assert(!ReindexIsProcessingIndex(indexOid));
+
+		/* Set index rebuild count */
+		pgstat_progress_update_param(PROGRESS_CLUSTER_INDEX_REBUILD_COUNT,
+									 i);
+		i++;
 	}
-	PG_END_TRY();
 
 	/*
 	 * Close rel, but continue to hold the lock.
@@ -3782,10 +3956,17 @@ reindex_relation(Oid relid, int flags, int options)
 
 	/*
 	 * If the relation has a secondary toast rel, reindex that too while we
-	 * still hold the lock on the master table.
+	 * still hold the lock on the main table.
 	 */
 	if ((flags & REINDEX_REL_PROCESS_TOAST) && OidIsValid(toast_relid))
-		result |= reindex_relation(toast_relid, flags, options);
+	{
+		/*
+		 * Note that this should fail if the toast relation is missing, so
+		 * reset REINDEXOPT_MISSING_OK.
+		 */
+		result |= reindex_relation(toast_relid, flags,
+								   options & ~(REINDEXOPT_MISSING_OK));
+	}
 
 	return result;
 }
@@ -3805,6 +3986,7 @@ reindex_relation(Oid relid, int flags, int options)
 static Oid	currentlyReindexedHeap = InvalidOid;
 static Oid	currentlyReindexedIndex = InvalidOid;
 static List *pendingReindexedIndexes = NIL;
+static int	reindexingNestLevel = 0;
 
 /*
  * ReindexIsProcessingHeap
@@ -3841,8 +4023,6 @@ ReindexIsProcessingIndex(Oid indexOid)
 /*
  * SetReindexProcessing
  *		Set flag that specified heap/index are being reindexed.
- *
- * NB: caller must use a PG_TRY block to ensure ResetReindexProcessing is done.
  */
 static void
 SetReindexProcessing(Oid heapOid, Oid indexOid)
@@ -3855,6 +4035,8 @@ SetReindexProcessing(Oid heapOid, Oid indexOid)
 	currentlyReindexedIndex = indexOid;
 	/* Index is no longer "pending" reindex. */
 	RemoveReindexPending(indexOid);
+	/* This may have been set already, but in case it isn't, do so now. */
+	reindexingNestLevel = GetCurrentTransactionNestLevel();
 }
 
 /*
@@ -3864,17 +4046,16 @@ SetReindexProcessing(Oid heapOid, Oid indexOid)
 static void
 ResetReindexProcessing(void)
 {
-	/* This may be called in leader error path */
 	currentlyReindexedHeap = InvalidOid;
 	currentlyReindexedIndex = InvalidOid;
+	/* reindexingNestLevel remains set till end of (sub)transaction */
 }
 
 /*
  * SetReindexPending
  *		Mark the given indexes as pending reindex.
  *
- * NB: caller must use a PG_TRY block to ensure ResetReindexPending is done.
- * Also, we assume that the current memory context stays valid throughout.
+ * NB: we assume that the current memory context stays valid throughout.
  */
 static void
 SetReindexPending(List *indexes)
@@ -3885,6 +4066,7 @@ SetReindexPending(List *indexes)
 	if (IsInParallelMode())
 		elog(ERROR, "cannot modify reindex state during a parallel operation");
 	pendingReindexedIndexes = list_copy(indexes);
+	reindexingNestLevel = GetCurrentTransactionNestLevel();
 }
 
 /*
@@ -3901,14 +4083,32 @@ RemoveReindexPending(Oid indexOid)
 }
 
 /*
- * ResetReindexPending
- *		Unset reindex-pending status.
+ * ResetReindexState
+ *		Clear all reindexing state during (sub)transaction abort.
  */
-static void
-ResetReindexPending(void)
+void
+ResetReindexState(int nestLevel)
 {
-	/* This may be called in leader error path */
-	pendingReindexedIndexes = NIL;
+	/*
+	 * Because reindexing is not re-entrant, we don't need to cope with nested
+	 * reindexing states.  We just need to avoid messing up the outer-level
+	 * state in case a subtransaction fails within a REINDEX.  So checking the
+	 * current nest level against that of the reindex operation is sufficient.
+	 */
+	if (reindexingNestLevel >= nestLevel)
+	{
+		currentlyReindexedHeap = InvalidOid;
+		currentlyReindexedIndex = InvalidOid;
+
+		/*
+		 * We needn't try to release the contents of pendingReindexedIndexes;
+		 * that list should be in a transaction-lifespan context, so it will
+		 * go away automatically.
+		 */
+		pendingReindexedIndexes = NIL;
+
+		reindexingNestLevel = 0;
+	}
 }
 
 /*
@@ -3961,4 +4161,7 @@ RestoreReindexState(void *reindexstate)
 			lappend_oid(pendingReindexedIndexes,
 						sistate->pendingReindexedIndexes[c]);
 	MemoryContextSwitchTo(oldcontext);
+
+	/* Note the worker has its own transaction nesting level */
+	reindexingNestLevel = GetCurrentTransactionNestLevel();
 }

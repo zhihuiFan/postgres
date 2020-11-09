@@ -49,7 +49,9 @@ SELECT ' INFINITY    x'::float4;
 
 SELECT 'Infinity'::float4 + 100.0;
 SELECT 'Infinity'::float4 / 'Infinity'::float4;
+SELECT '42'::float4 / 'Infinity'::float4;
 SELECT 'nan'::float4 / 'nan'::float4;
+SELECT 'nan'::float4 / '0'::float4;
 SELECT 'nan'::numeric::float4;
 
 SELECT '' AS five, * FROM FLOAT4_TBL;

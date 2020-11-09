@@ -46,7 +46,7 @@
 #include "utils/memutils.h"
 
 /* default init hook can be overridden by a shared library */
-static void  default_openssl_tls_init(SSL_CTX *context, bool isServerStart);
+static void default_openssl_tls_init(SSL_CTX *context, bool isServerStart);
 openssl_tls_init_hook_typ openssl_tls_init_hook = default_openssl_tls_init;
 
 static int	my_sock_read(BIO *h, char *buf, int size);
@@ -72,6 +72,7 @@ static bool dummy_ssl_passwd_cb_called = false;
 static bool ssl_is_server_start;
 
 static int	ssl_protocol_version_to_openssl(int v);
+static const char *ssl_protocol_version_to_string(int v);
 
 /* ------------------------------------------------------------ */
 /*						 Public interface						*/
@@ -80,7 +81,7 @@ static int	ssl_protocol_version_to_openssl(int v);
 int
 be_tls_init(bool isServerStart)
 {
-	STACK_OF(X509_NAME) *root_cert_list = NULL;
+	STACK_OF(X509_NAME) * root_cert_list = NULL;
 	SSL_CTX    *context;
 	int			ssl_ver_min = -1;
 	int			ssl_ver_max = -1;
@@ -122,7 +123,7 @@ be_tls_init(bool isServerStart)
 	/*
 	 * Call init hook (usually to set password callback)
 	 */
-	(* openssl_tls_init_hook)(context, isServerStart);
+	(*openssl_tls_init_hook) (context, isServerStart);
 
 	/* used by the callback */
 	ssl_is_server_start = isServerStart;
@@ -226,12 +227,14 @@ be_tls_init(bool isServerStart)
 		 * as the code above would have already generated an error.
 		 */
 		if (ssl_ver_min > ssl_ver_max)
+		{
 			ereport(isServerStart ? FATAL : LOG,
 					(errmsg("could not set SSL protocol version range"),
 					 errdetail("\"%s\" cannot be higher than \"%s\"",
 							   "ssl_min_protocol_version",
 							   "ssl_max_protocol_version")));
-		goto error;
+			goto error;
+		}
 	}
 
 	/* disallow SSL session tickets */
@@ -363,6 +366,7 @@ be_tls_open_server(Port *port)
 	int			err;
 	int			waitfor;
 	unsigned long ecode;
+	bool		give_proto_hint;
 
 	Assert(!port->ssl);
 	Assert(!port->peer);
@@ -449,10 +453,52 @@ aloop:
 							 errmsg("could not accept SSL connection: EOF detected")));
 				break;
 			case SSL_ERROR_SSL:
+				switch (ERR_GET_REASON(ecode))
+				{
+						/*
+						 * UNSUPPORTED_PROTOCOL, WRONG_VERSION_NUMBER, and
+						 * TLSV1_ALERT_PROTOCOL_VERSION have been observed
+						 * when trying to communicate with an old OpenSSL
+						 * library, or when the client and server specify
+						 * disjoint protocol ranges.  NO_PROTOCOLS_AVAILABLE
+						 * occurs if there's a local misconfiguration (which
+						 * can happen despite our checks, if openssl.cnf
+						 * injects a limit we didn't account for).  It's not
+						 * very clear what would make OpenSSL return the other
+						 * codes listed here, but a hint about protocol
+						 * versions seems like it's appropriate for all.
+						 */
+					case SSL_R_NO_PROTOCOLS_AVAILABLE:
+					case SSL_R_UNSUPPORTED_PROTOCOL:
+					case SSL_R_BAD_PROTOCOL_VERSION_NUMBER:
+					case SSL_R_UNKNOWN_PROTOCOL:
+					case SSL_R_UNKNOWN_SSL_VERSION:
+					case SSL_R_UNSUPPORTED_SSL_VERSION:
+					case SSL_R_WRONG_SSL_VERSION:
+					case SSL_R_WRONG_VERSION_NUMBER:
+					case SSL_R_TLSV1_ALERT_PROTOCOL_VERSION:
+#ifdef SSL_R_VERSION_TOO_HIGH
+					case SSL_R_VERSION_TOO_HIGH:
+					case SSL_R_VERSION_TOO_LOW:
+#endif
+						give_proto_hint = true;
+						break;
+					default:
+						give_proto_hint = false;
+						break;
+				}
 				ereport(COMMERROR,
 						(errcode(ERRCODE_PROTOCOL_VIOLATION),
 						 errmsg("could not accept SSL connection: %s",
-								SSLerrmessage(ecode))));
+								SSLerrmessage(ecode)),
+						 give_proto_hint ?
+						 errhint("This may indicate that the client does not support any SSL protocol version between %s and %s.",
+								 ssl_min_protocol_version ?
+								 ssl_protocol_version_to_string(ssl_min_protocol_version) :
+								 MIN_OPENSSL_TLS_VERSION,
+								 ssl_max_protocol_version ?
+								 ssl_protocol_version_to_string(ssl_max_protocol_version) :
+								 MAX_OPENSSL_TLS_VERSION) : 0));
 				break;
 			case SSL_ERROR_ZERO_RETURN:
 				ereport(COMMERROR,
@@ -870,8 +916,9 @@ load_dh_file(char *filename, bool isServerStart)
 /*
  *	Load hardcoded DH parameters.
  *
- *	To prevent problems if the DH parameters files don't even
- *	exist, we can load DH parameters hardcoded into this file.
+ *	If DH parameters cannot be loaded from a specified file, we can load
+ *	the	hardcoded DH parameters supplied with the backend to prevent
+ *	problems.
  */
 static DH  *
 load_dh_buffer(const char *buffer, size_t len)
@@ -1251,15 +1298,28 @@ X509_NAME_to_cstring(X509_NAME *name)
 	char	   *dp;
 	char	   *result;
 
+	if (membuf == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("failed to create BIO")));
+
 	(void) BIO_set_close(membuf, BIO_CLOSE);
 	for (i = 0; i < count; i++)
 	{
 		e = X509_NAME_get_entry(name, i);
 		nid = OBJ_obj2nid(X509_NAME_ENTRY_get_object(e));
+		if (nid == NID_undef)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("could not get NID for ASN1_OBJECT object")));
 		v = X509_NAME_ENTRY_get_data(e);
 		field_name = OBJ_nid2sn(nid);
-		if (!field_name)
+		if (field_name == NULL)
 			field_name = OBJ_nid2ln(nid);
+		if (field_name == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("could not convert NID %d to an ASN1_OBJECT structure", nid)));
 		BIO_printf(membuf, "/%s=", field_name);
 		ASN1_STRING_print_ex(membuf, v,
 							 ((ASN1_STRFLGS_RFC2253 & ~ASN1_STRFLGS_ESC_MSB)
@@ -1275,7 +1335,8 @@ X509_NAME_to_cstring(X509_NAME *name)
 	result = pstrdup(dp);
 	if (dp != sp)
 		pfree(dp);
-	BIO_free(membuf);
+	if (BIO_free(membuf) != 1)
+		elog(ERROR, "could not free OpenSSL BIO structure");
 
 	return result;
 }
@@ -1325,6 +1386,29 @@ ssl_protocol_version_to_openssl(int v)
 	return -1;
 }
 
+/*
+ * Likewise provide a mapping to strings.
+ */
+static const char *
+ssl_protocol_version_to_string(int v)
+{
+	switch (v)
+	{
+		case PG_TLS_ANY:
+			return "any";
+		case PG_TLS1_VERSION:
+			return "TLSv1";
+		case PG_TLS1_1_VERSION:
+			return "TLSv1.1";
+		case PG_TLS1_2_VERSION:
+			return "TLSv1.2";
+		case PG_TLS1_3_VERSION:
+			return "TLSv1.3";
+	}
+
+	return "(unrecognized)";
+}
+
 
 static void
 default_openssl_tls_init(SSL_CTX *context, bool isServerStart)
@@ -1339,6 +1423,7 @@ default_openssl_tls_init(SSL_CTX *context, bool isServerStart)
 		if (ssl_passphrase_command[0] && ssl_passphrase_command_supports_reload)
 			SSL_CTX_set_default_passwd_cb(context, ssl_external_passwd_cb);
 		else
+
 			/*
 			 * If reloading and no external command is configured, override
 			 * OpenSSL's default handling of passphrase-protected files,

@@ -25,6 +25,7 @@
 #include "parser/parse_relation.h"
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"		/* needed for datumIsEqual() */
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
@@ -1522,6 +1523,43 @@ coerce_to_common_type(ParseState *pstate, Node *node,
 }
 
 /*
+ * select_common_typmod()
+ *		Determine the common typmod of a list of input expressions.
+ *
+ * common_type is the selected common type of the expressions, typically
+ * computed using select_common_type().
+ */
+int32
+select_common_typmod(ParseState *pstate, List *exprs, Oid common_type)
+{
+	ListCell   *lc;
+	bool		first = true;
+	int32		result = -1;
+
+	foreach(lc, exprs)
+	{
+		Node   *expr = (Node *) lfirst(lc);
+
+		/* Types must match */
+		if (exprType(expr) != common_type)
+			return -1;
+		else if (first)
+		{
+			result = exprTypmod(expr);
+			first = false;
+		}
+		else
+		{
+			/* As soon as we see a non-matching typmod, fall back to -1 */
+			if (result != exprTypmod(expr))
+				return -1;
+		}
+	}
+
+	return result;
+}
+
+/*
  * check_generic_type_consistency()
  *		Are the actual arguments potentially compatible with a
  *		polymorphic function?
@@ -1813,7 +1851,8 @@ check_generic_type_consistency(const Oid *actual_arg_types,
  * arguments to the proper type.
  *
  * Rules are applied to the function's return type (possibly altering it)
- * if it is declared as a polymorphic type:
+ * if it is declared as a polymorphic type and there is at least one
+ * polymorphic argument type:
  *
  * 1) If return type is ANYELEMENT, and any argument is ANYELEMENT, use the
  *	  argument's actual type as the function's return type.
@@ -1821,11 +1860,11 @@ check_generic_type_consistency(const Oid *actual_arg_types,
  *	  argument's actual type as the function's return type.
  * 3) Similarly, if return type is ANYRANGE, and any argument is ANYRANGE,
  *	  use the argument's actual type as the function's return type.
- * 4) Otherwise, if return type is ANYELEMENT or ANYARRAY, there should be
- *	  at least one ANYELEMENT, ANYARRAY, or ANYRANGE input; deduce the
+ * 4) Otherwise, if return type is ANYELEMENT or ANYARRAY, and there is
+ *	  at least one ANYELEMENT, ANYARRAY, or ANYRANGE input, deduce the
  *	  return type from those inputs, or throw error if we can't.
- * 5) Otherwise, if return type is ANYRANGE, throw error.  (There should
- *	  be at least one ANYRANGE input, since CREATE FUNCTION enforces that.)
+ * 5) Otherwise, if return type is ANYRANGE, throw error.  (We have no way to
+ *	  select a specific range type if the arguments don't include ANYRANGE.)
  * 6) ANYENUM is treated the same as ANYELEMENT except that if it is used
  *	  (alone or in combination with plain ANYELEMENT), we add the extra
  *	  condition that the ANYELEMENT type must be an enum.
@@ -1869,6 +1908,11 @@ check_generic_type_consistency(const Oid *actual_arg_types,
  * input to an ANYCOMPATIBLEARRAY argument, but at present that seems useless
  * as well, since there's no value in using ANYCOMPATIBLEARRAY unless there's
  * at least one other ANYCOMPATIBLE-family argument or result.
+ *
+ * Also, if there are no arguments declared to be of polymorphic types,
+ * we'll return the rettype unmodified even if it's polymorphic.  This should
+ * never occur for user-declared functions, because CREATE FUNCTION prevents
+ * it.  But it does happen for some built-in functions, such as array_in().
  */
 Oid
 enforce_generic_type_consistency(const Oid *actual_arg_types,
@@ -2042,13 +2086,10 @@ enforce_generic_type_consistency(const Oid *actual_arg_types,
 
 	/*
 	 * Fast Track: if none of the arguments are polymorphic, return the
-	 * unmodified rettype.  We assume it can't be polymorphic either.
+	 * unmodified rettype.  Not our job to resolve it if it's polymorphic.
 	 */
 	if (n_poly_args == 0 && !have_poly_anycompatible)
-	{
-		Assert(!IsPolymorphicType(rettype));
 		return rettype;
-	}
 
 	/* Check matching of family-1 polymorphic arguments, if any */
 	if (n_poly_args)
@@ -2151,8 +2192,8 @@ enforce_generic_type_consistency(const Oid *actual_arg_types,
 			else
 			{
 				/*
-				 * Only way to get here is if all the polymorphic args have
-				 * UNKNOWN inputs
+				 * Only way to get here is if all the family-1 polymorphic
+				 * arguments have UNKNOWN inputs.
 				 */
 				ereport(ERROR,
 						(errcode(ERRCODE_DATATYPE_MISMATCH),
@@ -2250,10 +2291,10 @@ enforce_generic_type_consistency(const Oid *actual_arg_types,
 			else
 			{
 				/*
-				 * Only way to get here is if all the ANYCOMPATIBLE args have
-				 * UNKNOWN inputs.  Resolve to TEXT as select_common_type()
-				 * would do.  That doesn't license us to use TEXTRANGE,
-				 * though.
+				 * Only way to get here is if all the family-2 polymorphic
+				 * arguments have UNKNOWN inputs.  Resolve to TEXT as
+				 * select_common_type() would do.  That doesn't license us to
+				 * use TEXTRANGE, though.
 				 */
 				anycompatible_typeid = TEXTOID;
 				anycompatible_array_typeid = TEXTARRAYOID;
@@ -2265,7 +2306,7 @@ enforce_generic_type_consistency(const Oid *actual_arg_types,
 			}
 		}
 
-		/* replace polymorphic types by selected types */
+		/* replace family-2 polymorphic types by selected types */
 		for (int j = 0; j < nargs; j++)
 		{
 			Oid			decl_type = declared_arg_types[j];
@@ -2281,11 +2322,11 @@ enforce_generic_type_consistency(const Oid *actual_arg_types,
 	}
 
 	/*
-	 * If we had any UNKNOWN inputs for polymorphic arguments, re-scan to
-	 * assign correct types to them.
+	 * If we had any UNKNOWN inputs for family-1 polymorphic arguments,
+	 * re-scan to assign correct types to them.
 	 *
 	 * Note: we don't have to consider unknown inputs that were matched to
-	 * ANYCOMPATIBLE-family arguments, because we forcibly updated their
+	 * family-2 polymorphic arguments, because we forcibly updated their
 	 * declared_arg_types[] positions just above.
 	 */
 	if (have_poly_unknowns)

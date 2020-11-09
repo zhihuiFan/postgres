@@ -23,6 +23,7 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_enum.h"
+#include "catalog/storage.h"
 #include "commands/async.h"
 #include "executor/execParallel.h"
 #include "libpq/libpq.h"
@@ -71,9 +72,10 @@
 #define PARALLEL_KEY_TRANSACTION_STATE		UINT64CONST(0xFFFFFFFFFFFF0008)
 #define PARALLEL_KEY_ENTRYPOINT				UINT64CONST(0xFFFFFFFFFFFF0009)
 #define PARALLEL_KEY_SESSION_DSM			UINT64CONST(0xFFFFFFFFFFFF000A)
-#define PARALLEL_KEY_REINDEX_STATE			UINT64CONST(0xFFFFFFFFFFFF000B)
-#define PARALLEL_KEY_RELMAPPER_STATE		UINT64CONST(0xFFFFFFFFFFFF000C)
-#define PARALLEL_KEY_ENUMBLACKLIST			UINT64CONST(0xFFFFFFFFFFFF000D)
+#define PARALLEL_KEY_PENDING_SYNCS			UINT64CONST(0xFFFFFFFFFFFF000B)
+#define PARALLEL_KEY_REINDEX_STATE			UINT64CONST(0xFFFFFFFFFFFF000C)
+#define PARALLEL_KEY_RELMAPPER_STATE		UINT64CONST(0xFFFFFFFFFFFF000D)
+#define PARALLEL_KEY_ENUMBLACKLIST			UINT64CONST(0xFFFFFFFFFFFF000E)
 
 /* Fixed-size parallel state. */
 typedef struct FixedParallelState
@@ -87,9 +89,9 @@ typedef struct FixedParallelState
 	Oid			temp_toast_namespace_id;
 	int			sec_context;
 	bool		is_superuser;
-	PGPROC	   *parallel_master_pgproc;
-	pid_t		parallel_master_pid;
-	BackendId	parallel_master_backend_id;
+	PGPROC	   *parallel_leader_pgproc;
+	pid_t		parallel_leader_pid;
+	BackendId	parallel_leader_backend_id;
 	TimestampTz xact_ts;
 	TimestampTz stmt_ts;
 	SerializableXactHandle serializable_xact_handle;
@@ -122,7 +124,7 @@ static FixedParallelState *MyFixedParallelState;
 static dlist_head pcxt_list = DLIST_STATIC_INIT(pcxt_list);
 
 /* Backend-local copy of data from FixedParallelState. */
-static pid_t ParallelMasterPid;
+static pid_t ParallelLeaderPid;
 
 /*
  * List of internal parallel worker entry points.  We need this for
@@ -206,6 +208,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	Size		tsnaplen = 0;
 	Size		asnaplen = 0;
 	Size		tstatelen = 0;
+	Size		pendingsyncslen = 0;
 	Size		reindexlen = 0;
 	Size		relmapperlen = 0;
 	Size		enumblacklistlen = 0;
@@ -258,6 +261,8 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		tstatelen = EstimateTransactionStateSpace();
 		shm_toc_estimate_chunk(&pcxt->estimator, tstatelen);
 		shm_toc_estimate_chunk(&pcxt->estimator, sizeof(dsm_handle));
+		pendingsyncslen = EstimatePendingSyncsSpace();
+		shm_toc_estimate_chunk(&pcxt->estimator, pendingsyncslen);
 		reindexlen = EstimateReindexStateSpace();
 		shm_toc_estimate_chunk(&pcxt->estimator, reindexlen);
 		relmapperlen = EstimateRelationMapSpace();
@@ -265,7 +270,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		enumblacklistlen = EstimateEnumBlacklistSpace();
 		shm_toc_estimate_chunk(&pcxt->estimator, enumblacklistlen);
 		/* If you add more chunks here, you probably need to add keys. */
-		shm_toc_estimate_keys(&pcxt->estimator, 10);
+		shm_toc_estimate_keys(&pcxt->estimator, 11);
 
 		/* Estimate space need for error queues. */
 		StaticAssertStmt(BUFFERALIGN(PARALLEL_ERROR_QUEUE_SIZE) ==
@@ -318,9 +323,9 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	GetUserIdAndSecContext(&fps->current_user_id, &fps->sec_context);
 	GetTempNamespaceState(&fps->temp_namespace_id,
 						  &fps->temp_toast_namespace_id);
-	fps->parallel_master_pgproc = MyProc;
-	fps->parallel_master_pid = MyProcPid;
-	fps->parallel_master_backend_id = MyBackendId;
+	fps->parallel_leader_pgproc = MyProc;
+	fps->parallel_leader_pid = MyProcPid;
+	fps->parallel_leader_backend_id = MyBackendId;
 	fps->xact_ts = GetCurrentTransactionStartTimestamp();
 	fps->stmt_ts = GetCurrentStatementStartTimestamp();
 	fps->serializable_xact_handle = ShareSerializableXact();
@@ -337,6 +342,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		char	   *tsnapspace;
 		char	   *asnapspace;
 		char	   *tstatespace;
+		char	   *pendingsyncsspace;
 		char	   *reindexspace;
 		char	   *relmapperspace;
 		char	   *error_queue_space;
@@ -380,6 +386,12 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		tstatespace = shm_toc_allocate(pcxt->toc, tstatelen);
 		SerializeTransactionState(tstatelen, tstatespace);
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_TRANSACTION_STATE, tstatespace);
+
+		/* Serialize pending syncs. */
+		pendingsyncsspace = shm_toc_allocate(pcxt->toc, pendingsyncslen);
+		SerializePendingSyncs(pendingsyncslen, pendingsyncsspace);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_PENDING_SYNCS,
+					   pendingsyncsspace);
 
 		/* Serialize reindex state. */
 		reindexspace = shm_toc_allocate(pcxt->toc, reindexlen);
@@ -493,7 +505,7 @@ ReinitializeParallelDSM(ParallelContext *pcxt)
 
 /*
  * Reinitialize parallel workers for a parallel context such that we could
- * launch the different number of workers.  This is required for cases where
+ * launch a different number of workers.  This is required for cases where
  * we need to reuse the same DSM segment, but the number of workers can
  * vary from run-to-run.
  */
@@ -845,8 +857,8 @@ WaitForParallelWorkersToFinish(ParallelContext *pcxt)
  *
  * This function ensures that workers have been completely shutdown.  The
  * difference between WaitForParallelWorkersToFinish and this function is
- * that former just ensures that last message sent by worker backend is
- * received by master backend whereas this ensures the complete shutdown.
+ * that the former just ensures that last message sent by a worker backend is
+ * received by the leader backend whereas this ensures the complete shutdown.
  */
 static void
 WaitForParallelWorkersToExit(ParallelContext *pcxt)
@@ -1242,6 +1254,7 @@ ParallelWorkerMain(Datum main_arg)
 	char	   *tsnapspace;
 	char	   *asnapspace;
 	char	   *tstatespace;
+	char	   *pendingsyncsspace;
 	char	   *reindexspace;
 	char	   *relmapperspace;
 	char	   *enumblacklistspace;
@@ -1289,8 +1302,8 @@ ParallelWorkerMain(Datum main_arg)
 	MyFixedParallelState = fps;
 
 	/* Arrange to signal the leader if we exit. */
-	ParallelMasterPid = fps->parallel_master_pid;
-	ParallelMasterBackendId = fps->parallel_master_backend_id;
+	ParallelLeaderPid = fps->parallel_leader_pid;
+	ParallelLeaderBackendId = fps->parallel_leader_backend_id;
 	on_shmem_exit(ParallelWorkerShutdown, (Datum) 0);
 
 	/*
@@ -1305,8 +1318,8 @@ ParallelWorkerMain(Datum main_arg)
 	shm_mq_set_sender(mq, MyProc);
 	mqh = shm_mq_attach(mq, seg, NULL);
 	pq_redirect_to_shm_mq(seg, mqh);
-	pq_set_parallel_master(fps->parallel_master_pid,
-						   fps->parallel_master_backend_id);
+	pq_set_parallel_leader(fps->parallel_leader_pid,
+						   fps->parallel_leader_backend_id);
 
 	/*
 	 * Send a BackendKeyData message to the process that initiated parallelism
@@ -1334,8 +1347,8 @@ ParallelWorkerMain(Datum main_arg)
 	 * deadlock.  (If we can't join the lock group, the leader has gone away,
 	 * so just exit quietly.)
 	 */
-	if (!BecomeLockGroupMember(fps->parallel_master_pgproc,
-							   fps->parallel_master_pid))
+	if (!BecomeLockGroupMember(fps->parallel_leader_pgproc,
+							   fps->parallel_leader_pid))
 		return;
 
 	/*
@@ -1397,7 +1410,7 @@ ParallelWorkerMain(Datum main_arg)
 	/* Restore transaction snapshot. */
 	tsnapspace = shm_toc_lookup(toc, PARALLEL_KEY_TRANSACTION_SNAPSHOT, false);
 	RestoreTransactionSnapshot(RestoreSnapshot(tsnapspace),
-							   fps->parallel_master_pgproc);
+							   fps->parallel_leader_pgproc);
 
 	/* Restore active snapshot. */
 	asnapspace = shm_toc_lookup(toc, PARALLEL_KEY_ACTIVE_SNAPSHOT, false);
@@ -1422,6 +1435,11 @@ ParallelWorkerMain(Datum main_arg)
 	/* Restore temp-namespace state to ensure search path matches leader's. */
 	SetTempNamespaceState(fps->temp_namespace_id,
 						  fps->temp_toast_namespace_id);
+
+	/* Restore pending syncs. */
+	pendingsyncsspace = shm_toc_lookup(toc, PARALLEL_KEY_PENDING_SYNCS,
+									   false);
+	RestorePendingSyncs(pendingsyncsspace);
 
 	/* Restore reindex state. */
 	reindexspace = shm_toc_lookup(toc, PARALLEL_KEY_REINDEX_STATE, false);
@@ -1492,9 +1510,9 @@ ParallelWorkerReportLastRecEnd(XLogRecPtr last_xlog_end)
 static void
 ParallelWorkerShutdown(int code, Datum arg)
 {
-	SendProcSignal(ParallelMasterPid,
+	SendProcSignal(ParallelLeaderPid,
 				   PROCSIG_PARALLEL_MESSAGE,
-				   ParallelMasterBackendId);
+				   ParallelLeaderBackendId);
 }
 
 /*

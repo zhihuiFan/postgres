@@ -311,6 +311,7 @@ SELECT ARRAY[[['hello','world']]] || ARRAY[[['happy','birthday']]] AS "ARRAY";
 SELECT ARRAY[[1,2],[3,4]] || ARRAY[5,6] AS "{{1,2},{3,4},{5,6}}";
 SELECT ARRAY[0,0] || ARRAY[1,1] || ARRAY[2,2] AS "{0,0,1,1,2,2}";
 SELECT 0 || ARRAY[1,2] || 3 AS "{0,1,2,3}";
+SELECT ARRAY[1.1] || ARRAY[2,3,4];
 
 SELECT * FROM array_op_test WHERE i @> '{32}' ORDER BY seqno;
 SELECT * FROM array_op_test WHERE i && '{32}' ORDER BY seqno;
@@ -544,6 +545,21 @@ select string_to_array('1,2,3,4,,6', ',');
 select string_to_array('1,2,3,4,,6', ',', '');
 select string_to_array('1,2,3,4,*,6', ',', '*');
 
+select v, v is null as "is null" from string_to_table('1|2|3', '|') g(v);
+select v, v is null as "is null" from string_to_table('1|2|3|', '|') g(v);
+select v, v is null as "is null" from string_to_table('1||2|3||', '||') g(v);
+select v, v is null as "is null" from string_to_table('1|2|3', '') g(v);
+select v, v is null as "is null" from string_to_table('', '|') g(v);
+select v, v is null as "is null" from string_to_table('1|2|3', NULL) g(v);
+select v, v is null as "is null" from string_to_table(NULL, '|') g(v);
+select v, v is null as "is null" from string_to_table('abc', '') g(v);
+select v, v is null as "is null" from string_to_table('abc', '', 'abc') g(v);
+select v, v is null as "is null" from string_to_table('abc', ',') g(v);
+select v, v is null as "is null" from string_to_table('abc', ',', 'abc') g(v);
+select v, v is null as "is null" from string_to_table('1,2,3,4,,6', ',') g(v);
+select v, v is null as "is null" from string_to_table('1,2,3,4,,6', ',', '') g(v);
+select v, v is null as "is null" from string_to_table('1,2,3,4,*,6', ',', '*') g(v);
+
 select array_to_string(NULL::int4[], ',') IS NULL;
 select array_to_string('{}'::int4[], ',');
 select array_to_string(array[1,2,3,4,NULL,6], ',');
@@ -601,6 +617,7 @@ select array_remove(array[1,2,2,3], 2);
 select array_remove(array[1,2,2,3], 5);
 select array_remove(array[1,NULL,NULL,3], NULL);
 select array_remove(array['A','CC','D','C','RR'], 'RR');
+select array_remove(array[1.0, 2.1, 3.3], 1);
 select array_remove('{{1,2,2},{1,4,3}}', 2); -- not allowed
 select array_remove(array['X','X','X'], 'X') = '{}';
 select array_replace(array[1,2,5,4],5,3);

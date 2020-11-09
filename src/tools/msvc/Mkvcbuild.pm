@@ -43,15 +43,14 @@ my $contrib_extrasource = {
 	'seg'  => [ 'contrib/seg/segscan.l',   'contrib/seg/segparse.y' ],
 };
 my @contrib_excludes = (
-	'bool_plperl',
-	'commit_ts',        'hstore_plperl',
-	'hstore_plpython',  'intagg',
-	'jsonb_plperl',     'jsonb_plpython',
-	'ltree_plpython',   'pgcrypto',
-	'sepgsql',          'brin',
-	'test_extensions',  'test_misc',
-	'test_pg_dump',     'snapshot_too_old',
-	'unsafe_tests');
+	'bool_plperl',      'commit_ts',
+	'hstore_plperl',    'hstore_plpython',
+	'intagg',           'jsonb_plperl',
+	'jsonb_plpython',   'ltree_plpython',
+	'pgcrypto',         'sepgsql',
+	'brin',             'test_extensions',
+	'test_misc',        'test_pg_dump',
+	'snapshot_too_old', 'unsafe_tests');
 
 # Set of variables for frontend modules
 my $frontend_defines = { 'initdb' => 'FRONTEND' };
@@ -103,8 +102,8 @@ sub mkvcbuild
 	  pread.c pwrite.c pg_bitutils.c
 	  pg_strong_random.c pgcheckdir.c pgmkdirp.c pgsleep.c pgstrcasecmp.c
 	  pqsignal.c mkdtemp.c qsort.c qsort_arg.c quotes.c system.c
-	  sprompt.c strerror.c tar.c thread.c
-	  win32env.c win32error.c win32security.c win32setlocale.c);
+	  strerror.c tar.c thread.c
+	  win32env.c win32error.c win32security.c win32setlocale.c win32stat.c);
 
 	push(@pgportfiles, 'strtof.c') if ($vsVersion < '14.00');
 
@@ -120,11 +119,11 @@ sub mkvcbuild
 	}
 
 	our @pgcommonallfiles = qw(
-	  archive.c
-	  base64.c config_info.c controldata_utils.c d2s.c encnames.c exec.c
-	  f2s.c file_perm.c hashfn.c ip.c jsonapi.c
+	  archive.c base64.c checksum_helper.c
+	  config_info.c controldata_utils.c d2s.c encnames.c exec.c
+	  f2s.c file_perm.c file_utils.c hashfn.c ip.c jsonapi.c
 	  keywords.c kwlookup.c link-canary.c md5.c
-	  pg_lzcompress.c pgfnames.c psprintf.c relpath.c rmtree.c
+	  pg_get_line.c pg_lzcompress.c pgfnames.c psprintf.c relpath.c rmtree.c
 	  saslprep.c scram-common.c string.c stringinfo.c unicode_norm.c username.c
 	  wait_error.c wchar.c);
 
@@ -139,14 +138,14 @@ sub mkvcbuild
 	}
 
 	our @pgcommonfrontendfiles = (
-		@pgcommonallfiles, qw(fe_memutils.c file_utils.c
-		  logging.c restricted_token.c));
+		@pgcommonallfiles, qw(fe_memutils.c
+		  logging.c restricted_token.c sprompt.c));
 
 	our @pgcommonbkndfiles = @pgcommonallfiles;
 
 	our @pgfeutilsfiles = qw(
-	  cancel.c conditional.c mbprint.c print.c psqlscan.l psqlscan.c
-	  simple_list.c string_utils.c recovery_gen.c);
+	  archive.c cancel.c conditional.c mbprint.c print.c psqlscan.l
+	  psqlscan.c simple_list.c string_utils.c recovery_gen.c);
 
 	$libpgport = $solution->AddProject('libpgport', 'lib', 'misc');
 	$libpgport->AddDefine('FRONTEND');
@@ -303,7 +302,8 @@ sub mkvcbuild
 	$libecpgcompat->AddIncludeDir('src/interfaces/ecpg/include');
 	$libecpgcompat->AddIncludeDir('src/interfaces/libpq');
 	$libecpgcompat->UseDef('src/interfaces/ecpg/compatlib/compatlib.def');
-	$libecpgcompat->AddReference($pgtypes, $libecpg, $libpgport, $libpgcommon);
+	$libecpgcompat->AddReference($pgtypes, $libecpg, $libpgport,
+		$libpgcommon);
 
 	my $ecpg = $solution->AddProject('ecpg', 'exe', 'interfaces',
 		'src/interfaces/ecpg/preproc');
@@ -498,7 +498,7 @@ sub mkvcbuild
 		my $pythonprog = "import sys;print(sys.prefix);"
 		  . "print(str(sys.version_info[0])+str(sys.version_info[1]))";
 		my $prefixcmd =
-		  $solution->{options}->{python} . "\\python -c \"$pythonprog\"";
+		  qq("$solution->{options}->{python}\\python" -c "$pythonprog");
 		my $pyout = `$prefixcmd`;
 		die "Could not query for python version!\n" if $?;
 		my ($pyprefix, $pyver) = split(/\r?\n/, $pyout);
@@ -651,11 +651,13 @@ sub mkvcbuild
 					# 'Can't spawn "conftest.exe"'; suppress that.
 					no warnings;
 
-					no strict 'subs'; ## no critic (ProhibitNoStrict)
+					no strict 'subs';    ## no critic (ProhibitNoStrict)
 
 					# Disable error dialog boxes like we do in the postmaster.
 					# Here, we run code that triggers relevant errors.
-					use if ($^O eq "MSWin32"), 'Win32API::File', qw(SetErrorMode :SEM_);
+					use
+					  if ($^O eq "MSWin32"), 'Win32API::File',
+					  qw(SetErrorMode :SEM_);
 					my $oldmode = SetErrorMode(
 						SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
 					system(".\\$exe");
@@ -766,8 +768,8 @@ sub mkvcbuild
 
 		# Add transform modules dependent on plperl
 		my $bool_plperl = AddTransformModule(
-			'bool_plperl',  'contrib/bool_plperl',
-			'plperl',       'src/pl/plperl');
+			'bool_plperl', 'contrib/bool_plperl',
+			'plperl',      'src/pl/plperl');
 		my $hstore_plperl = AddTransformModule(
 			'hstore_plperl', 'contrib/hstore_plperl',
 			'plperl',        'src/pl/plperl',

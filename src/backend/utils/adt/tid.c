@@ -32,6 +32,7 @@
 #include "storage/itemptr.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/varlena.h"
@@ -332,8 +333,13 @@ currtid_for_view(Relation viewrel, ItemPointer tid)
 					rte = rt_fetch(var->varno, query->rtable);
 					if (rte)
 					{
+						Datum		result;
+
+						result = DirectFunctionCall2(currtid_byreloid,
+													 ObjectIdGetDatum(rte->relid),
+													 PointerGetDatum(tid));
 						table_close(viewrel, AccessShareLock);
-						return DirectFunctionCall2(currtid_byreloid, ObjectIdGetDatum(rte->relid), PointerGetDatum(tid));
+						return result;
 					}
 				}
 			}
@@ -373,6 +379,11 @@ currtid_byreloid(PG_FUNCTION_ARGS)
 	if (rel->rd_rel->relkind == RELKIND_VIEW)
 		return currtid_for_view(rel, tid);
 
+	if (!RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+		elog(ERROR, "cannot look at latest visible tid for relation \"%s.%s\"",
+			 get_namespace_name(RelationGetNamespace(rel)),
+			 RelationGetRelationName(rel));
+
 	ItemPointerCopy(tid, result);
 
 	snapshot = RegisterSnapshot(GetLatestSnapshot());
@@ -409,6 +420,11 @@ currtid_byrelname(PG_FUNCTION_ARGS)
 
 	if (rel->rd_rel->relkind == RELKIND_VIEW)
 		return currtid_for_view(rel, tid);
+
+	if (!RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+		elog(ERROR, "cannot look at latest visible tid for relation \"%s.%s\"",
+			 get_namespace_name(RelationGetNamespace(rel)),
+			 RelationGetRelationName(rel));
 
 	result = (ItemPointer) palloc(sizeof(ItemPointerData));
 	ItemPointerCopy(tid, result);

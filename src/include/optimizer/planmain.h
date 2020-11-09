@@ -56,7 +56,10 @@ extern Agg *make_agg(List *tlist, List *qual,
 					 int numGroupCols, AttrNumber *grpColIdx, Oid *grpOperators, Oid *grpCollations,
 					 List *groupingSets, List *chain, double dNumGroups,
 					 Size transitionSpace, Plan *lefttree);
-extern Limit *make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount);
+extern Limit *make_limit(Plan *lefttree, Node *limitOffset, Node *limitCount,
+						 LimitOption limitOption, int uniqNumCols,
+						 AttrNumber *uniqColIdx, Oid *uniqOperators,
+						 Oid *uniqCollations);
 
 /*
  * prototypes for plan/initsplan.c
@@ -74,16 +77,16 @@ extern void create_lateral_join_info(PlannerInfo *root);
 extern List *deconstruct_jointree(PlannerInfo *root);
 extern void distribute_restrictinfo_to_rels(PlannerInfo *root,
 											RestrictInfo *restrictinfo);
-extern void process_implied_equality(PlannerInfo *root,
-									 Oid opno,
-									 Oid collation,
-									 Expr *item1,
-									 Expr *item2,
-									 Relids qualscope,
-									 Relids nullable_relids,
-									 Index security_level,
-									 bool below_outer_join,
-									 bool both_const);
+extern RestrictInfo *process_implied_equality(PlannerInfo *root,
+											  Oid opno,
+											  Oid collation,
+											  Expr *item1,
+											  Expr *item2,
+											  Relids qualscope,
+											  Relids nullable_relids,
+											  Index security_level,
+											  bool below_outer_join,
+											  bool both_const);
 extern RestrictInfo *build_implied_join_equality(Oid opno,
 												 Oid collation,
 												 Expr *item1,

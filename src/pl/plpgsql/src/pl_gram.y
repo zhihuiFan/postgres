@@ -107,7 +107,7 @@ static	void			 check_labels(const char *start_label,
 									  const char *end_label,
 									  int end_location);
 static	PLpgSQL_expr	*read_cursor_args(PLpgSQL_var *cursor,
-										  int until, const char *expected);
+										  int until);
 static	List			*read_raise_options(void);
 static	void			check_raise_parameters(PLpgSQL_stmt_raise *stmt);
 
@@ -1414,8 +1414,7 @@ for_control		: for_variable K_IN
 
 							/* collect cursor's parameters if any */
 							new->argquery = read_cursor_args(cursor,
-															 K_LOOP,
-															 "LOOP");
+															 K_LOOP);
 
 							/* create loop's private RECORD variable */
 							new->var = (PLpgSQL_variable *)
@@ -1725,7 +1724,7 @@ stmt_exit		: exit_type opt_label opt_exitcond
 						{
 							/*
 							 * No label, so make sure there is some loop (an
-							 * unlabelled EXIT does not match a block, so this
+							 * unlabeled EXIT does not match a block, so this
 							 * is the same test for both EXIT and CONTINUE)
 							 */
 							if (plpgsql_ns_find_nearest_loop(plpgsql_ns_top()) == NULL)
@@ -2129,7 +2128,7 @@ stmt_open		: K_OPEN cursor_variable
 						else
 						{
 							/* predefined cursor query, so read args */
-							new->argquery = read_cursor_args($2, ';', ";");
+							new->argquery = read_cursor_args($2, ';');
 						}
 
 						$$ = (PLpgSQL_stmt *)new;
@@ -3749,7 +3748,7 @@ check_labels(const char *start_label, const char *end_label, int end_location)
 		if (!start_label)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("end label \"%s\" specified for unlabelled block",
+					 errmsg("end label \"%s\" specified for unlabeled block",
 							end_label),
 					 parser_errposition(end_location)));
 
@@ -3773,7 +3772,7 @@ check_labels(const char *start_label, const char *end_label, int end_location)
  * parens).
  */
 static PLpgSQL_expr *
-read_cursor_args(PLpgSQL_var *cursor, int until, const char *expected)
+read_cursor_args(PLpgSQL_var *cursor, int until)
 {
 	PLpgSQL_expr *expr;
 	PLpgSQL_row *row;

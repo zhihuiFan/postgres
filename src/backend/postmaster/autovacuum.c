@@ -117,6 +117,8 @@ int			autovacuum_work_mem = -1;
 int			autovacuum_naptime;
 int			autovacuum_vac_thresh;
 double		autovacuum_vac_scale;
+int			autovacuum_vac_ins_thresh;
+double		autovacuum_vac_ins_scale;
 int			autovacuum_anl_thresh;
 double		autovacuum_anl_scale;
 int			autovacuum_freeze_max_age;
@@ -452,8 +454,8 @@ AutoVacLauncherMain(int argc, char *argv[])
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, StatementCancelHandler);
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 
-	pqsignal(SIGQUIT, quickdie);
 	InitializeTimeouts();		/* establishes SIGALRM handler */
 
 	pqsignal(SIGPIPE, SIG_IGN);
@@ -493,6 +495,13 @@ AutoVacLauncherMain(int argc, char *argv[])
 	 * If an exception is encountered, processing resumes here.
 	 *
 	 * This code is a stripped down version of PostgresMain error recovery.
+	 *
+	 * Note that we use sigsetjmp(..., 1), so that the prevailing signal mask
+	 * (to wit, BlockSig) will be restored when longjmp'ing to here.  Thus,
+	 * signals other than SIGQUIT will be blocked until we complete error
+	 * recovery.  It might seem that this policy makes the HOLD_INTERRUPTS()
+	 * call redundant, but it is not since InterruptPending might be set
+	 * already.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -651,8 +660,7 @@ AutoVacLauncherMain(int argc, char *argv[])
 		HandleAutoVacLauncherInterrupts();
 
 		/*
-		 * a worker finished, or postmaster signalled failure to start a
-		 * worker
+		 * a worker finished, or postmaster signaled failure to start a worker
 		 */
 		if (got_SIGUSR2)
 		{
@@ -832,7 +840,7 @@ HandleAutoVacLauncherInterrupts(void)
  * Perform a normal exit from the autovac launcher.
  */
 static void
-AutoVacLauncherShutdown()
+AutoVacLauncherShutdown(void)
 {
 	ereport(DEBUG1,
 			(errmsg("autovacuum launcher shutting down")));
@@ -1524,7 +1532,8 @@ AutoVacWorkerMain(int argc, char *argv[])
 	 */
 	pqsignal(SIGINT, StatementCancelHandler);
 	pqsignal(SIGTERM, die);
-	pqsignal(SIGQUIT, quickdie);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
+
 	InitializeTimeouts();		/* establishes SIGALRM handler */
 
 	pqsignal(SIGPIPE, SIG_IGN);
@@ -1549,7 +1558,15 @@ AutoVacWorkerMain(int argc, char *argv[])
 	/*
 	 * If an exception is encountered, processing resumes here.
 	 *
-	 * See notes in postgres.c about the design of this coding.
+	 * Unlike most auxiliary processes, we don't attempt to continue
+	 * processing after an error; we just clean up and exit.  The autovac
+	 * launcher is responsible for spawning another worker later.
+	 *
+	 * Note that we use sigsetjmp(..., 1), so that the prevailing signal mask
+	 * (to wit, BlockSig) will be restored when longjmp'ing to here.  Thus,
+	 * signals other than SIGQUIT will be blocked until we exit.  It might
+	 * seem that this policy makes the HOLD_INTERRUPTS() call redundant, but
+	 * it is not since InterruptPending might be set already.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -1876,6 +1893,10 @@ get_database_list(void)
 	 * the secondary effect that it sets RecentGlobalXmin.  (This is critical
 	 * for anything that reads heap pages, because HOT may decide to prune
 	 * them even if the process doesn't attempt to modify any tuples.)
+	 *
+	 * FIXME: This comment is inaccurate / the code buggy. A snapshot that is
+	 * not pushed/active does not reliably prevent HOT pruning (->xmin could
+	 * e.g. be cleared when cache invalidations are processed).
 	 */
 	StartTransactionCommand();
 	(void) GetTransactionSnapshot();
@@ -2488,7 +2509,7 @@ do_autovacuum(void)
 						   tab->at_datname, tab->at_nspname, tab->at_relname);
 			EmitErrorReport();
 
-			/* this resets the PGXACT flags too */
+			/* this resets ProcGlobal->vacuumFlags[i] too */
 			AbortOutOfAnyTransaction();
 			FlushErrorState();
 			MemoryContextResetAndDeleteChildren(PortalContext);
@@ -2504,7 +2525,7 @@ do_autovacuum(void)
 
 		did_vacuum = true;
 
-		/* the PGXACT flags are reset at the next end of transaction */
+		/* ProcGlobal->vacuumFlags[i] are reset at the next end of xact */
 
 		/* be tidy */
 deleted:
@@ -2681,7 +2702,7 @@ perform_work_item(AutoVacuumWorkItem *workitem)
 				   cur_datname, cur_nspname, cur_relname);
 		EmitErrorReport();
 
-		/* this resets the PGXACT flags too */
+		/* this resets ProcGlobal->vacuumFlags[i] too */
 		AbortOutOfAnyTransaction();
 		FlushErrorState();
 		MemoryContextResetAndDeleteChildren(PortalContext);
@@ -2969,16 +2990,20 @@ relation_needs_vacanalyze(Oid relid,
 
 	/* constants from reloptions or GUC variables */
 	int			vac_base_thresh,
+				vac_ins_base_thresh,
 				anl_base_thresh;
 	float4		vac_scale_factor,
+				vac_ins_scale_factor,
 				anl_scale_factor;
 
 	/* thresholds calculated from above constants */
 	float4		vacthresh,
+				vacinsthresh,
 				anlthresh;
 
 	/* number of vacuum (resp. analyze) tuples at this time */
 	float4		vactuples,
+				instuples,
 				anltuples;
 
 	/* freeze parameters */
@@ -3004,6 +3029,15 @@ relation_needs_vacanalyze(Oid relid,
 	vac_base_thresh = (relopts && relopts->vacuum_threshold >= 0)
 		? relopts->vacuum_threshold
 		: autovacuum_vac_thresh;
+
+	vac_ins_scale_factor = (relopts && relopts->vacuum_ins_scale_factor >= 0)
+		? relopts->vacuum_ins_scale_factor
+		: autovacuum_vac_ins_scale;
+
+	/* -1 is used to disable insert vacuums */
+	vac_ins_base_thresh = (relopts && relopts->vacuum_ins_threshold >= -1)
+		? relopts->vacuum_ins_threshold
+		: autovacuum_vac_ins_thresh;
 
 	anl_scale_factor = (relopts && relopts->analyze_scale_factor >= 0)
 		? relopts->analyze_scale_factor
@@ -3059,9 +3093,15 @@ relation_needs_vacanalyze(Oid relid,
 	{
 		reltuples = classForm->reltuples;
 		vactuples = tabentry->n_dead_tuples;
+		instuples = tabentry->inserts_since_vacuum;
 		anltuples = tabentry->changes_since_analyze;
 
+		/* If the table hasn't yet been vacuumed, take reltuples as zero */
+		if (reltuples < 0)
+			reltuples = 0;
+
 		vacthresh = (float4) vac_base_thresh + vac_scale_factor * reltuples;
+		vacinsthresh = (float4) vac_ins_base_thresh + vac_ins_scale_factor * reltuples;
 		anlthresh = (float4) anl_base_thresh + anl_scale_factor * reltuples;
 
 		/*
@@ -3069,12 +3109,18 @@ relation_needs_vacanalyze(Oid relid,
 		 * reset, because if that happens, the last vacuum and analyze counts
 		 * will be reset too.
 		 */
-		elog(DEBUG3, "%s: vac: %.0f (threshold %.0f), anl: %.0f (threshold %.0f)",
-			 NameStr(classForm->relname),
-			 vactuples, vacthresh, anltuples, anlthresh);
+		if (vac_ins_base_thresh >= 0)
+			elog(DEBUG3, "%s: vac: %.0f (threshold %.0f), ins: %.0f (threshold %.0f), anl: %.0f (threshold %.0f)",
+				 NameStr(classForm->relname),
+				 vactuples, vacthresh, instuples, vacinsthresh, anltuples, anlthresh);
+		else
+			elog(DEBUG3, "%s: vac: %.0f (threshold %.0f), ins: (disabled), anl: %.0f (threshold %.0f)",
+				 NameStr(classForm->relname),
+				 vactuples, vacthresh, anltuples, anlthresh);
 
 		/* Determine if this table needs vacuum or analyze. */
-		*dovacuum = force_vacuum || (vactuples > vacthresh);
+		*dovacuum = force_vacuum || (vactuples > vacthresh) ||
+			(vac_ins_base_thresh >= 0 && instuples > vacinsthresh);
 		*doanalyze = (anltuples > anlthresh);
 	}
 	else

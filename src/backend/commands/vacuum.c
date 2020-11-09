@@ -104,7 +104,6 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 	bool		freeze = false;
 	bool		full = false;
 	bool		disable_page_skipping = false;
-	bool		parallel_option = false;
 	ListCell   *lc;
 
 	/* Set default value */
@@ -145,7 +144,6 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 			params.truncate = get_vacopt_ternary_value(opt);
 		else if (strcmp(opt->defname, "parallel") == 0)
 		{
-			parallel_option = true;
 			if (opt->arg == NULL)
 			{
 				ereport(ERROR,
@@ -199,10 +197,10 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 		   !(params.options & (VACOPT_FULL | VACOPT_FREEZE)));
 	Assert(!(params.options & VACOPT_SKIPTOAST));
 
-	if ((params.options & VACOPT_FULL) && parallel_option)
+	if ((params.options & VACOPT_FULL) && params.nworkers > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot specify both FULL and PARALLEL options")));
+				 errmsg("VACUUM FULL cannot be performed in parallel")));
 
 	/*
 	 * Make sure VACOPT_ANALYZE is specified if any column lists are present.
@@ -909,6 +907,8 @@ get_all_vacuum_rels(int options)
 /*
  * vacuum_set_xid_limits() -- compute oldestXmin and freeze cutoff points
  *
+ * Input parameters are the target relation, applicable freeze age settings.
+ *
  * The output parameters are:
  * - oldestXmin is the cutoff value used to distinguish whether tuples are
  *	 DEAD or RECENTLY_DEAD (see HeapTupleSatisfiesVacuum).
@@ -951,14 +951,32 @@ vacuum_set_xid_limits(Relation rel,
 	/*
 	 * We can always ignore processes running lazy vacuum.  This is because we
 	 * use these values only for deciding which tuples we must keep in the
-	 * tables.  Since lazy vacuum doesn't write its XID anywhere, it's safe to
-	 * ignore it.  In theory it could be problematic to ignore lazy vacuums in
-	 * a full vacuum, but keep in mind that only one vacuum process can be
-	 * working on a particular table at any time, and that each vacuum is
-	 * always an independent transaction.
+	 * tables.  Since lazy vacuum doesn't write its XID anywhere (usually no
+	 * XID assigned), it's safe to ignore it.  In theory it could be
+	 * problematic to ignore lazy vacuums in a full vacuum, but keep in mind
+	 * that only one vacuum process can be working on a particular table at
+	 * any time, and that each vacuum is always an independent transaction.
 	 */
-	*oldestXmin =
-		TransactionIdLimitedForOldSnapshots(GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM), rel);
+	*oldestXmin = GetOldestNonRemovableTransactionId(rel);
+
+	if (OldSnapshotThresholdActive())
+	{
+		TransactionId limit_xmin;
+		TimestampTz limit_ts;
+
+		if (TransactionIdLimitedForOldSnapshots(*oldestXmin, rel,
+												&limit_xmin, &limit_ts))
+		{
+			/*
+			 * TODO: We should only set the threshold if we are pruning on the
+			 * basis of the increased limits.  Not as crucial here as it is
+			 * for opportunistic pruning (which often happens at a much higher
+			 * frequency), but would still be a significant improvement.
+			 */
+			SetOldSnapshotThresholdTimestamp(limit_ts, limit_xmin);
+			*oldestXmin = limit_xmin;
+		}
+	}
 
 	Assert(TransactionIdIsNormal(*oldestXmin));
 
@@ -1113,8 +1131,8 @@ vacuum_set_xid_limits(Relation rel,
  *		live tuples seen; but if we did not, we should not blindly extrapolate
  *		from that number, since VACUUM may have scanned a quite nonrandom
  *		subset of the table.  When we have only partial information, we take
- *		the old value of pg_class.reltuples as a measurement of the
- *		tuple density in the unscanned pages.
+ *		the old value of pg_class.reltuples/pg_class.relpages as a measurement
+ *		of the tuple density in the unscanned pages.
  *
  *		Note: scanned_tuples should count only *live* tuples, since
  *		pg_class.reltuples is defined that way.
@@ -1137,18 +1155,16 @@ vac_estimate_reltuples(Relation relation,
 
 	/*
 	 * If scanned_pages is zero but total_pages isn't, keep the existing value
-	 * of reltuples.  (Note: callers should avoid updating the pg_class
-	 * statistics in this situation, since no new information has been
-	 * provided.)
+	 * of reltuples.  (Note: we might be returning -1 in this case.)
 	 */
 	if (scanned_pages == 0)
 		return old_rel_tuples;
 
 	/*
-	 * If old value of relpages is zero, old density is indeterminate; we
-	 * can't do much except scale up scanned_tuples to match total_pages.
+	 * If old density is unknown, we can't do much except scale up
+	 * scanned_tuples to match total_pages.
 	 */
-	if (old_rel_pages == 0)
+	if (old_rel_tuples < 0 || old_rel_pages == 0)
 		return floor((scanned_tuples / scanned_pages) * total_pages + 0.5);
 
 	/*
@@ -1347,12 +1363,21 @@ vac_update_datfrozenxid(void)
 	bool		dirty = false;
 
 	/*
-	 * Initialize the "min" calculation with GetOldestXmin, which is a
-	 * reasonable approximation to the minimum relfrozenxid for not-yet-
-	 * committed pg_class entries for new tables; see AddNewRelationTuple().
-	 * So we cannot produce a wrong minimum by starting with this.
+	 * Restrict this task to one backend per database.  This avoids race
+	 * conditions that would move datfrozenxid or datminmxid backward.  It
+	 * avoids calling vac_truncate_clog() with a datfrozenxid preceding a
+	 * datfrozenxid passed to an earlier vac_truncate_clog() call.
 	 */
-	newFrozenXid = GetOldestXmin(NULL, PROCARRAY_FLAGS_VACUUM);
+	LockDatabaseFrozenIds(ExclusiveLock);
+
+	/*
+	 * Initialize the "min" calculation with
+	 * GetOldestNonRemovableTransactionId(), which is a reasonable
+	 * approximation to the minimum relfrozenxid for not-yet-committed
+	 * pg_class entries for new tables; see AddNewRelationTuple().  So we
+	 * cannot produce a wrong minimum by starting with this.
+	 */
+	newFrozenXid = GetOldestNonRemovableTransactionId(NULL);
 
 	/*
 	 * Similarly, initialize the MultiXact "min" with the value that would be
@@ -1535,6 +1560,9 @@ vac_truncate_clog(TransactionId frozenXID,
 	bool		bogus = false;
 	bool		frozenAlreadyWrapped = false;
 
+	/* Restrict task to one backend per cluster; see SimpleLruTruncate(). */
+	LWLockAcquire(WrapLimitsVacuumLock, LW_EXCLUSIVE);
+
 	/* init oldest datoids to sync with my frozenXID/minMulti values */
 	oldestxid_datoid = MyDatabaseId;
 	minmulti_datoid = MyDatabaseId;
@@ -1640,10 +1668,12 @@ vac_truncate_clog(TransactionId frozenXID,
 	 * Update the wrap limit for GetNewTransactionId and creation of new
 	 * MultiXactIds.  Note: these functions will also signal the postmaster
 	 * for an(other) autovac cycle if needed.   XXX should we avoid possibly
-	 * signalling twice?
+	 * signaling twice?
 	 */
 	SetTransactionIdLimit(frozenXID, oldestxid_datoid);
 	SetMultiXactIdLimit(minMulti, minmulti_datoid, false);
+
+	LWLockRelease(WrapLimitsVacuumLock);
 }
 
 
@@ -1683,8 +1713,9 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 	StartTransactionCommand();
 
 	/*
-	 * Functions in indexes may want a snapshot set.  Also, setting a snapshot
-	 * ensures that RecentGlobalXmin is kept truly recent.
+	 * Need to acquire a snapshot to prevent pg_subtrans from being truncated,
+	 * cutoff xids in local memory wrapping around, and to have updated xmin
+	 * horizons.
 	 */
 	PushActiveSnapshot(GetTransactionSnapshot());
 
@@ -1707,13 +1738,14 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 		 *
 		 * Note: these flags remain set until CommitTransaction or
 		 * AbortTransaction.  We don't want to clear them until we reset
-		 * MyPgXact->xid/xmin, else OldestXmin might appear to go backwards,
-		 * which is probably Not Good.
+		 * MyProc->xid/xmin, otherwise GetOldestNonRemovableTransactionId()
+		 * might appear to go backwards, which is probably Not Good.
 		 */
 		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
-		MyPgXact->vacuumFlags |= PROC_IN_VACUUM;
+		MyProc->vacuumFlags |= PROC_IN_VACUUM;
 		if (params->is_wraparound)
-			MyPgXact->vacuumFlags |= PROC_VACUUM_FOR_WRAPAROUND;
+			MyProc->vacuumFlags |= PROC_VACUUM_FOR_WRAPAROUND;
+		ProcGlobal->vacuumFlags[MyProc->pgxactoff] = MyProc->vacuumFlags;
 		LWLockRelease(ProcArrayLock);
 	}
 
@@ -1899,7 +1931,7 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 
 	/*
 	 * If the relation has a secondary toast rel, vacuum that too while we
-	 * still hold the session lock on the master table.  Note however that
+	 * still hold the session lock on the main table.  Note however that
 	 * "analyze" will not get done on the toast table.  This is good, because
 	 * the toaster always uses hardcoded index access and statistics are
 	 * totally unimportant for toast relations.
@@ -1908,7 +1940,7 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 		vacuum_rel(toast_relid, NULL, params);
 
 	/*
-	 * Now release the session-level lock on the master table.
+	 * Now release the session-level lock on the main table.
 	 */
 	UnlockRelationIdForSession(&onerelid, lmode);
 
@@ -2036,23 +2068,23 @@ vacuum_delay_point(void)
 /*
  * Computes the vacuum delay for parallel workers.
  *
- * The basic idea of a cost-based vacuum delay for parallel vacuum is to allow
- * each worker to sleep proportional to the work done by it.  We achieve this
+ * The basic idea of a cost-based delay for parallel vacuum is to allow each
+ * worker to sleep in proportion to the share of work it's done.  We achieve this
  * by allowing all parallel vacuum workers including the leader process to
  * have a shared view of cost related parameters (mainly VacuumCostBalance).
  * We allow each worker to update it as and when it has incurred any cost and
  * then based on that decide whether it needs to sleep.  We compute the time
  * to sleep for a worker based on the cost it has incurred
  * (VacuumCostBalanceLocal) and then reduce the VacuumSharedCostBalance by
- * that amount.  This avoids letting the workers sleep who have done less or
- * no I/O as compared to other workers and therefore can ensure that workers
- * who are doing more I/O got throttled more.
+ * that amount.  This avoids putting to sleep those workers which have done less
+ * I/O than other workers and therefore ensure that workers
+ * which are doing more I/O got throttled more.
  *
- * We allow any worker to sleep only if it has performed the I/O above a
- * certain threshold, which is calculated based on the number of active
- * workers (VacuumActiveNWorkers), and the overall cost balance is more than
- * VacuumCostLimit set by the system.  The testing reveals that we achieve
- * the required throttling if we allow a worker that has done more than 50%
+ * We allow a worker to sleep only if it has performed I/O above a certain
+ * threshold, which is calculated based on the number of active workers
+ * (VacuumActiveNWorkers), and the overall cost balance is more than
+ * VacuumCostLimit set by the system.  Testing reveals that we achieve
+ * the required throttling if we force a worker that has done more than 50%
  * of its share of work to sleep.
  */
 static double
@@ -2077,7 +2109,7 @@ compute_parallel_delay(void)
 	VacuumCostBalanceLocal += VacuumCostBalance;
 
 	if ((shared_balance >= VacuumCostLimit) &&
-		(VacuumCostBalanceLocal > 0.5 * (VacuumCostLimit / nworkers)))
+		(VacuumCostBalanceLocal > 0.5 * ((double) VacuumCostLimit / nworkers)))
 	{
 		/* Compute sleep time based on the local cost balance */
 		msec = VacuumCostDelay * VacuumCostBalanceLocal / VacuumCostLimit;

@@ -413,6 +413,7 @@ Bitmapset *
 PopulateNeededColumnsForEPQ(EPQState *epqstate, int ncol)
 {
 	Bitmapset *epqCols = NULL;
+	Assert(epqstate && epqstate->plan);
 	PopulateNeededColumnsForNode((Node *) epqstate->plan->qual,
 								 ncol,
 								 &epqCols);

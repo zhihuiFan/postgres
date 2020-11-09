@@ -71,7 +71,7 @@ typedef struct
 typedef enum CAC_state
 {
 	CAC_OK, CAC_STARTUP, CAC_SHUTDOWN, CAC_RECOVERY, CAC_TOOMANY,
-	CAC_WAITBACKUP
+	CAC_SUPERUSER
 } CAC_state;
 
 
@@ -288,8 +288,10 @@ extern char *be_tls_get_certificate_hash(Port *port, size_t *len);
 #endif
 
 /* init hook for SSL, the default sets the password callback if appropriate */
-typedef void(* openssl_tls_init_hook_typ)(SSL_CTX *context, bool isServerStart);
+#ifdef USE_OPENSSL
+typedef void (*openssl_tls_init_hook_typ) (SSL_CTX *context, bool isServerStart);
 extern PGDLLIMPORT openssl_tls_init_hook_typ openssl_tls_init_hook;
+#endif
 
 #endif							/* USE_SSL */
 

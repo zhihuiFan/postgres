@@ -155,6 +155,7 @@ extern bool ParseConfigDirectory(const char *includedir,
 								 ConfigVariable **head_p,
 								 ConfigVariable **tail_p);
 extern void FreeConfigVariables(ConfigVariable *list);
+extern char *DeescapeQuotedString(const char *s);
 
 /*
  * The possible values of an enum variable are specified by an array of
@@ -233,8 +234,6 @@ typedef enum
 
 
 /* GUC vars that are actually declared in guc.c, rather than elsewhere */
-extern bool log_duration;
-extern bool log_parameters_on_error;
 extern bool Debug_print_plan;
 extern bool Debug_print_parse;
 extern bool Debug_print_rewritten;
@@ -249,6 +248,9 @@ extern bool log_btree_build_stats;
 extern PGDLLIMPORT bool check_function_bodies;
 extern bool session_auth_is_superuser;
 
+extern bool log_duration;
+extern int	log_parameter_max_length;
+extern int	log_parameter_max_length_on_error;
 extern int	log_min_error_statement;
 extern PGDLLIMPORT int log_min_messages;
 extern PGDLLIMPORT int client_min_messages;

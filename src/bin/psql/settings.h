@@ -88,10 +88,11 @@ typedef struct _psqlSettings
 
 	PGresult   *last_error_result;	/* most recent error result, if any */
 
-	printQueryOpt popt;
+	printQueryOpt popt;			/* The active print format settings */
 
 	char	   *gfname;			/* one-shot file output argument for \g */
-	bool		g_expanded;		/* one-shot expanded output requested via \gx */
+	printQueryOpt *gsavepopt;	/* if not null, saved print format settings */
+
 	char	   *gset_prefix;	/* one-shot prefix argument for \gset */
 	bool		gdesc_flag;		/* one-shot request to describe query results */
 	bool		gexec_flag;		/* one-shot request to execute query results */
@@ -115,6 +116,13 @@ typedef struct _psqlSettings
 	FILE	   *logfile;		/* session log file handle */
 
 	VariableSpace vars;			/* "shell variable" repository */
+
+	/*
+	 * If we get a connection failure, the now-unusable PGconn is stashed here
+	 * until we can successfully reconnect.  Never attempt to do anything with
+	 * this PGconn except extract parameters for a \connect attempt.
+	 */
+	PGconn	   *dead_conn;		/* previous connection to backend */
 
 	/*
 	 * The remaining fields are set by assign hooks associated with entries in

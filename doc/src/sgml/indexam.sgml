@@ -96,6 +96,8 @@ typedef struct IndexAmRoutine
     uint16      amstrategies;
     /* total number of support functions that this AM uses */
     uint16      amsupport;
+    /* opclass options support function number or 0 */
+    uint16      amoptsprocnum;
     /* does AM support ORDER BY indexed column's value? */
     bool        amcanorder;
     /* does AM support ORDER BY result of an operator on indexed column? */
@@ -141,6 +143,7 @@ typedef struct IndexAmRoutine
     amproperty_function amproperty;     /* can be NULL */
     ambuildphasename_function ambuildphasename;   /* can be NULL */
     amvalidate_function amvalidate;
+    amadjustmembers_function amadjustmembers; /* can be NULL */
     ambeginscan_function ambeginscan;
     amrescan_function amrescan;
     amgettuple_function amgettuple;     /* can be NULL */
@@ -365,7 +368,6 @@ amvacuumcleanup (IndexVacuumInfo *info,
   </para>
 
   <para>
-   As of <productname>PostgreSQL</productname> 8.4,
    <function>amvacuumcleanup</function> will also be called at completion of an
    <command>ANALYZE</command> operation.  In this case <literal>stats</literal> is always
    NULL and any return value will be ignored.  This case can be distinguished
@@ -383,7 +385,7 @@ amcanreturn (Relation indexRelation, int attno);
    linkend="indexes-index-only-scans"><firstterm>index-only scans</firstterm></link> on
    the given column, by returning the indexed column values for an index entry
    in the form of an <structname>IndexTuple</structname>.  The attribute number
-   is 1-based, i.e. the first column's attno is 1. Returns true if supported,
+   is 1-based, i.e., the first column's attno is 1. Returns true if supported,
    else false.  If the access method does not support index-only scans at all,
    the <structfield>amcanreturn</structfield> field in its <structname>IndexAmRoutine</structname>
    struct can be set to NULL.
@@ -500,7 +502,48 @@ amvalidate (Oid opclassoid);
    the access method can reasonably do that.  For example, this might include
    testing that all required support functions are provided.
    The <function>amvalidate</function> function must return false if the opclass is
-   invalid.  Problems should be reported with <function>ereport</function> messages.
+   invalid.  Problems should be reported with <function>ereport</function>
+   messages, typically at <literal>INFO</literal> level.
+  </para>
+
+  <para>
+<programlisting>
+void
+amadjustmembers (Oid opfamilyoid,
+                 Oid opclassoid,
+                 List *operators,
+                 List *functions);
+</programlisting>
+   Validate proposed new operator and function members of an operator family,
+   so far as the access method can reasonably do that, and set their
+   dependency types if the default is not satisfactory.  This is called
+   during <command>CREATE OPERATOR CLASS</command> and during
+   <command>ALTER OPERATOR FAMILY ADD</command>; in the latter
+   case <parameter>opclassoid</parameter> is <literal>InvalidOid</literal>.
+   The <type>List</type> arguments are lists
+   of <structname>OpFamilyMember</structname> structs, as defined
+   in <filename>amapi.h</filename>.
+
+   Tests done by this function will typically be a subset of those
+   performed by <function>amvalidate</function>,
+   since <function>amadjustmembers</function> cannot assume that it is
+   seeing a complete set of members.  For example, it would be reasonable
+   to check the signature of a support function, but not to check whether
+   all required support functions are provided.  Any problems can be
+   reported by throwing an error.
+
+   The dependency-related fields of
+   the <structname>OpFamilyMember</structname> structs are initialized by
+   the core code to create hard dependencies on the opclass if this
+   is <command>CREATE OPERATOR CLASS</command>, or soft dependencies on the
+   opfamily if this is <command>ALTER OPERATOR FAMILY ADD</command>.
+   <function>amadjustmembers</function> can adjust these fields if some other
+   behavior is more appropriate.  For example, GIN, GiST, and SP-GiST
+   always set operator members to have soft dependencies on the opfamily,
+   since the connection between an operator and an opclass is relatively
+   weak in these index types; so it is reasonable to allow operator members
+   to be added and removed freely.  Optional support functions are typically
+   also given soft dependencies, so that they can be removed if necessary.
   </para>
 
 
@@ -568,7 +611,7 @@ amgettuple (IndexScanDesc scan,
    will pass the caller's snapshot test.  On success, <function>amgettuple</function>
    must also set <literal>scan-&gt;xs_recheck</literal> to true or false.
    False means it is certain that the index entry matches the scan keys.
-   true means this is not certain, and the conditions represented by the
+   True means this is not certain, and the conditions represented by the
    scan keys must be rechecked against the heap tuple after fetching it.
    This provision supports <quote>lossy</quote> index operators.
    Note that rechecking will extend only to the scan conditions; a partial

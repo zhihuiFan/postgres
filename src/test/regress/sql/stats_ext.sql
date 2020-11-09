@@ -1,8 +1,10 @@
 -- Generic extended statistics support
 
--- We will be checking execution plans without/with statistics, so
--- let's make sure we get simple non-parallel plans. Also set the
--- work_mem low so that we can use small amounts of data.
+--
+-- Note: tables for which we check estimated row counts should be created
+-- with autovacuum_enabled = off, so that we don't have unstable results
+-- from auto-analyze happening when we didn't expect it.
+--
 
 -- check the number of estimated/actual rows in the top node
 create function check_estimated_rows(text) returns table (estimated int, actual int)
@@ -70,12 +72,14 @@ ANALYZE ab1;
 ALTER TABLE ab1 ALTER a SET STATISTICS -1;
 -- setting statistics target 0 skips the statistics, without printing any message, so check catalog
 ALTER STATISTICS ab1_a_b_stats SET STATISTICS 0;
+\d ab1
 ANALYZE ab1;
 SELECT stxname, stxdndistinct, stxddependencies, stxdmcv
   FROM pg_statistic_ext s, pg_statistic_ext_data d
  WHERE s.stxname = 'ab1_a_b_stats'
    AND d.stxoid = s.oid;
 ALTER STATISTICS ab1_a_b_stats SET STATISTICS -1;
+\d+ ab1
 -- partial analyze doesn't build stats either
 ANALYZE ab1 (a);
 ANALYZE ab1;
@@ -137,7 +141,8 @@ CREATE TABLE ndistinct (
     filler3 DATE,
     c INT,
     d INT
-);
+)
+WITH (autovacuum_enabled = off);
 
 -- over-estimates when using only per-column statistics
 INSERT INTO ndistinct (a, b, c, filler1)
@@ -198,7 +203,7 @@ SELECT s.stxkind, d.stxdndistinct
  WHERE s.stxrelid = 'ndistinct'::regclass
    AND d.stxoid = s.oid;
 
--- correct esimates
+-- correct estimates
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b');
 
 SELECT * FROM check_estimated_rows('SELECT COUNT(*) FROM ndistinct GROUP BY a, b, c');
@@ -236,7 +241,8 @@ CREATE TABLE functional_dependencies (
     filler3 DATE,
     c INT,
     d TEXT
-);
+)
+WITH (autovacuum_enabled = off);
 
 CREATE INDEX fdeps_ab_idx ON functional_dependencies (a, b);
 CREATE INDEX fdeps_abc_idx ON functional_dependencies (a, b, c);
@@ -279,6 +285,8 @@ SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 51) AND b IN (''1'', ''2'')');
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 2, 51, 52) AND b IN (''1'', ''2'')');
+
+SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 2, 51, 52) AND b = ''1''');
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 26, 51, 76) AND b IN (''1'', ''26'') AND c = 1');
 
@@ -342,6 +350,8 @@ SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE 
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 2, 51, 52) AND b IN (''1'', ''2'')');
 
+SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 2, 51, 52) AND b = ''1''');
+
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 26, 51, 76) AND b IN (''1'', ''26'') AND c = 1');
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 26, 51, 76) AND b IN (''1'', ''26'') AND c IN (1)');
@@ -385,7 +395,9 @@ SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE 
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a IN (1, 2, 51, 52) AND b = ALL (ARRAY[''1'', ''2''])');
 
--- check change of column type doesn't break it
+-- changing the type of column c causes its single-column stats to be dropped,
+-- giving a default estimate of 0.005 * 5000 = 25 for (c = 1); check multiple
+-- clauses estimated with functional dependencies does not exceed this
 ALTER TABLE functional_dependencies ALTER COLUMN c TYPE numeric;
 
 SELECT * FROM check_estimated_rows('SELECT * FROM functional_dependencies WHERE a = 1 AND b = ''1'' AND c = 1');
@@ -400,7 +412,8 @@ CREATE TABLE functional_dependencies_multi (
 	b INTEGER,
 	c INTEGER,
 	d INTEGER
-);
+)
+WITH (autovacuum_enabled = off);
 
 INSERT INTO functional_dependencies_multi (a, b, c, d)
     SELECT
@@ -442,7 +455,8 @@ CREATE TABLE mcv_lists (
     filler3 DATE,
     c INT,
     d TEXT
-);
+)
+WITH (autovacuum_enabled = off);
 
 -- random data (no MCV list)
 INSERT INTO mcv_lists (a, b, c, filler1)
@@ -680,7 +694,8 @@ CREATE TABLE mcv_lists_uuid (
     a UUID,
     b UUID,
     c UUID
-);
+)
+WITH (autovacuum_enabled = off);
 
 INSERT INTO mcv_lists_uuid (a, b, c)
      SELECT
@@ -711,7 +726,8 @@ CREATE TABLE mcv_lists_arrays (
     a TEXT[],
     b NUMERIC[],
     c INT[]
-);
+)
+WITH (autovacuum_enabled = off);
 
 INSERT INTO mcv_lists_arrays (a, b, c)
      SELECT
@@ -730,7 +746,8 @@ CREATE TABLE mcv_lists_bool (
     a BOOL,
     b BOOL,
     c BOOL
-);
+)
+WITH (autovacuum_enabled = off);
 
 INSERT INTO mcv_lists_bool (a, b, c)
      SELECT
@@ -766,7 +783,8 @@ CREATE TABLE mcv_lists_multi (
 	b INTEGER,
 	c INTEGER,
 	d INTEGER
-);
+)
+WITH (autovacuum_enabled = off);
 
 INSERT INTO mcv_lists_multi (a, b, c, d)
     SELECT

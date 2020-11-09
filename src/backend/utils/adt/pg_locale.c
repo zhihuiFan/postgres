@@ -57,7 +57,9 @@
 #include "access/htup_details.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_control.h"
+#include "catalog/pg_database.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/formatting.h"
 #include "utils/hsearch.h"
@@ -75,16 +77,7 @@
 #endif
 
 #ifdef WIN32
-/*
- * This Windows file defines StrNCpy. We don't need it here, so we undefine
- * it to keep the compiler quiet, and undefine it again after the file is
- * included, so we don't accidentally use theirs.
- */
-#undef StrNCpy
 #include <shlwapi.h>
-#ifdef StrNCpy
-#undef StrNCpy
-#endif
 #endif
 
 #define		MAX_L10N_DATA		80
@@ -147,6 +140,9 @@ static char *IsoLocaleName(const char *);	/* MSVC specific */
 #ifdef USE_ICU
 static void icu_set_collation_attributes(UCollator *collator, const char *loc);
 #endif
+
+static char *get_collation_actual_version(char collprovider,
+										  const char *collcollate);
 
 /*
  * pg_perm_setlocale
@@ -234,6 +230,7 @@ pg_perm_setlocale(int category, const char *locale)
 			result = IsoLocaleName(locale);
 			if (result == NULL)
 				result = (char *) locale;
+			elog(DEBUG3, "IsoLocaleName() executed; locale: \"%s\"", result);
 #endif							/* WIN32 */
 			break;
 #endif							/* LC_MESSAGES */
@@ -971,25 +968,185 @@ cache_locale_time(void)
  * string.  Furthermore, msvcr110.dll changed the undocumented _locale_t
  * content to carry locale names instead of locale identifiers.
  *
- * MinGW headers declare _create_locale(), but msvcrt.dll lacks that symbol.
- * IsoLocaleName() always fails in a MinGW-built postgres.exe, so only
- * Unix-style values of the lc_messages GUC can elicit localized messages.  In
- * particular, every lc_messages setting that initdb can select automatically
- * will yield only C-locale messages.  XXX This could be fixed by running the
- * fully-qualified locale name through a lookup table.
+ * Visual Studio 2015 should still be able to do the same as Visual Studio
+ * 2012, but the declaration of locale_name is missing in _locale_t, causing
+ * this code compilation to fail, hence this falls back instead on to
+ * enumerating all system locales by using EnumSystemLocalesEx to find the
+ * required locale name.  If the input argument is in Unix-style then we can
+ * get ISO Locale name directly by using GetLocaleInfoEx() with LCType as
+ * LOCALE_SNAME.
+ *
+ * MinGW headers declare _create_locale(), but msvcrt.dll lacks that symbol in
+ * releases before Windows 8. IsoLocaleName() always fails in a MinGW-built
+ * postgres.exe, so only Unix-style values of the lc_messages GUC can elicit
+ * localized messages. In particular, every lc_messages setting that initdb
+ * can select automatically will yield only C-locale messages. XXX This could
+ * be fixed by running the fully-qualified locale name through a lookup table.
  *
  * This function returns a pointer to a static buffer bearing the converted
  * name or NULL if conversion fails.
  *
- * [1] http://msdn.microsoft.com/en-us/library/windows/desktop/dd373763.aspx
- * [2] http://msdn.microsoft.com/en-us/library/windows/desktop/dd373814.aspx
+ * [1] https://docs.microsoft.com/en-us/windows/win32/intl/locale-identifiers
+ * [2] https://docs.microsoft.com/en-us/windows/win32/intl/locale-names
  */
+
+#if _MSC_VER >= 1900
+/*
+ * Callback function for EnumSystemLocalesEx() in get_iso_localename().
+ *
+ * This function enumerates all system locales, searching for one that matches
+ * an input with the format: <Language>[_<Country>], e.g.
+ * English[_United States]
+ *
+ * The input is a three wchar_t array as an LPARAM. The first element is the
+ * locale_name we want to match, the second element is an allocated buffer
+ * where the Unix-style locale is copied if a match is found, and the third
+ * element is the search status, 1 if a match was found, 0 otherwise.
+ */
+static BOOL CALLBACK
+search_locale_enum(LPWSTR pStr, DWORD dwFlags, LPARAM lparam)
+{
+	wchar_t		test_locale[LOCALE_NAME_MAX_LENGTH];
+	wchar_t   **argv;
+
+	(void) (dwFlags);
+
+	argv = (wchar_t **) lparam;
+	*argv[2] = (wchar_t) 0;
+
+	memset(test_locale, 0, sizeof(test_locale));
+
+	/* Get the name of the <Language> in English */
+	if (GetLocaleInfoEx(pStr, LOCALE_SENGLISHLANGUAGENAME,
+						test_locale, LOCALE_NAME_MAX_LENGTH))
+	{
+		/*
+		 * If the enumerated locale does not have a hyphen ("en") OR  the
+		 * lc_message input does not have an underscore ("English"), we only
+		 * need to compare the <Language> tags.
+		 */
+		if (wcsrchr(pStr, '-') == NULL || wcsrchr(argv[0], '_') == NULL)
+		{
+			if (_wcsicmp(argv[0], test_locale) == 0)
+			{
+				wcscpy(argv[1], pStr);
+				*argv[2] = (wchar_t) 1;
+				return FALSE;
+			}
+		}
+
+		/*
+		 * We have to compare a full <Language>_<Country> tag, so we append
+		 * the underscore and name of the country/region in English, e.g.
+		 * "English_United States".
+		 */
+		else
+		{
+			size_t		len;
+
+			wcscat(test_locale, L"_");
+			len = wcslen(test_locale);
+			if (GetLocaleInfoEx(pStr, LOCALE_SENGLISHCOUNTRYNAME,
+								test_locale + len,
+								LOCALE_NAME_MAX_LENGTH - len))
+			{
+				if (_wcsicmp(argv[0], test_locale) == 0)
+				{
+					wcscpy(argv[1], pStr);
+					*argv[2] = (wchar_t) 1;
+					return FALSE;
+				}
+			}
+		}
+	}
+
+	return TRUE;
+}
+
+/*
+ * This function converts a Windows locale name to an ISO formatted version
+ * for Visual Studio 2015 or greater.
+ *
+ * Returns NULL, if no valid conversion was found.
+ */
+static char *
+get_iso_localename(const char *winlocname)
+{
+	wchar_t		wc_locale_name[LOCALE_NAME_MAX_LENGTH];
+	wchar_t		buffer[LOCALE_NAME_MAX_LENGTH];
+	static char iso_lc_messages[LOCALE_NAME_MAX_LENGTH];
+	char	   *period;
+	int			len;
+	int			ret_val;
+
+	/*
+	 * Valid locales have the following syntax:
+	 * <Language>[_<Country>[.<CodePage>]]
+	 *
+	 * GetLocaleInfoEx can only take locale name without code-page and for the
+	 * purpose of this API the code-page doesn't matter.
+	 */
+	period = strchr(winlocname, '.');
+	if (period != NULL)
+		len = period - winlocname;
+	else
+		len = pg_mbstrlen(winlocname);
+
+	memset(wc_locale_name, 0, sizeof(wc_locale_name));
+	memset(buffer, 0, sizeof(buffer));
+	MultiByteToWideChar(CP_ACP, 0, winlocname, len, wc_locale_name,
+						LOCALE_NAME_MAX_LENGTH);
+
+	/*
+	 * If the lc_messages is already an Unix-style string, we have a direct
+	 * match with LOCALE_SNAME, e.g. en-US, en_US.
+	 */
+	ret_val = GetLocaleInfoEx(wc_locale_name, LOCALE_SNAME, (LPWSTR) &buffer,
+							  LOCALE_NAME_MAX_LENGTH);
+	if (!ret_val)
+	{
+		/*
+		 * Search for a locale in the system that matches language and country
+		 * name.
+		 */
+		wchar_t    *argv[3];
+
+		argv[0] = wc_locale_name;
+		argv[1] = buffer;
+		argv[2] = (wchar_t *) &ret_val;
+		EnumSystemLocalesEx(search_locale_enum, LOCALE_WINDOWS, (LPARAM) argv,
+							NULL);
+	}
+
+	if (ret_val)
+	{
+		size_t		rc;
+		char	   *hyphen;
+
+		/* Locale names use only ASCII, any conversion locale suffices. */
+		rc = wchar2char(iso_lc_messages, buffer, sizeof(iso_lc_messages), NULL);
+		if (rc == -1 || rc == sizeof(iso_lc_messages))
+			return NULL;
+
+		/*
+		 * Simply replace the hyphen with an underscore.  See comments in
+		 * IsoLocaleName.
+		 */
+		hyphen = strchr(iso_lc_messages, '-');
+		if (hyphen)
+			*hyphen = '_';
+		return iso_lc_messages;
+	}
+
+	return NULL;
+}
+#endif							/* _MSC_VER >= 1900 */
+
 static char *
 IsoLocaleName(const char *winlocname)
 {
-#ifdef _MSC_VER
-	static char iso_lc_messages[32];
-	_locale_t	loct = NULL;
+#if defined(_MSC_VER)
+	static char iso_lc_messages[LOCALE_NAME_MAX_LENGTH];
 
 	if (pg_strcasecmp("c", winlocname) == 0 ||
 		pg_strcasecmp("posix", winlocname) == 0)
@@ -997,39 +1154,48 @@ IsoLocaleName(const char *winlocname)
 		strcpy(iso_lc_messages, "C");
 		return iso_lc_messages;
 	}
-
-	loct = _create_locale(LC_CTYPE, winlocname);
-	if (loct != NULL)
+	else
 	{
-		size_t		rc;
-		char	   *hyphen;
+#if (_MSC_VER >= 1900)			/* Visual Studio 2015 or later */
+		return get_iso_localename(winlocname);
+#else
+		_locale_t	loct;
 
-		/* Locale names use only ASCII, any conversion locale suffices. */
-		rc = wchar2char(iso_lc_messages, loct->locinfo->locale_name[LC_CTYPE],
-						sizeof(iso_lc_messages), NULL);
-		_free_locale(loct);
-		if (rc == -1 || rc == sizeof(iso_lc_messages))
-			return NULL;
+		loct = _create_locale(LC_CTYPE, winlocname);
+		if (loct != NULL)
+		{
+			size_t		rc;
+			char	   *hyphen;
 
-		/*
-		 * Since the message catalogs sit on a case-insensitive filesystem, we
-		 * need not standardize letter case here.  So long as we do not ship
-		 * message catalogs for which it would matter, we also need not
-		 * translate the script/variant portion, e.g. uz-Cyrl-UZ to
-		 * uz_UZ@cyrillic.  Simply replace the hyphen with an underscore.
-		 *
-		 * Note that the locale name can be less-specific than the value we
-		 * would derive under earlier Visual Studio releases.  For example,
-		 * French_France.1252 yields just "fr".  This does not affect any of
-		 * the country-specific message catalogs available as of this writing
-		 * (pt_BR, zh_CN, zh_TW).
-		 */
-		hyphen = strchr(iso_lc_messages, '-');
-		if (hyphen)
-			*hyphen = '_';
-		return iso_lc_messages;
+			/* Locale names use only ASCII, any conversion locale suffices. */
+			rc = wchar2char(iso_lc_messages, loct->locinfo->locale_name[LC_CTYPE],
+							sizeof(iso_lc_messages), NULL);
+			_free_locale(loct);
+			if (rc == -1 || rc == sizeof(iso_lc_messages))
+				return NULL;
+
+			/*
+			 * Since the message catalogs sit on a case-insensitive
+			 * filesystem, we need not standardize letter case here.  So long
+			 * as we do not ship message catalogs for which it would matter,
+			 * we also need not translate the script/variant portion, e.g.
+			 * uz-Cyrl-UZ to uz_UZ@cyrillic.  Simply replace the hyphen with
+			 * an underscore.
+			 *
+			 * Note that the locale name can be less-specific than the value
+			 * we would derive under earlier Visual Studio releases.  For
+			 * example, French_France.1252 yields just "fr".  This does not
+			 * affect any of the country-specific message catalogs available
+			 * as of this writing (pt_BR, zh_CN, zh_TW).
+			 */
+			hyphen = strchr(iso_lc_messages, '-');
+			if (hyphen)
+				*hyphen = '_';
+			return iso_lc_messages;
+		}
+#endif							/* Visual Studio 2015 or later */
 	}
-#endif							/* _MSC_VER */
+#endif							/* defined(_MSC_VER) */
 	return NULL;				/* Not supported on this version of msvc/mingw */
 }
 #endif							/* WIN32 && LC_MESSAGES */
@@ -1352,8 +1518,6 @@ pg_newlocale_from_collation(Oid collid)
 		const char *collctype pg_attribute_unused();
 		struct pg_locale_struct result;
 		pg_locale_t resultp;
-		Datum		collversion;
-		bool		isnull;
 
 		tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(collid));
 		if (!HeapTupleIsValid(tp))
@@ -1455,41 +1619,6 @@ pg_newlocale_from_collation(Oid collid)
 #endif							/* not USE_ICU */
 		}
 
-		collversion = SysCacheGetAttr(COLLOID, tp, Anum_pg_collation_collversion,
-									  &isnull);
-		if (!isnull)
-		{
-			char	   *actual_versionstr;
-			char	   *collversionstr;
-
-			actual_versionstr = get_collation_actual_version(collform->collprovider, collcollate);
-			if (!actual_versionstr)
-			{
-				/*
-				 * This could happen when specifying a version in CREATE
-				 * COLLATION for a libc locale, or manually creating a mess in
-				 * the catalogs.
-				 */
-				ereport(ERROR,
-						(errmsg("collation \"%s\" has no actual version, but a version was specified",
-								NameStr(collform->collname))));
-			}
-			collversionstr = TextDatumGetCString(collversion);
-
-			if (strcmp(actual_versionstr, collversionstr) != 0)
-				ereport(WARNING,
-						(errmsg("collation \"%s\" has version mismatch",
-								NameStr(collform->collname)),
-						 errdetail("The collation in the database was created using version %s, "
-								   "but the operating system provides version %s.",
-								   collversionstr, actual_versionstr),
-						 errhint("Rebuild all objects affected by this collation and run "
-								 "ALTER COLLATION %s REFRESH VERSION, "
-								 "or build PostgreSQL with the right library version.",
-								 quote_qualified_identifier(get_namespace_name(collform->collnamespace),
-															NameStr(collform->collname)))));
-		}
-
 		ReleaseSysCache(tp);
 
 		/* We'll keep the pg_locale_t structures in TopMemoryContext */
@@ -1506,7 +1635,7 @@ pg_newlocale_from_collation(Oid collid)
  * Get provider-specific collation version string for the given collation from
  * the operating system/library.
  */
-char *
+static char *
 get_collation_actual_version(char collprovider, const char *collcollate)
 {
 	char	   *collversion = NULL;
@@ -1573,10 +1702,22 @@ get_collation_actual_version(char collprovider, const char *collcollate)
 		MultiByteToWideChar(CP_ACP, 0, collcollate, -1, wide_collcollate,
 							LOCALE_NAME_MAX_LENGTH);
 		if (!GetNLSVersionEx(COMPARE_STRING, wide_collcollate, &version))
+		{
+			/*
+			 * GetNLSVersionEx() wants a language tag such as "en-US", not a
+			 * locale name like "English_United States.1252".  Until those
+			 * values can be prevented from entering the system, or 100%
+			 * reliably converted to the more useful tag format, tolerate the
+			 * resulting error and report that we have no version data.
+			 */
+			if (GetLastError() == ERROR_INVALID_PARAMETER)
+				return NULL;
+
 			ereport(ERROR,
 					(errmsg("could not get collation version for locale \"%s\": error code %lu",
 							collcollate,
 							GetLastError())));
+		}
 		collversion = psprintf("%d.%d,%d.%d",
 							   (version.dwNLSVersion >> 8) & 0xFFFF,
 							   version.dwNLSVersion & 0xFF,
@@ -1588,6 +1729,45 @@ get_collation_actual_version(char collprovider, const char *collcollate)
 	return collversion;
 }
 
+/*
+ * Get provider-specific collation version string for a given collation OID.
+ * Return NULL if the provider doesn't support versions.
+ */
+char *
+get_collation_version_for_oid(Oid oid)
+{
+	HeapTuple	tp;
+	char	   *version = NULL;
+
+	Assert(oid != C_COLLATION_OID && oid != POSIX_COLLATION_OID);
+
+	if (oid == DEFAULT_COLLATION_OID)
+	{
+		Form_pg_database dbform;
+
+		tp = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+		if (!HeapTupleIsValid(tp))
+			elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+		dbform = (Form_pg_database) GETSTRUCT(tp);
+		version = get_collation_actual_version(COLLPROVIDER_LIBC,
+											   NameStr(dbform->datcollate));
+	}
+	else
+	{
+		Form_pg_collation collform;
+
+		tp = SearchSysCache1(COLLOID, ObjectIdGetDatum(oid));
+		if (!HeapTupleIsValid(tp))
+			elog(ERROR, "cache lookup failed for collation %u", oid);
+		collform = (Form_pg_collation) GETSTRUCT(tp);
+		version = get_collation_actual_version(collform->collprovider,
+											   NameStr(collform->collcollate));
+	}
+
+	ReleaseSysCache(tp);
+
+	return version;
+}
 
 #ifdef USE_ICU
 /*

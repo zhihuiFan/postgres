@@ -11,7 +11,7 @@
  *	cpu_tuple_cost		Cost of typical CPU time to process a tuple
  *	cpu_index_tuple_cost  Cost of typical CPU time to process an index tuple
  *	cpu_operator_cost	Cost of CPU time to execute an operator or function
- *	parallel_tuple_cost Cost of CPU time to pass a tuple from worker to master backend
+ *	parallel_tuple_cost Cost of CPU time to pass a tuple from worker to leader backend
  *	parallel_setup_cost Cost of setting up shared memory for parallelism
  *
  * We expect that the kernel will typically do some amount of read-ahead
@@ -107,6 +107,13 @@
  */
 #define APPEND_CPU_COST_MULTIPLIER 0.5
 
+/*
+ * Maximum value for row estimates.  We cap row estimates to this to help
+ * ensure that costs based on these estimates remain within the range of what
+ * double can represent.  add_path() wouldn't act sanely given infinite or NaN
+ * cost values.
+ */
+#define MAXIMUM_ROWCOUNT 1e100
 
 double		seq_page_cost = DEFAULT_SEQ_PAGE_COST;
 double		random_page_cost = DEFAULT_RANDOM_PAGE_COST;
@@ -128,9 +135,8 @@ bool		enable_indexonlyscan = true;
 bool		enable_bitmapscan = true;
 bool		enable_tidscan = true;
 bool		enable_sort = true;
+bool		enable_incremental_sort = true;
 bool		enable_hashagg = true;
-bool		enable_hashagg_disk = true;
-bool		enable_groupingsets_hash_disk = false;
 bool		enable_nestloop = true;
 bool		enable_material = true;
 bool		enable_mergejoin = true;
@@ -190,11 +196,14 @@ double
 clamp_row_est(double nrows)
 {
 	/*
-	 * Force estimate to be at least one row, to make explain output look
-	 * better and to avoid possible divide-by-zero when interpolating costs.
-	 * Make it an integer, too.
+	 * Avoid infinite and NaN row estimates.  Costs derived from such values
+	 * are going to be useless.  Also force the estimate to be at least one
+	 * row, to make explain output look better and to avoid possible
+	 * divide-by-zero when interpolating costs.  Make it an integer, too.
 	 */
-	if (nrows <= 1.0)
+	if (nrows > MAXIMUM_ROWCOUNT || isnan(nrows))
+		nrows = MAXIMUM_ROWCOUNT;
+	else if (nrows <= 1.0)
 		nrows = 1.0;
 	else
 		nrows = rint(nrows);
@@ -1648,9 +1657,9 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
 }
 
 /*
- * cost_sort
- *	  Determines and returns the cost of sorting a relation, including
- *	  the cost of reading the input data.
+ * cost_tuplesort
+ *	  Determines and returns the cost of sorting a relation using tuplesort,
+ *    not including the cost of reading the input data.
  *
  * If the total volume of data to sort is less than sort_mem, we will do
  * an in-memory sort, which requires no I/O and about t*log2(t) tuple
@@ -1677,38 +1686,22 @@ cost_recursive_union(Path *runion, Path *nrterm, Path *rterm)
  * specifying nonzero comparison_cost; typically that's used for any extra
  * work that has to be done to prepare the inputs to the comparison operators.
  *
- * 'pathkeys' is a list of sort keys
- * 'input_cost' is the total cost for reading the input data
  * 'tuples' is the number of tuples in the relation
  * 'width' is the average tuple width in bytes
  * 'comparison_cost' is the extra cost per comparison, if any
  * 'sort_mem' is the number of kilobytes of work memory allowed for the sort
  * 'limit_tuples' is the bound on the number of output tuples; -1 if no bound
- *
- * NOTE: some callers currently pass NIL for pathkeys because they
- * can't conveniently supply the sort keys.  Since this routine doesn't
- * currently do anything with pathkeys anyway, that doesn't matter...
- * but if it ever does, it should react gracefully to lack of key data.
- * (Actually, the thing we'd most likely be interested in is just the number
- * of sort keys, which all callers *could* supply.)
  */
-void
-cost_sort(Path *path, PlannerInfo *root,
-		  List *pathkeys, Cost input_cost, double tuples, int width,
-		  Cost comparison_cost, int sort_mem,
-		  double limit_tuples)
+static void
+cost_tuplesort(Cost *startup_cost, Cost *run_cost,
+			   double tuples, int width,
+			   Cost comparison_cost, int sort_mem,
+			   double limit_tuples)
 {
-	Cost		startup_cost = input_cost;
-	Cost		run_cost = 0;
 	double		input_bytes = relation_byte_size(tuples, width);
 	double		output_bytes;
 	double		output_tuples;
 	long		sort_mem_bytes = sort_mem * 1024L;
-
-	if (!enable_sort)
-		startup_cost += disable_cost;
-
-	path->rows = tuples;
 
 	/*
 	 * We want to be sure the cost of a sort is never estimated as zero, even
@@ -1748,7 +1741,7 @@ cost_sort(Path *path, PlannerInfo *root,
 		 *
 		 * Assume about N log2 N comparisons
 		 */
-		startup_cost += comparison_cost * tuples * LOG2(tuples);
+		*startup_cost = comparison_cost * tuples * LOG2(tuples);
 
 		/* Disk costs */
 
@@ -1759,7 +1752,7 @@ cost_sort(Path *path, PlannerInfo *root,
 			log_runs = 1.0;
 		npageaccesses = 2.0 * npages * log_runs;
 		/* Assume 3/4ths of accesses are sequential, 1/4th are not */
-		startup_cost += npageaccesses *
+		*startup_cost += npageaccesses *
 			(seq_page_cost * 0.75 + random_page_cost * 0.25);
 	}
 	else if (tuples > 2 * output_tuples || input_bytes > sort_mem_bytes)
@@ -1770,12 +1763,12 @@ cost_sort(Path *path, PlannerInfo *root,
 		 * factor is a bit higher than for quicksort.  Tweak it so that the
 		 * cost curve is continuous at the crossover point.
 		 */
-		startup_cost += comparison_cost * tuples * LOG2(2.0 * output_tuples);
+		*startup_cost = comparison_cost * tuples * LOG2(2.0 * output_tuples);
 	}
 	else
 	{
 		/* We'll use plain quicksort on all the input tuples */
-		startup_cost += comparison_cost * tuples * LOG2(tuples);
+		*startup_cost = comparison_cost * tuples * LOG2(tuples);
 	}
 
 	/*
@@ -1786,8 +1779,181 @@ cost_sort(Path *path, PlannerInfo *root,
 	 * here --- the upper LIMIT will pro-rate the run cost so we'd be double
 	 * counting the LIMIT otherwise.
 	 */
-	run_cost += cpu_operator_cost * tuples;
+	*run_cost = cpu_operator_cost * tuples;
+}
 
+/*
+ * cost_incremental_sort
+ * 	Determines and returns the cost of sorting a relation incrementally, when
+ *  the input path is presorted by a prefix of the pathkeys.
+ *
+ * 'presorted_keys' is the number of leading pathkeys by which the input path
+ * is sorted.
+ *
+ * We estimate the number of groups into which the relation is divided by the
+ * leading pathkeys, and then calculate the cost of sorting a single group
+ * with tuplesort using cost_tuplesort().
+ */
+void
+cost_incremental_sort(Path *path,
+					  PlannerInfo *root, List *pathkeys, int presorted_keys,
+					  Cost input_startup_cost, Cost input_total_cost,
+					  double input_tuples, int width, Cost comparison_cost, int sort_mem,
+					  double limit_tuples)
+{
+	Cost		startup_cost = 0,
+				run_cost = 0,
+				input_run_cost = input_total_cost - input_startup_cost;
+	double		group_tuples,
+				input_groups;
+	Cost		group_startup_cost,
+				group_run_cost,
+				group_input_run_cost;
+	List	   *presortedExprs = NIL;
+	ListCell   *l;
+	int			i = 0;
+	bool		unknown_varno = false;
+
+	Assert(presorted_keys != 0);
+
+	/*
+	 * We want to be sure the cost of a sort is never estimated as zero, even
+	 * if passed-in tuple count is zero.  Besides, mustn't do log(0)...
+	 */
+	if (input_tuples < 2.0)
+		input_tuples = 2.0;
+
+	/* Default estimate of number of groups, capped to one group per row. */
+	input_groups = Min(input_tuples, DEFAULT_NUM_DISTINCT);
+
+	/*
+	 * Extract presorted keys as list of expressions.
+	 *
+	 * We need to be careful about Vars containing "varno 0" which might have
+	 * been introduced by generate_append_tlist, which would confuse
+	 * estimate_num_groups (in fact it'd fail for such expressions). See
+	 * recurse_set_operations which has to deal with the same issue.
+	 *
+	 * Unlike recurse_set_operations we can't access the original target list
+	 * here, and even if we could it's not very clear how useful would that be
+	 * for a set operation combining multiple tables. So we simply detect if
+	 * there are any expressions with "varno 0" and use the default
+	 * DEFAULT_NUM_DISTINCT in that case.
+	 *
+	 * We might also use either 1.0 (a single group) or input_tuples (each row
+	 * being a separate group), pretty much the worst and best case for
+	 * incremental sort. But those are extreme cases and using something in
+	 * between seems reasonable. Furthermore, generate_append_tlist is used
+	 * for set operations, which are likely to produce mostly unique output
+	 * anyway - from that standpoint the DEFAULT_NUM_DISTINCT is defensive
+	 * while maintaining lower startup cost.
+	 */
+	foreach(l, pathkeys)
+	{
+		PathKey    *key = (PathKey *) lfirst(l);
+		EquivalenceMember *member = (EquivalenceMember *)
+		linitial(key->pk_eclass->ec_members);
+
+		/*
+		 * Check if the expression contains Var with "varno 0" so that we
+		 * don't call estimate_num_groups in that case.
+		 */
+		if (bms_is_member(0, pull_varnos((Node *) member->em_expr)))
+		{
+			unknown_varno = true;
+			break;
+		}
+
+		/* expression not containing any Vars with "varno 0" */
+		presortedExprs = lappend(presortedExprs, member->em_expr);
+
+		i++;
+		if (i >= presorted_keys)
+			break;
+	}
+
+	/* Estimate number of groups with equal presorted keys. */
+	if (!unknown_varno)
+		input_groups = estimate_num_groups(root, presortedExprs, input_tuples, NULL);
+
+	group_tuples = input_tuples / input_groups;
+	group_input_run_cost = input_run_cost / input_groups;
+
+	/*
+	 * Estimate average cost of sorting of one group where presorted keys are
+	 * equal.  Incremental sort is sensitive to distribution of tuples to the
+	 * groups, where we're relying on quite rough assumptions.  Thus, we're
+	 * pessimistic about incremental sort performance and increase its average
+	 * group size by half.
+	 */
+	cost_tuplesort(&group_startup_cost, &group_run_cost,
+				   1.5 * group_tuples, width, comparison_cost, sort_mem,
+				   limit_tuples);
+
+	/*
+	 * Startup cost of incremental sort is the startup cost of its first group
+	 * plus the cost of its input.
+	 */
+	startup_cost += group_startup_cost
+		+ input_startup_cost + group_input_run_cost;
+
+	/*
+	 * After we started producing tuples from the first group, the cost of
+	 * producing all the tuples is given by the cost to finish processing this
+	 * group, plus the total cost to process the remaining groups, plus the
+	 * remaining cost of input.
+	 */
+	run_cost += group_run_cost
+		+ (group_run_cost + group_startup_cost) * (input_groups - 1)
+		+ group_input_run_cost * (input_groups - 1);
+
+	/*
+	 * Incremental sort adds some overhead by itself. Firstly, it has to
+	 * detect the sort groups. This is roughly equal to one extra copy and
+	 * comparison per tuple. Secondly, it has to reset the tuplesort context
+	 * for every group.
+	 */
+	run_cost += (cpu_tuple_cost + comparison_cost) * input_tuples;
+	run_cost += 2.0 * cpu_tuple_cost * input_groups;
+
+	path->rows = input_tuples;
+	path->startup_cost = startup_cost;
+	path->total_cost = startup_cost + run_cost;
+}
+
+/*
+ * cost_sort
+ *	  Determines and returns the cost of sorting a relation, including
+ *	  the cost of reading the input data.
+ *
+ * NOTE: some callers currently pass NIL for pathkeys because they
+ * can't conveniently supply the sort keys.  Since this routine doesn't
+ * currently do anything with pathkeys anyway, that doesn't matter...
+ * but if it ever does, it should react gracefully to lack of key data.
+ * (Actually, the thing we'd most likely be interested in is just the number
+ * of sort keys, which all callers *could* supply.)
+ */
+void
+cost_sort(Path *path, PlannerInfo *root,
+		  List *pathkeys, Cost input_cost, double tuples, int width,
+		  Cost comparison_cost, int sort_mem,
+		  double limit_tuples)
+
+{
+	Cost		startup_cost;
+	Cost		run_cost;
+
+	cost_tuplesort(&startup_cost, &run_cost,
+				   tuples, width,
+				   comparison_cost, sort_mem,
+				   limit_tuples);
+
+	if (!enable_sort)
+		startup_cost += disable_cost;
+
+	startup_cost += input_cost;
+
+	path->rows = tuples;
 	path->startup_cost = startup_cost;
 	path->total_cost = startup_cost + run_cost;
 }
@@ -2245,63 +2411,74 @@ cost_agg(Path *path, PlannerInfo *root,
 	/*
 	 * Add the disk costs of hash aggregation that spills to disk.
 	 *
-	 * Groups that go into the hash table stay in memory until finalized,
-	 * so spilling and reprocessing tuples doesn't incur additional
-	 * invocations of transCost or finalCost. Furthermore, the computed
-	 * hash value is stored with the spilled tuples, so we don't incur
-	 * extra invocations of the hash function.
+	 * Groups that go into the hash table stay in memory until finalized, so
+	 * spilling and reprocessing tuples doesn't incur additional invocations
+	 * of transCost or finalCost. Furthermore, the computed hash value is
+	 * stored with the spilled tuples, so we don't incur extra invocations of
+	 * the hash function.
 	 *
-	 * Hash Agg begins returning tuples after the first batch is
-	 * complete. Accrue writes (spilled tuples) to startup_cost and to
-	 * total_cost; accrue reads only to total_cost.
+	 * Hash Agg begins returning tuples after the first batch is complete.
+	 * Accrue writes (spilled tuples) to startup_cost and to total_cost;
+	 * accrue reads only to total_cost.
 	 */
 	if (aggstrategy == AGG_HASHED || aggstrategy == AGG_MIXED)
 	{
-		double	pages_written = 0.0;
-		double	pages_read	  = 0.0;
-		double	hashentrysize;
-		double	nbatches;
-		Size	mem_limit;
-		uint64	ngroups_limit;
-		int		num_partitions;
-
+		double		pages;
+		double		pages_written = 0.0;
+		double		pages_read = 0.0;
+		double		spill_cost;
+		double		hashentrysize;
+		double		nbatches;
+		Size		mem_limit;
+		uint64		ngroups_limit;
+		int			num_partitions;
+		int			depth;
 
 		/*
 		 * Estimate number of batches based on the computed limits. If less
 		 * than or equal to one, all groups are expected to fit in memory;
 		 * otherwise we expect to spill.
 		 */
-		hashentrysize = hash_agg_entry_size(
-			aggcosts->numAggs, input_width, aggcosts->transitionSpace);
+		hashentrysize = hash_agg_entry_size(aggcosts->numAggs, input_width,
+											aggcosts->transitionSpace);
 		hash_agg_set_limits(hashentrysize, numGroups, 0, &mem_limit,
 							&ngroups_limit, &num_partitions);
 
-		nbatches = Max( (numGroups * hashentrysize) / mem_limit,
-						numGroups / ngroups_limit );
+		nbatches = Max((numGroups * hashentrysize) / mem_limit,
+					   numGroups / ngroups_limit);
+
+		nbatches = Max(ceil(nbatches), 1.0);
+		num_partitions = Max(num_partitions, 2);
+
+		/*
+		 * The number of partitions can change at different levels of
+		 * recursion; but for the purposes of this calculation assume it stays
+		 * constant.
+		 */
+		depth = ceil(log(nbatches) / log(num_partitions));
 
 		/*
 		 * Estimate number of pages read and written. For each level of
 		 * recursion, a tuple must be written and then later read.
 		 */
-		if (nbatches > 1.0)
-		{
-			double depth;
-			double pages;
+		pages = relation_byte_size(input_tuples, input_width) / BLCKSZ;
+		pages_written = pages_read = pages * depth;
 
-			pages = relation_byte_size(input_tuples, input_width) / BLCKSZ;
-
-			/*
-			 * The number of partitions can change at different levels of
-			 * recursion; but for the purposes of this calculation assume it
-			 * stays constant.
-			 */
-			depth = ceil( log(nbatches - 1) / log(num_partitions) );
-			pages_written = pages_read = pages * depth;
-		}
+		/*
+		 * HashAgg has somewhat worse IO behavior than Sort on typical
+		 * hardware/OS combinations. Account for this with a generic penalty.
+		 */
+		pages_read *= 2.0;
+		pages_written *= 2.0;
 
 		startup_cost += pages_written * random_page_cost;
 		total_cost += pages_written * random_page_cost;
 		total_cost += pages_read * seq_page_cost;
+
+		/* account for CPU cost of spilling a tuple and reading it back */
+		spill_cost = depth * input_tuples * 2.0 * cpu_tuple_cost;
+		startup_cost += spill_cost;
+		total_cost += spill_cost;
 	}
 
 	/*
@@ -2570,12 +2747,11 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 	QualCost	restrict_qual_cost;
 	double		ntuples;
 
-	/* Protect some assumptions below that rowcounts aren't zero or NaN */
-	if (outer_path_rows <= 0 || isnan(outer_path_rows))
+	/* Protect some assumptions below that rowcounts aren't zero */
+	if (outer_path_rows <= 0)
 		outer_path_rows = 1;
-	if (inner_path_rows <= 0 || isnan(inner_path_rows))
+	if (inner_path_rows <= 0)
 		inner_path_rows = 1;
-
 	/* Mark the path with the correct row estimate */
 	if (path->path.param_info)
 		path->path.rows = path->path.param_info->ppi_rows;
@@ -2785,10 +2961,10 @@ initial_cost_mergejoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 				innerendsel;
 	Path		sort_path;		/* dummy for result of cost_sort */
 
-	/* Protect some assumptions below that rowcounts aren't zero or NaN */
-	if (outer_path_rows <= 0 || isnan(outer_path_rows))
+	/* Protect some assumptions below that rowcounts aren't zero */
+	if (outer_path_rows <= 0)
 		outer_path_rows = 1;
-	if (inner_path_rows <= 0 || isnan(inner_path_rows))
+	if (inner_path_rows <= 0)
 		inner_path_rows = 1;
 
 	/*
@@ -3018,8 +3194,8 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 				rescannedtuples;
 	double		rescanratio;
 
-	/* Protect some assumptions below that rowcounts aren't zero or NaN */
-	if (inner_path_rows <= 0 || isnan(inner_path_rows))
+	/* Protect some assumptions below that rowcounts aren't zero */
+	if (inner_path_rows <= 0)
 		inner_path_rows = 1;
 
 	/* Mark the path with the correct row estimate */
@@ -3101,7 +3277,7 @@ final_cost_mergejoin(PlannerInfo *root, MergePath *path,
 	 * The whole issue is moot if we are working from a unique-ified outer
 	 * input, or if we know we don't need to mark/restore at all.
 	 */
-	if (IsA(outer_path, UniquePath) ||path->skip_mark_restore)
+	if (IsA(outer_path, UniquePath) || path->skip_mark_restore)
 		rescannedtuples = 0;
 	else
 	{
@@ -3371,7 +3547,7 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	 * Get hash table size that executor would use for inner relation.
 	 *
 	 * XXX for the moment, always assume that skew optimization will be
-	 * performed.  As long as SKEW_WORK_MEM_PERCENT is small, it's not worth
+	 * performed.  As long as SKEW_HASH_MEM_PERCENT is small, it's not worth
 	 * trying to determine that for sure.
 	 *
 	 * XXX at some point it might be interesting to try to account for skew
@@ -3380,7 +3556,7 @@ initial_cost_hashjoin(PlannerInfo *root, JoinCostWorkspace *workspace,
 	ExecChooseHashTableSize(inner_path_rows_total,
 							inner_path->pathtarget->width,
 							true,	/* useskew */
-							parallel_hash,	/* try_combined_work_mem */
+							parallel_hash,	/* try_combined_hash_mem */
 							outer_path->parallel_workers,
 							&space_allowed,
 							&numbuckets,
@@ -3443,6 +3619,7 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	Cost		run_cost = workspace->run_cost;
 	int			numbuckets = workspace->numbuckets;
 	int			numbatches = workspace->numbatches;
+	int			hash_mem;
 	Cost		cpu_per_tuple;
 	QualCost	hash_qual_cost;
 	QualCost	qp_qual_cost;
@@ -3561,16 +3738,17 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 	}
 
 	/*
-	 * If the bucket holding the inner MCV would exceed work_mem, we don't
+	 * If the bucket holding the inner MCV would exceed hash_mem, we don't
 	 * want to hash unless there is really no other alternative, so apply
 	 * disable_cost.  (The executor normally copes with excessive memory usage
 	 * by splitting batches, but obviously it cannot separate equal values
-	 * that way, so it will be unable to drive the batch size below work_mem
+	 * that way, so it will be unable to drive the batch size below hash_mem
 	 * when this is true.)
 	 */
+	hash_mem = get_hash_mem();
 	if (relation_byte_size(clamp_row_est(inner_path_rows * innermcvfreq),
 						   inner_path->pathtarget->width) >
-		(work_mem * 1024L))
+		(hash_mem * 1024L))
 		startup_cost += disable_cost;
 
 	/*
@@ -4888,9 +5066,16 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 		 * remove back into the worklist.
 		 *
 		 * Since the matching clauses are known not outerjoin-delayed, they
-		 * should certainly have appeared in the initial joinclause list.  If
-		 * we didn't find them, they must have been matched to, and removed
-		 * by, some other FK in a previous iteration of this loop.  (A likely
+		 * would normally have appeared in the initial joinclause list.  If we
+		 * didn't find them, there are two possibilities:
+		 *
+		 * 1. If the FK match is based on an EC that is ec_has_const, it won't
+		 * have generated any join clauses at all.  We discount such ECs while
+		 * checking to see if we have "all" the clauses.  (Below, we'll adjust
+		 * the selectivity estimate for this case.)
+		 *
+		 * 2. The clauses were matched to some other FK in a previous
+		 * iteration of this loop, and thus removed from worklist.  (A likely
 		 * case is that two FKs are matched to the same EC; there will be only
 		 * one EC-derived clause in the initial list, so the first FK will
 		 * consume it.)  Applying both FKs' selectivity independently risks
@@ -4900,8 +5085,9 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 		 * Later we might think of a reasonable way to combine the estimates,
 		 * but for now, just punt, since this is a fairly uncommon situation.
 		 */
-		if (list_length(removedlist) !=
-			(fkinfo->nmatched_ec + fkinfo->nmatched_ri))
+		if (removedlist == NIL ||
+			list_length(removedlist) !=
+			(fkinfo->nmatched_ec - fkinfo->nconst_ec + fkinfo->nmatched_ri))
 		{
 			worklist = list_concat(worklist, removedlist);
 			continue;
@@ -4960,9 +5146,48 @@ get_foreign_key_join_selectivity(PlannerInfo *root,
 
 			fkselec *= 1.0 / ref_tuples;
 		}
+
+		/*
+		 * If any of the FK columns participated in ec_has_const ECs, then
+		 * equivclass.c will have generated "var = const" restrictions for
+		 * each side of the join, thus reducing the sizes of both input
+		 * relations.  Taking the fkselec at face value would amount to
+		 * double-counting the selectivity of the constant restriction for the
+		 * referencing Var.  Hence, look for the restriction clause(s) that
+		 * were applied to the referencing Var(s), and divide out their
+		 * selectivity to correct for this.
+		 */
+		if (fkinfo->nconst_ec > 0)
+		{
+			for (int i = 0; i < fkinfo->nkeys; i++)
+			{
+				EquivalenceClass *ec = fkinfo->eclass[i];
+
+				if (ec && ec->ec_has_const)
+				{
+					EquivalenceMember *em = fkinfo->fk_eclass_member[i];
+					RestrictInfo *rinfo = find_derived_clause_for_ec_member(ec,
+																			em);
+
+					if (rinfo)
+					{
+						Selectivity s0;
+
+						s0 = clause_selectivity(root,
+												(Node *) rinfo,
+												0,
+												jointype,
+												sjinfo);
+						if (s0 > 0)
+							fkselec /= s0;
+					}
+				}
+			}
+		}
 	}
 
 	*restrictlist = worklist;
+	CLAMP_PROBABILITY(fkselec);
 	return fkselec;
 }
 

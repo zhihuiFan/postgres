@@ -180,6 +180,24 @@
 { amopfamily => 'btree/oid_ops', amoplefttype => 'oid', amoprighttype => 'oid',
   amopstrategy => '5', amopopr => '>(oid,oid)', amopmethod => 'btree' },
 
+# btree xid8_ops
+
+{ amopfamily => 'btree/xid8_ops', amoplefttype => 'xid8',
+  amoprighttype => 'xid8', amopstrategy => '1', amopopr => '<(xid8,xid8)',
+  amopmethod => 'btree' },
+{ amopfamily => 'btree/xid8_ops', amoplefttype => 'xid8',
+  amoprighttype => 'xid8', amopstrategy => '2', amopopr => '<=(xid8,xid8)',
+  amopmethod => 'btree' },
+{ amopfamily => 'btree/xid8_ops', amoplefttype => 'xid8',
+  amoprighttype => 'xid8', amopstrategy => '3', amopopr => '=(xid8,xid8)',
+  amopmethod => 'btree' },
+{ amopfamily => 'btree/xid8_ops', amoplefttype => 'xid8',
+  amoprighttype => 'xid8', amopstrategy => '4', amopopr => '>=(xid8,xid8)',
+  amopmethod => 'btree' },
+{ amopfamily => 'btree/xid8_ops', amoplefttype => 'xid8',
+  amoprighttype => 'xid8', amopstrategy => '5', amopopr => '>(xid8,xid8)',
+  amopmethod => 'btree' },
+
 # btree tid_ops
 
 { amopfamily => 'btree/tid_ops', amoplefttype => 'tid', amoprighttype => 'tid',
@@ -1009,6 +1027,11 @@
 { amopfamily => 'hash/xid_ops', amoplefttype => 'xid', amoprighttype => 'xid',
   amopstrategy => '1', amopopr => '=(xid,xid)', amopmethod => 'hash' },
 
+# xid8_ops
+{ amopfamily => 'hash/xid8_ops', amoplefttype => 'xid8',
+  amoprighttype => 'xid8', amopstrategy => '1', amopopr => '=(xid8,xid8)',
+  amopmethod => 'hash' },
+
 # cid_ops
 { amopfamily => 'hash/cid_ops', amoplefttype => 'cid', amoprighttype => 'cid',
   amopstrategy => '1', amopopr => '=(cid,cid)', amopmethod => 'hash' },
@@ -1077,10 +1100,6 @@
   amopstrategy => '11', amopopr => '|>>(box,box)', amopmethod => 'gist' },
 { amopfamily => 'gist/box_ops', amoplefttype => 'box', amoprighttype => 'box',
   amopstrategy => '12', amopopr => '|&>(box,box)', amopmethod => 'gist' },
-{ amopfamily => 'gist/box_ops', amoplefttype => 'box', amoprighttype => 'box',
-  amopstrategy => '13', amopopr => '~(box,box)', amopmethod => 'gist' },
-{ amopfamily => 'gist/box_ops', amoplefttype => 'box', amoprighttype => 'box',
-  amopstrategy => '14', amopopr => '@(box,box)', amopmethod => 'gist' },
 { amopfamily => 'gist/box_ops', amoplefttype => 'box', amoprighttype => 'point',
   amopstrategy => '15', amoppurpose => 'o', amopopr => '<->(box,point)',
   amopmethod => 'gist', amopsortfamily => 'btree/float_ops' },
@@ -1153,12 +1172,6 @@
   amoprighttype => 'polygon', amopstrategy => '12',
   amopopr => '|&>(polygon,polygon)', amopmethod => 'gist' },
 { amopfamily => 'gist/poly_ops', amoplefttype => 'polygon',
-  amoprighttype => 'polygon', amopstrategy => '13',
-  amopopr => '~(polygon,polygon)', amopmethod => 'gist' },
-{ amopfamily => 'gist/poly_ops', amoplefttype => 'polygon',
-  amoprighttype => 'polygon', amopstrategy => '14',
-  amopopr => '@(polygon,polygon)', amopmethod => 'gist' },
-{ amopfamily => 'gist/poly_ops', amoplefttype => 'polygon',
   amoprighttype => 'point', amopstrategy => '15', amoppurpose => 'o',
   amopopr => '<->(polygon,point)', amopmethod => 'gist',
   amopsortfamily => 'btree/float_ops' },
@@ -1200,12 +1213,6 @@
 { amopfamily => 'gist/circle_ops', amoplefttype => 'circle',
   amoprighttype => 'circle', amopstrategy => '12',
   amopopr => '|&>(circle,circle)', amopmethod => 'gist' },
-{ amopfamily => 'gist/circle_ops', amoplefttype => 'circle',
-  amoprighttype => 'circle', amopstrategy => '13',
-  amopopr => '~(circle,circle)', amopmethod => 'gist' },
-{ amopfamily => 'gist/circle_ops', amoplefttype => 'circle',
-  amoprighttype => 'circle', amopstrategy => '14',
-  amopopr => '@(circle,circle)', amopmethod => 'gist' },
 { amopfamily => 'gist/circle_ops', amoplefttype => 'circle',
   amoprighttype => 'point', amopstrategy => '15', amoppurpose => 'o',
   amopopr => '<->(circle,point)', amopmethod => 'gist',
@@ -2430,8 +2437,6 @@
 { amopfamily => 'brin/box_inclusion_ops', amoplefttype => 'box',
   amoprighttype => 'box', amopstrategy => '12', amopopr => '|&>(box,box)',
   amopmethod => 'brin' },
-
-# we could, but choose not to, supply entries for strategies 13 and 14
 
 { amopfamily => 'brin/box_inclusion_ops', amoplefttype => 'box',
   amoprighttype => 'point', amopstrategy => '7', amopopr => '@>(box,point)',

@@ -621,7 +621,7 @@ DefineQueryRewrite(const char *rulename,
 		classForm->relam = InvalidOid;
 		classForm->reltablespace = InvalidOid;
 		classForm->relpages = 0;
-		classForm->reltuples = 0;
+		classForm->reltuples = -1;
 		classForm->relallvisible = 0;
 		classForm->reltoastrelid = InvalidOid;
 		classForm->relhasindex = false;
@@ -1002,6 +1002,8 @@ RenameRewriteRule(RangeVar *relation, const char *oldName,
 	namestrcpy(&(ruleform->rulename), newName);
 
 	CatalogTupleUpdate(pg_rewrite_desc, &ruletup->t_self, ruletup);
+
+	InvokeObjectPostAlterHook(RewriteRelationId, ruleOid, 0);
 
 	heap_freetuple(ruletup);
 	table_close(pg_rewrite_desc, RowExclusiveLock);

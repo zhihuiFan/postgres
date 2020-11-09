@@ -90,6 +90,7 @@ brinhandler(PG_FUNCTION_ARGS)
 
 	amroutine->amstrategies = 0;
 	amroutine->amsupport = BRIN_LAST_OPTIONAL_PROCNUM;
+	amroutine->amoptsprocnum = BRIN_PROCNUM_OPTIONS;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = false;
 	amroutine->amcanbackward = false;
@@ -119,6 +120,7 @@ brinhandler(PG_FUNCTION_ARGS)
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;
 	amroutine->amvalidate = brinvalidate;
+	amroutine->amadjustmembers = NULL;
 	amroutine->ambeginscan = brinbeginscan;
 	amroutine->amrescan = brinrescan;
 	amroutine->amgettuple = NULL;

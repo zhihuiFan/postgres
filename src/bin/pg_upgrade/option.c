@@ -56,6 +56,7 @@ parseCommandLine(int argc, char *argv[])
 		{"socketdir", required_argument, NULL, 's'},
 		{"verbose", no_argument, NULL, 'v'},
 		{"clone", no_argument, NULL, 1},
+		{"index-collation-versions-unknown", no_argument, NULL, 2},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -203,6 +204,10 @@ parseCommandLine(int argc, char *argv[])
 				user_opts.transfer_mode = TRANSFER_MODE_CLONE;
 				break;
 
+			case 2:
+				user_opts.ind_coll_unknown = true;
+				break;
+
 			default:
 				fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 						os_info.progname);
@@ -307,6 +312,8 @@ usage(void)
 	printf(_("  -v, --verbose                 enable verbose internal logging\n"));
 	printf(_("  -V, --version                 display version information, then exit\n"));
 	printf(_("  --clone                       clone instead of copying files to new cluster\n"));
+	printf(_("  --index-collation-versions-unknown\n"));
+	printf(_("                                mark text indexes as needing to be rebuilt\n"));
 	printf(_("  -?, --help                    show this help, then exit\n"));
 	printf(_("\n"
 			 "Before running pg_upgrade you must:\n"
@@ -468,7 +475,7 @@ adjust_data_dir(ClusterInfo *cluster)
 void
 get_sock_dir(ClusterInfo *cluster, bool live_check)
 {
-#ifdef HAVE_UNIX_SOCKETS
+#if defined(HAVE_UNIX_SOCKETS) && !defined(WIN32)
 
 	/*
 	 * sockdir and port were added to postmaster.pid in PG 9.1. Pre-9.1 cannot
@@ -530,7 +537,7 @@ get_sock_dir(ClusterInfo *cluster, bool live_check)
 		 * default
 		 */
 		cluster->sockdir = NULL;
-#else							/* !HAVE_UNIX_SOCKETS */
+#else							/* !HAVE_UNIX_SOCKETS || WIN32 */
 	cluster->sockdir = NULL;
 #endif
 }

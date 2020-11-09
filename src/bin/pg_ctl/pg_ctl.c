@@ -810,8 +810,7 @@ find_other_exec_or_die(const char *argv0, const char *target, const char *versio
 			strlcpy(full_path, progname, sizeof(full_path));
 
 		if (ret == -1)
-			write_stderr(_("The program \"%s\" is needed by %s "
-						   "but was not found in the\n"
+			write_stderr(_("The program \"%s\" is needed by %s but was not found in the\n"
 						   "same directory as \"%s\".\n"
 						   "Check your installation.\n"),
 						 target, progname, full_path);
@@ -1196,11 +1195,6 @@ do_promote(void)
 		exit(1);
 	}
 
-	/*
-	 * For 9.3 onwards, "fast" promotion is performed. Promotion with a full
-	 * checkpoint is still possible by writing a file called
-	 * "fallback_promote" instead of "promote"
-	 */
 	snprintf(promote_file, MAXPGPATH, "%s/promote", pg_data);
 
 	if ((prmfile = fopen(promote_file, "w")) == NULL)
@@ -1784,7 +1778,7 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 	Advapi32Handle = LoadLibrary("ADVAPI32.DLL");
 	if (Advapi32Handle != NULL)
 	{
-		_CreateRestrictedToken = (__CreateRestrictedToken) GetProcAddress(Advapi32Handle, "CreateRestrictedToken");
+		_CreateRestrictedToken = (__CreateRestrictedToken) (pg_funcptr_t) GetProcAddress(Advapi32Handle, "CreateRestrictedToken");
 	}
 
 	if (_CreateRestrictedToken == NULL)
@@ -1858,11 +1852,11 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo, bool as_ser
 	Kernel32Handle = LoadLibrary("KERNEL32.DLL");
 	if (Kernel32Handle != NULL)
 	{
-		_IsProcessInJob = (__IsProcessInJob) GetProcAddress(Kernel32Handle, "IsProcessInJob");
-		_CreateJobObject = (__CreateJobObject) GetProcAddress(Kernel32Handle, "CreateJobObjectA");
-		_SetInformationJobObject = (__SetInformationJobObject) GetProcAddress(Kernel32Handle, "SetInformationJobObject");
-		_AssignProcessToJobObject = (__AssignProcessToJobObject) GetProcAddress(Kernel32Handle, "AssignProcessToJobObject");
-		_QueryInformationJobObject = (__QueryInformationJobObject) GetProcAddress(Kernel32Handle, "QueryInformationJobObject");
+		_IsProcessInJob = (__IsProcessInJob) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "IsProcessInJob");
+		_CreateJobObject = (__CreateJobObject) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "CreateJobObjectA");
+		_SetInformationJobObject = (__SetInformationJobObject) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "SetInformationJobObject");
+		_AssignProcessToJobObject = (__AssignProcessToJobObject) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "AssignProcessToJobObject");
+		_QueryInformationJobObject = (__QueryInformationJobObject) (pg_funcptr_t) GetProcAddress(Kernel32Handle, "QueryInformationJobObject");
 	}
 
 	/* Verify that we found all functions */

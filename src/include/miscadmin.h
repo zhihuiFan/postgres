@@ -98,16 +98,16 @@ extern void ProcessInterrupts(void);
 
 #define CHECK_FOR_INTERRUPTS() \
 do { \
-	if (InterruptPending) \
+	if (unlikely(InterruptPending)) \
 		ProcessInterrupts(); \
 } while(0)
 #else							/* WIN32 */
 
 #define CHECK_FOR_INTERRUPTS() \
 do { \
-	if (UNBLOCKED_SIGNAL_QUEUE()) \
+	if (unlikely(UNBLOCKED_SIGNAL_QUEUE())) \
 		pgwin32_dispatch_queued_signals(); \
-	if (InterruptPending) \
+	if (unlikely(InterruptPending)) \
 		ProcessInterrupts(); \
 } while(0)
 #endif							/* WIN32 */
@@ -243,6 +243,7 @@ extern PGDLLIMPORT int IntervalStyle;
 extern bool enableFsync;
 extern PGDLLIMPORT bool allowSystemTableMods;
 extern PGDLLIMPORT int work_mem;
+extern PGDLLIMPORT double hash_mem_multiplier;
 extern PGDLLIMPORT int maintenance_work_mem;
 extern PGDLLIMPORT int max_parallel_maintenance_workers;
 
@@ -468,5 +469,8 @@ extern bool has_rolreplication(Oid roleid);
 /* in access/transam/xlog.c */
 extern bool BackupInProgress(void);
 extern void CancelBackup(void);
+
+/* in executor/nodeHash.c */
+extern int	get_hash_mem(void);
 
 #endif							/* MISCADMIN_H */

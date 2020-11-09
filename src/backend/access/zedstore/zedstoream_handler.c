@@ -1786,7 +1786,7 @@ zedstoream_index_build_range_scan(Relation baseRelation,
 
 	/* okay to ignore lazy VACUUMs here */
 	if (!IsBootstrapProcessingMode() && !indexInfo->ii_Concurrent)
-		OldestXmin = GetOldestXmin(baseRelation, PROCARRAY_FLAGS_VACUUM);
+		OldestXmin = GetOldestNonRemovableTransactionId(baseRelation);
 
 	zsbt_tuplebuffer_flush(baseRelation);
 	if (!scan)
@@ -1808,7 +1808,8 @@ zedstoream_index_build_range_scan(Relation baseRelation,
 		else
 		{
 			/* leave out completely dead items even with SnapshotAny */
-			InitNonVacuumableSnapshot(NonVacuumableSnapshot, OldestXmin);
+			InitNonVacuumableSnapshot(NonVacuumableSnapshot,
+									  GlobalVisTestFor(baseRelation));
 			snapshot = &NonVacuumableSnapshot;
 		}
 
@@ -1876,7 +1877,8 @@ zedstoream_index_build_range_scan(Relation baseRelation,
 		if (snapshot == SnapshotAny)
 		{
 			/* leave out completely dead items even with SnapshotAny */
-			InitNonVacuumableSnapshot(NonVacuumableSnapshot, OldestXmin);
+			InitNonVacuumableSnapshot(NonVacuumableSnapshot,
+									  GlobalVisTestFor(baseRelation));
 			snapshot = &NonVacuumableSnapshot;
 		}
 	}
@@ -1975,13 +1977,6 @@ static void
 zedstoream_finish_bulk_insert(Relation relation, int options)
 {
 	zsbt_tuplebuffer_flush(relation);
-
-	/*
-	 * If we skipped writing WAL, then we need to sync the zedstore (but not
-	 * indexes since those use WAL anyway / don't go through tableam)
-	 */
-	if (options & HEAP_INSERT_SKIP_WAL)
-		heap_sync(relation);
 }
 
 /* ------------------------------------------------------------------------
@@ -3010,7 +3005,7 @@ zedstoream_vacuum_rel(Relation onerel, VacuumParams *params,
 {
 	zsbt_tuplebuffer_flush(onerel);
 	zsundo_vacuum(onerel, params, bstrategy,
-				  GetOldestXmin(onerel, PROCARRAY_FLAGS_VACUUM));
+				  GetOldestNonRemovableTransactionId(onerel));
 }
 
 static const TableAmRoutine zedstoream_methods = {

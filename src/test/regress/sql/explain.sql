@@ -22,8 +22,12 @@ begin
         ln := regexp_replace(ln, '\m\d+\M', 'N', 'g');
         -- In sort output, the above won't match units-suffixed numbers
         ln := regexp_replace(ln, '\m\d+kB', 'NkB', 'g');
-        -- Text-mode buffers output varies depending on the system state
-        ln := regexp_replace(ln, '^( +Buffers: shared)( hit=N)?( read=N)?', '\1 [read]');
+        -- Ignore text-mode buffers output because it varies depending
+        -- on the system state
+        CONTINUE WHEN (ln ~ ' +Buffers: .*');
+        -- Ignore text-mode "Planning:" line because whether it's output
+        -- varies depending on the system state
+        CONTINUE WHEN (ln = 'Planning:');
         return next ln;
     end loop;
 end;
@@ -56,6 +60,8 @@ select explain_filter('explain (analyze, buffers, format text) select * from int
 select explain_filter('explain (analyze, buffers, format json) select * from int8_tbl i8');
 select explain_filter('explain (analyze, buffers, format xml) select * from int8_tbl i8');
 select explain_filter('explain (analyze, buffers, format yaml) select * from int8_tbl i8');
+select explain_filter('explain (buffers, format text) select * from int8_tbl i8');
+select explain_filter('explain (buffers, format json) select * from int8_tbl i8');
 
 -- SETTINGS option
 -- We have to ignore other settings that might be imposed by the environment,

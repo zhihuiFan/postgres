@@ -80,6 +80,11 @@ typedef struct LogicalDecodingContext
 	void	   *output_writer_private;
 
 	/*
+	 * Does the output plugin support streaming, and is it enabled?
+	 */
+	bool		streaming;
+
+	/*
 	 * State for writing output.
 	 */
 	bool		accept_writes;
@@ -91,18 +96,18 @@ typedef struct LogicalDecodingContext
 
 extern void CheckLogicalDecodingRequirements(void);
 
-extern LogicalDecodingContext *CreateInitDecodingContext(char *plugin,
+extern LogicalDecodingContext *CreateInitDecodingContext(const char *plugin,
 														 List *output_plugin_options,
 														 bool need_full_snapshot,
 														 XLogRecPtr restart_lsn,
-														 XLogPageReadCB read_page,
+														 XLogReaderRoutine *xl_routine,
 														 LogicalOutputPluginWriterPrepareWrite prepare_write,
 														 LogicalOutputPluginWriterWrite do_write,
 														 LogicalOutputPluginWriterUpdateProgress update_progress);
 extern LogicalDecodingContext *CreateDecodingContext(XLogRecPtr start_lsn,
 													 List *output_plugin_options,
 													 bool fast_forward,
-													 XLogPageReadCB read_page,
+													 XLogReaderRoutine *xl_routine,
 													 LogicalOutputPluginWriterPrepareWrite prepare_write,
 													 LogicalOutputPluginWriterWrite do_write,
 													 LogicalOutputPluginWriterUpdateProgress update_progress);
@@ -116,5 +121,7 @@ extern void LogicalIncreaseRestartDecodingForSlot(XLogRecPtr current_lsn,
 extern void LogicalConfirmReceivedLocation(XLogRecPtr lsn);
 
 extern bool filter_by_origin_cb_wrapper(LogicalDecodingContext *ctx, RepOriginId origin_id);
+extern void ResetLogicalStreamingState(void);
+extern void UpdateDecodingStats(LogicalDecodingContext *ctx);
 
 #endif

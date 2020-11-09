@@ -226,12 +226,15 @@ pg_GSS_write(PGconn *conn, const void *ptr, size_t len)
 		PqGSSSendConsumed += input.length;
 
 		/* 4 network-order bytes of length, then payload */
-		netlen = htonl(output.length);
+		netlen = pg_hton32(output.length);
 		memcpy(PqGSSSendBuffer + PqGSSSendLength, &netlen, sizeof(uint32));
 		PqGSSSendLength += sizeof(uint32);
 
 		memcpy(PqGSSSendBuffer + PqGSSSendLength, output.value, output.length);
 		PqGSSSendLength += output.length;
+
+		/* Release buffer storage allocated by GSSAPI */
+		gss_release_buffer(&minor, &output);
 	}
 
 	/* If we get here, our counters should all match up. */
@@ -241,6 +244,7 @@ pg_GSS_write(PGconn *conn, const void *ptr, size_t len)
 	ret = bytes_sent;
 
 cleanup:
+	/* Release GSSAPI buffer storage, if we didn't already */
 	if (output.value != NULL)
 		gss_release_buffer(&minor, &output);
 	return ret;
@@ -342,7 +346,7 @@ pg_GSS_read(PGconn *conn, void *ptr, size_t len)
 		}
 
 		/* Decode the packet length and check for overlength packet */
-		input.length = ntohl(*(uint32 *) PqGSSRecvBuffer);
+		input.length = pg_ntoh32(*(uint32 *) PqGSSRecvBuffer);
 
 		if (input.length > PQ_GSS_RECV_BUFFER_SIZE - sizeof(uint32))
 		{
@@ -408,12 +412,14 @@ pg_GSS_read(PGconn *conn, void *ptr, size_t len)
 		/* Our receive buffer is now empty, reset it */
 		PqGSSRecvLength = 0;
 
+		/* Release buffer storage allocated by GSSAPI */
 		gss_release_buffer(&minor, &output);
 	}
 
 	ret = bytes_returned;
 
 cleanup:
+	/* Release GSSAPI buffer storage, if we didn't already */
 	if (output.value != NULL)
 		gss_release_buffer(&minor, &output);
 	return ret;
@@ -583,7 +589,7 @@ pqsecure_open_gss(PGconn *conn)
 		 */
 
 		/* Get the length and check for over-length packet */
-		input.length = ntohl(*(uint32 *) PqGSSRecvBuffer);
+		input.length = pg_ntoh32(*(uint32 *) PqGSSRecvBuffer);
 		if (input.length > PQ_GSS_RECV_BUFFER_SIZE - sizeof(uint32))
 		{
 			printfPQExpBuffer(&conn->errorMessage,
@@ -652,6 +658,7 @@ pqsecure_open_gss(PGconn *conn)
 		gss_release_cred(&minor, &conn->gcred);
 		conn->gcred = GSS_C_NO_CREDENTIAL;
 		conn->gssenc = true;
+		gss_release_buffer(&minor, &output);
 
 		/*
 		 * Determine the max packet size which will fit in our buffer, after
@@ -676,11 +683,12 @@ pqsecure_open_gss(PGconn *conn)
 	{
 		pg_GSS_error(libpq_gettext("GSSAPI context establishment error"),
 					 conn, major, minor);
+		gss_release_buffer(&minor, &output);
 		return PGRES_POLLING_FAILED;
 	}
 
 	/* Queue the token for writing */
-	netlen = htonl(output.length);
+	netlen = pg_hton32(output.length);
 
 	memcpy(PqGSSSendBuffer, (char *) &netlen, sizeof(uint32));
 	PqGSSSendLength += sizeof(uint32);
@@ -690,6 +698,7 @@ pqsecure_open_gss(PGconn *conn)
 
 	/* We don't bother with PqGSSSendConsumed here */
 
+	/* Release buffer storage allocated by GSSAPI */
 	gss_release_buffer(&minor, &output);
 
 	/* Ask to be called again to write data */

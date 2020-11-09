@@ -292,7 +292,7 @@ zsundo_create_for_tuple_lock(Relation rel, TransactionId xid, CommandId cid,
  * Returns the oldest valid UNDO ptr, after discarding.
  */
 static ZSUndoRecPtr
-zsundo_trim(Relation rel, TransactionId OldestXmin)
+zsundo_trim(Relation rel)
 {
 	/* Scan the undo log from oldest to newest */
 	Buffer		metabuf;
@@ -395,7 +395,7 @@ zsundo_trim(Relation rel, TransactionId OldestXmin)
 			}
 			oldest_undorecptr = undorec->undorecptr;
 
-			if (!TransactionIdPrecedes(undorec->xid, OldestXmin))
+			if (!GlobalVisCheckRemovableXid(rel, undorec->xid))
 			{
 				/* This is still needed. Bail out */
 				break;
@@ -651,7 +651,7 @@ zsundo_vacuum(Relation rel, VacuumParams *params, BufferAccessStrategy bstrategy
 	/*
 	 * Scan the UNDO log, and discard what we can.
 	 */
-	(void) zsundo_trim(rel, RecentGlobalXmin);
+	(void) zsundo_trim(rel);
 
 	vacrelstats = (ZSVacRelStats *) palloc0(sizeof(ZSVacRelStats));
 
@@ -871,7 +871,7 @@ zsundo_get_oldest_undo_ptr(Relation rel, bool attempt_trim)
 	 * just get the current value from the metapage.
 	 */
 	if (attempt_trim)
-		result = zsundo_trim(rel, RecentGlobalXmin);
+		result = zsundo_trim(rel);
 	else
 	{
 		/*

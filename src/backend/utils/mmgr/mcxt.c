@@ -67,6 +67,7 @@ static void MemoryContextStatsPrint(MemoryContext context, void *passthru,
 #define AssertNotInCriticalSection(context) \
 	Assert(CritSectionCount == 0 || (context)->allowInCritSection)
 
+
 /*****************************************************************************
  *	  EXPORTED ROUTINES														 *
  *****************************************************************************/
@@ -469,13 +470,13 @@ MemoryContextIsEmpty(MemoryContext context)
 Size
 MemoryContextMemAllocated(MemoryContext context, bool recurse)
 {
-	Size	total = context->mem_allocated;
+	Size		total = context->mem_allocated;
 
 	AssertArg(MemoryContextIsValid(context));
 
 	if (recurse)
 	{
-		MemoryContext child = context->firstchild;
+		MemoryContext child;
 
 		for (child = context->firstchild;
 			 child != NULL;

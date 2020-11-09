@@ -1,4 +1,4 @@
-#! /usr/bin/perl -w
+#! /usr/bin/perl
 
 #################################################################
 # version_stamp.pl -- update version stamps throughout the source tree
@@ -9,10 +9,10 @@
 #################################################################
 
 #
-# This script updates the version stamp in configure.in, and also in assorted
+# This script updates the version stamp in configure.ac, and also in assorted
 # other files wherein it's not convenient to obtain the version number from
 # configure's output.  Note that you still have to run autoconf afterward
-# to regenerate configure from the updated configure.in.
+# to regenerate configure from the updated configure.ac.
 #
 # Usage: cd to top of source tree and issue
 #	src/tools/version_stamp.pl MINORVERSION
@@ -21,10 +21,11 @@
 #
 
 use strict;
+use warnings;
 
 # Major version is hard-wired into the script.  We update it when we branch
 # a new development version.
-my $majorversion = 13;
+my $majorversion = 14;
 
 # Validate argument and compute derived variables
 my $minor = shift;
@@ -34,23 +35,23 @@ my ($dotneeded);
 
 if ($minor =~ m/^\d+$/)
 {
-	$dotneeded    = 1;
+	$dotneeded = 1;
 }
 elsif ($minor eq "devel")
 {
-	$dotneeded    = 0;
+	$dotneeded = 0;
 }
 elsif ($minor =~ m/^alpha\d+$/)
 {
-	$dotneeded    = 0;
+	$dotneeded = 0;
 }
 elsif ($minor =~ m/^beta\d+$/)
 {
-	$dotneeded    = 0;
+	$dotneeded = 0;
 }
 elsif ($minor =~ m/^rc\d+$/)
 {
-	$dotneeded    = 0;
+	$dotneeded = 0;
 }
 else
 {
@@ -73,7 +74,7 @@ else
 # (this also ensures we're in the right directory)
 
 my $aconfver = "";
-open(my $fh, '<', "configure.in") || die "could not read configure.in: $!\n";
+open(my $fh, '<', "configure.ac") || die "could not read configure.ac: $!\n";
 while (<$fh>)
 {
 	if (m/^m4_if\(m4_defn\(\[m4_PACKAGE_VERSION\]\), \[(.*)\], \[\], \[m4_fatal/
@@ -85,13 +86,13 @@ while (<$fh>)
 }
 close($fh);
 $aconfver ne ""
-  || die "could not find autoconf version number in configure.in\n";
+  || die "could not find autoconf version number in configure.ac\n";
 
-# Update configure.in and other files that contain version numbers
+# Update configure.ac and other files that contain version numbers
 
 my $fixedfiles = "";
 
-sed_file("configure.in",
+sed_file("configure.ac",
 	"-e 's/AC_INIT(\\[PostgreSQL\\], \\[[0-9a-z.]*\\]/AC_INIT([PostgreSQL], [$fullversion]/'"
 );
 

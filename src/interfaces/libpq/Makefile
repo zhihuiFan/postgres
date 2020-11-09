@@ -85,12 +85,13 @@ endif
 ifeq ($(PORTNAME), win32)
 SHLIB_LINK += -lshell32 -lws2_32 -lsecur32 $(filter -leay32 -lssleay32 -lcomerr32 -lkrb5_32, $(LIBS))
 endif
+SHLIB_PREREQS = submake-libpgport
 
 SHLIB_EXPORTS = exports.txt
 
-all: all-lib
+PKG_CONFIG_REQUIRES_PRIVATE = libssl libcrypto
 
-all-lib: | submake-libpgport
+all: all-lib
 
 # Shared library stuff
 include $(top_srcdir)/src/Makefile.shlib

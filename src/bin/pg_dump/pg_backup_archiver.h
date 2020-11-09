@@ -98,7 +98,7 @@ typedef z_stream *z_streamp;
 #define K_VERS_MAJOR 1
 #define K_VERS_MINOR 14
 #define K_VERS_REV 0
-#define K_VERS_SELF MAKE_ARCHIVE_VERSION(K_VERS_MAJOR, K_VERS_MINOR, K_VERS_REV);
+#define K_VERS_SELF MAKE_ARCHIVE_VERSION(K_VERS_MAJOR, K_VERS_MINOR, K_VERS_REV)
 
 /* Newest format we can read */
 #define K_VERS_MAX	MAKE_ARCHIVE_VERSION(K_VERS_MAJOR, K_VERS_MINOR, 255)
@@ -303,7 +303,6 @@ struct _archiveHandle
 
 	/* Stuff for direct DB connection */
 	char	   *archdbname;		/* DB name *read* from archive */
-	trivalue	promptPassword;
 	char	   *savedPassword;	/* password for ropt->username, if known */
 	char	   *use_role;
 	PGconn	   *connection;
@@ -471,7 +470,7 @@ extern void InitArchiveFmt_Tar(ArchiveHandle *AH);
 
 extern bool isValidTarHeader(char *header);
 
-extern void ReconnectToServer(ArchiveHandle *AH, const char *dbname, const char *newUser);
+extern void ReconnectToServer(ArchiveHandle *AH, const char *dbname);
 extern void DropBlobIfExists(ArchiveHandle *AH, Oid oid);
 
 void		ahwrite(const void *ptr, size_t size, size_t nmemb, ArchiveHandle *AH);

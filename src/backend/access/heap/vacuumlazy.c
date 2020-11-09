@@ -65,6 +65,7 @@
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
+#include "executor/instrument.h"
 #include "miscadmin.h"
 #include "optimizer/paths.h"
 #include "pgstat.h"
@@ -137,12 +138,25 @@
 #define PARALLEL_VACUUM_KEY_SHARED			1
 #define PARALLEL_VACUUM_KEY_DEAD_TUPLES		2
 #define PARALLEL_VACUUM_KEY_QUERY_TEXT		3
+#define PARALLEL_VACUUM_KEY_BUFFER_USAGE	4
+#define PARALLEL_VACUUM_KEY_WAL_USAGE		5
 
 /*
  * Macro to check if we are in a parallel vacuum.  If true, we are in the
  * parallel mode and the DSM segment is initialized.
  */
 #define ParallelVacuumIsActive(lps) PointerIsValid(lps)
+
+/* Phases of vacuum during which we report error context. */
+typedef enum
+{
+	VACUUM_ERRCB_PHASE_UNKNOWN,
+	VACUUM_ERRCB_PHASE_SCAN_HEAP,
+	VACUUM_ERRCB_PHASE_VACUUM_INDEX,
+	VACUUM_ERRCB_PHASE_VACUUM_HEAP,
+	VACUUM_ERRCB_PHASE_INDEX_CLEANUP,
+	VACUUM_ERRCB_PHASE_TRUNCATE
+} VacErrPhase;
 
 /*
  * LVDeadTuples stores the dead tuple TIDs collected during the heap scan.
@@ -194,7 +208,8 @@ typedef struct LVShared
 	 * live tuples in the index vacuum case or the new live tuples in the
 	 * index cleanup case.
 	 *
-	 * estimated_count is true if the reltuples is an estimated value.
+	 * estimated_count is true if reltuples is an estimated value.  (Note that
+	 * reltuples could be -1 in this case, indicating we have no idea.)
 	 */
 	double		reltuples;
 	bool		estimated_count;
@@ -218,8 +233,8 @@ typedef struct LVShared
 
 	/*
 	 * Number of active parallel workers.  This is used for computing the
-	 * minimum threshold of the vacuum cost balance for a worker to go for the
-	 * delay.
+	 * minimum threshold of the vacuum cost balance before a worker sleeps for
+	 * cost-based delay.
 	 */
 	pg_atomic_uint32 active_nworkers;
 
@@ -259,6 +274,12 @@ typedef struct LVParallelState
 	/* Shared information among parallel vacuum workers */
 	LVShared   *lvshared;
 
+	/* Points to buffer usage area in DSM */
+	BufferUsage *buffer_usage;
+
+	/* Points to WAL usage area in DSM */
+	WalUsage   *wal_usage;
+
 	/*
 	 * The number of indexes that support parallel index bulk-deletion and
 	 * parallel index cleanup respectively.
@@ -270,6 +291,8 @@ typedef struct LVParallelState
 
 typedef struct LVRelStats
 {
+	char	   *relnamespace;
+	char	   *relname;
 	/* useindex = true means two-pass strategy; false means one-pass */
 	bool		useindex;
 	/* Overall statistics about rel */
@@ -290,8 +313,21 @@ typedef struct LVRelStats
 	int			num_index_scans;
 	TransactionId latestRemovedXid;
 	bool		lock_waiter_detected;
+
+	/* Used for error callback */
+	char	   *indname;
+	BlockNumber blkno;			/* used only for heap operations */
+	OffsetNumber offnum;		/* used only for heap operations */
+	VacErrPhase phase;
 } LVRelStats;
 
+/* Struct for saving and restoring vacuum error information. */
+typedef struct LVSavedErrInfo
+{
+	BlockNumber blkno;
+	OffsetNumber offnum;
+	VacErrPhase phase;
+} LVSavedErrInfo;
 
 /* A few variables that don't seem worth passing around as parameters */
 static int	elevel = -1;
@@ -308,16 +344,17 @@ static void lazy_scan_heap(Relation onerel, VacuumParams *params,
 						   LVRelStats *vacrelstats, Relation *Irel, int nindexes,
 						   bool aggressive);
 static void lazy_vacuum_heap(Relation onerel, LVRelStats *vacrelstats);
-static bool lazy_check_needs_freeze(Buffer buf, bool *hastup);
+static bool lazy_check_needs_freeze(Buffer buf, bool *hastup,
+									LVRelStats *vacrelstats);
 static void lazy_vacuum_all_indexes(Relation onerel, Relation *Irel,
 									IndexBulkDeleteResult **stats,
 									LVRelStats *vacrelstats, LVParallelState *lps,
 									int nindexes);
 static void lazy_vacuum_index(Relation indrel, IndexBulkDeleteResult **stats,
-							  LVDeadTuples *dead_tuples, double reltuples);
+							  LVDeadTuples *dead_tuples, double reltuples, LVRelStats *vacrelstats);
 static void lazy_cleanup_index(Relation indrel,
 							   IndexBulkDeleteResult **stats,
-							   double reltuples, bool estimated_count);
+							   double reltuples, bool estimated_count, LVRelStats *vacrelstats);
 static int	lazy_vacuum_page(Relation onerel, BlockNumber blkno, Buffer buffer,
 							 int tupindex, LVRelStats *vacrelstats, Buffer *vmbuffer);
 static bool should_attempt_truncation(VacuumParams *params,
@@ -331,19 +368,20 @@ static void lazy_record_dead_tuple(LVDeadTuples *dead_tuples,
 static bool lazy_tid_reaped(ItemPointer itemptr, void *state);
 static int	vac_cmp_itemptr(const void *left, const void *right);
 static bool heap_page_is_all_visible(Relation rel, Buffer buf,
+									 LVRelStats *vacrelstats,
 									 TransactionId *visibility_cutoff_xid, bool *all_frozen);
 static void lazy_parallel_vacuum_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
 										 LVRelStats *vacrelstats, LVParallelState *lps,
 										 int nindexes);
 static void parallel_vacuum_index(Relation *Irel, IndexBulkDeleteResult **stats,
 								  LVShared *lvshared, LVDeadTuples *dead_tuples,
-								  int nindexes);
+								  int nindexes, LVRelStats *vacrelstats);
 static void vacuum_indexes_leader(Relation *Irel, IndexBulkDeleteResult **stats,
 								  LVRelStats *vacrelstats, LVParallelState *lps,
 								  int nindexes);
 static void vacuum_one_index(Relation indrel, IndexBulkDeleteResult **stats,
 							 LVShared *lvshared, LVSharedIndStats *shared_indstats,
-							 LVDeadTuples *dead_tuples);
+							 LVDeadTuples *dead_tuples, LVRelStats *vacrelstats);
 static void lazy_cleanup_all_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
 									 LVRelStats *vacrelstats, LVParallelState *lps,
 									 int nindexes);
@@ -357,10 +395,15 @@ static void update_index_statistics(Relation *Irel, IndexBulkDeleteResult **stat
 static LVParallelState *begin_parallel_vacuum(Oid relid, Relation *Irel,
 											  LVRelStats *vacrelstats, BlockNumber nblocks,
 											  int nindexes, int nrequested);
-static void end_parallel_vacuum(Relation *Irel, IndexBulkDeleteResult **stats,
+static void end_parallel_vacuum(IndexBulkDeleteResult **stats,
 								LVParallelState *lps, int nindexes);
 static LVSharedIndStats *get_indstats(LVShared *lvshared, int n);
 static bool skip_parallel_vacuum_index(Relation indrel, LVShared *lvshared);
+static void vacuum_error_callback(void *arg);
+static void update_vacuum_error_info(LVRelStats *errinfo, LVSavedErrInfo *saved_err_info,
+									 int phase, BlockNumber blkno,
+									 OffsetNumber offnum);
+static void restore_vacuum_error_info(LVRelStats *errinfo, const LVSavedErrInfo *saved_err_info);
 
 
 /*
@@ -381,6 +424,8 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 	int			nindexes;
 	PGRUsage	ru0;
 	TimestampTz starttime = 0;
+	WalUsage	walusage_start = pgWalUsage;
+	WalUsage	walusage = {0, 0, 0};
 	long		secs;
 	int			usecs;
 	double		read_rate,
@@ -394,6 +439,7 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 	double		new_live_tuples;
 	TransactionId new_frozen_xid;
 	MultiXactId new_min_multi;
+	ErrorContextCallback errcallback;
 
 	Assert(params != NULL);
 	Assert(params->index_cleanup != VACOPT_TERNARY_DEFAULT);
@@ -441,25 +487,12 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 	if (params->options & VACOPT_DISABLE_PAGE_SKIPPING)
 		aggressive = true;
 
-	/*
-	 * Normally the relfrozenxid for an anti-wraparound vacuum will be old
-	 * enough to force an aggressive vacuum.  However, a concurrent vacuum
-	 * might have already done this work that the relfrozenxid in relcache has
-	 * been updated.  If that happens this vacuum is redundant, so skip it.
-	 */
-	if (params->is_wraparound && !aggressive)
-	{
-		ereport(DEBUG1,
-				(errmsg("skipping redundant vacuum to prevent wraparound of table \"%s.%s.%s\"",
-						get_database_name(MyDatabaseId),
-						get_namespace_name(RelationGetNamespace(onerel)),
-						RelationGetRelationName(onerel))));
-		pgstat_progress_end_command();
-		return;
-	}
-
 	vacrelstats = (LVRelStats *) palloc0(sizeof(LVRelStats));
 
+	vacrelstats->relnamespace = get_namespace_name(RelationGetNamespace(onerel));
+	vacrelstats->relname = pstrdup(RelationGetRelationName(onerel));
+	vacrelstats->indname = NULL;
+	vacrelstats->phase = VACUUM_ERRCB_PHASE_UNKNOWN;
 	vacrelstats->old_rel_pages = onerel->rd_rel->relpages;
 	vacrelstats->old_live_tuples = onerel->rd_rel->reltuples;
 	vacrelstats->num_index_scans = 0;
@@ -470,6 +503,22 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 	vac_open_indexes(onerel, RowExclusiveLock, &nindexes, &Irel);
 	vacrelstats->useindex = (nindexes > 0 &&
 							 params->index_cleanup == VACOPT_TERNARY_ENABLED);
+
+	/*
+	 * Setup error traceback support for ereport().  The idea is to set up an
+	 * error context callback to display additional information on any error
+	 * during a vacuum.  During different phases of vacuum (heap scan, heap
+	 * vacuum, index vacuum, index clean up, heap truncate), we update the
+	 * error context callback to display appropriate information.
+	 *
+	 * Note that the index vacuum and heap vacuum phases may be called
+	 * multiple times in the middle of the heap scan phase.  So the old phase
+	 * information is restored at the end of those phases.
+	 */
+	errcallback.callback = vacuum_error_callback;
+	errcallback.arg = vacrelstats;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
 
 	/* Do the vacuuming */
 	lazy_scan_heap(onerel, params, vacrelstats, Irel, nindexes, aggressive);
@@ -497,7 +546,20 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 	 * Optionally truncate the relation.
 	 */
 	if (should_attempt_truncation(params, vacrelstats))
+	{
+		/*
+		 * Update error traceback information.  This is the last phase during
+		 * which we add context information to errors, so we don't need to
+		 * revert to the previous phase.
+		 */
+		update_vacuum_error_info(vacrelstats, NULL, VACUUM_ERRCB_PHASE_TRUNCATE,
+								 vacrelstats->nonempty_pages,
+								 InvalidOffsetNumber);
 		lazy_truncate_heap(onerel, vacrelstats);
+	}
+
+	/* Pop the error context stack */
+	error_context_stack = errcallback.previous;
 
 	/* Report that we are now doing final cleanup */
 	pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
@@ -506,31 +568,19 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 	/*
 	 * Update statistics in pg_class.
 	 *
-	 * A corner case here is that if we scanned no pages at all because every
-	 * page is all-visible, we should not update relpages/reltuples, because
-	 * we have no new information to contribute.  In particular this keeps us
-	 * from replacing relpages=reltuples=0 (which means "unknown tuple
-	 * density") with nonzero relpages and reltuples=0 (which means "zero
-	 * tuple density") unless there's some actual evidence for the latter.
+	 * In principle new_live_tuples could be -1 indicating that we (still)
+	 * don't know the tuple count.  In practice that probably can't happen,
+	 * since we'd surely have scanned some pages if the table is new and
+	 * nonempty.
 	 *
-	 * It's important that we use tupcount_pages and not scanned_pages for the
-	 * check described above; scanned_pages counts pages where we could not
-	 * get cleanup lock, and which were processed only for frozenxid purposes.
-	 *
-	 * We do update relallvisible even in the corner case, since if the table
-	 * is all-visible we'd definitely like to know that.  But clamp the value
-	 * to be not more than what we're setting relpages to.
+	 * For safety, clamp relallvisible to be not more than what we're setting
+	 * relpages to.
 	 *
 	 * Also, don't change relfrozenxid/relminmxid if we skipped any pages,
 	 * since then we don't know for certain that all tuples have a newer xmin.
 	 */
 	new_rel_pages = vacrelstats->rel_pages;
 	new_live_tuples = vacrelstats->new_live_tuples;
-	if (vacrelstats->tupcount_pages == 0 && new_rel_pages > 0)
-	{
-		new_rel_pages = vacrelstats->old_rel_pages;
-		new_live_tuples = vacrelstats->old_live_tuples;
-	}
 
 	visibilitymap_count(onerel, &new_rel_allvisible, NULL);
 	if (new_rel_allvisible > new_rel_pages)
@@ -551,7 +601,7 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 	/* report results to the stats collector, too */
 	pgstat_report_vacuum(RelationGetRelid(onerel),
 						 onerel->rd_rel->relisshared,
-						 new_live_tuples,
+						 Max(new_live_tuples, 0),
 						 vacrelstats->new_dead_tuples);
 	pgstat_progress_end_command();
 
@@ -568,6 +618,9 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 			char	   *msgfmt;
 
 			TimestampDifference(starttime, endtime, &secs, &usecs);
+
+			memset(&walusage, 0, sizeof(WalUsage));
+			WalUsageAccumDiff(&walusage, &pgWalUsage, &walusage_start);
 
 			read_rate = 0;
 			write_rate = 0;
@@ -586,9 +639,10 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 			initStringInfo(&buf);
 			if (params->is_wraparound)
 			{
-				/* an anti-wraparound vacuum has to be aggressive */
-				Assert(aggressive);
-				msgfmt = _("automatic aggressive vacuum to prevent wraparound of table \"%s.%s.%s\": index scans: %d\n");
+				if (aggressive)
+					msgfmt = _("automatic aggressive vacuum to prevent wraparound of table \"%s.%s.%s\": index scans: %d\n");
+				else
+					msgfmt = _("automatic vacuum to prevent wraparound of table \"%s.%s.%s\": index scans: %d\n");
 			}
 			else
 			{
@@ -599,8 +653,8 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 			}
 			appendStringInfo(&buf, msgfmt,
 							 get_database_name(MyDatabaseId),
-							 get_namespace_name(RelationGetNamespace(onerel)),
-							 RelationGetRelationName(onerel),
+							 vacrelstats->relnamespace,
+							 vacrelstats->relname,
 							 vacrelstats->num_index_scans);
 			appendStringInfo(&buf, _("pages: %u removed, %u remain, %u skipped due to pins, %u skipped frozen\n"),
 							 vacrelstats->pages_removed,
@@ -620,7 +674,12 @@ heap_vacuum_rel(Relation onerel, VacuumParams *params,
 							 (long long) VacuumPageDirty);
 			appendStringInfo(&buf, _("avg read rate: %.3f MB/s, avg write rate: %.3f MB/s\n"),
 							 read_rate, write_rate);
-			appendStringInfo(&buf, _("system usage: %s"), pg_rusage_show(&ru0));
+			appendStringInfo(&buf, _("system usage: %s\n"), pg_rusage_show(&ru0));
+			appendStringInfo(&buf,
+							 _("WAL usage: %ld records, %ld full page images, %llu bytes"),
+							 walusage.wal_records,
+							 walusage.wal_fpi,
+							 (unsigned long long) walusage.wal_bytes);
 
 			ereport(LOG,
 					(errmsg_internal("%s", buf.data)));
@@ -675,7 +734,7 @@ vacuum_log_cleanup_info(Relation rel, LVRelStats *vacrelstats)
  *		to reclaim dead line pointers.
  *
  *		If the table has at least two indexes, we execute both index vacuum
- *		and index cleanup with parallel workers unless the parallel vacuum is
+ *		and index cleanup with parallel workers unless parallel vacuum is
  *		disabled.  In a parallel vacuum, we enter parallel mode and then
  *		create both the parallel context and the DSM segment before starting
  *		heap scan so that we can record dead tuples to the DSM segment.  All
@@ -699,7 +758,6 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 	BlockNumber nblocks,
 				blkno;
 	HeapTupleData tuple;
-	char	   *relname;
 	TransactionId relfrozenxid = onerel->rd_rel->relfrozenxid;
 	TransactionId relminmxid = onerel->rd_rel->relminmxid;
 	BlockNumber empty_pages,
@@ -724,20 +782,20 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 		PROGRESS_VACUUM_MAX_DEAD_TUPLES
 	};
 	int64		initprog_val[3];
+	GlobalVisState *vistest;
 
 	pg_rusage_init(&ru0);
 
-	relname = RelationGetRelationName(onerel);
 	if (aggressive)
 		ereport(elevel,
 				(errmsg("aggressively vacuuming \"%s.%s\"",
-						get_namespace_name(RelationGetNamespace(onerel)),
-						relname)));
+						vacrelstats->relnamespace,
+						vacrelstats->relname)));
 	else
 		ereport(elevel,
 				(errmsg("vacuuming \"%s.%s\"",
-						get_namespace_name(RelationGetNamespace(onerel)),
-						relname)));
+						vacrelstats->relnamespace,
+						vacrelstats->relname)));
 
 	empty_pages = vacuumed_pages = 0;
 	next_fsm_block_to_vacuum = (BlockNumber) 0;
@@ -753,9 +811,11 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 	vacrelstats->nonempty_pages = 0;
 	vacrelstats->latestRemovedXid = InvalidTransactionId;
 
+	vistest = GlobalVisTestFor(onerel);
+
 	/*
-	 * Initialize the state for a parallel vacuum.  As of now, only one worker
-	 * can be used for an index, so we invoke parallelism only if there are at
+	 * Initialize state for a parallel vacuum.  As of now, only one worker can
+	 * be used for an index, so we invoke parallelism only if there are at
 	 * least two indexes on a table.
 	 */
 	if (params->nworkers >= 0 && vacrelstats->useindex && nindexes > 1)
@@ -773,7 +833,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 			if (params->nworkers > 0)
 				ereport(WARNING,
 						(errmsg("disabling parallel option of vacuum on \"%s\" --- cannot vacuum temporary tables in parallel",
-								RelationGetRelationName(onerel))));
+								vacrelstats->relname)));
 		}
 		else
 			lps = begin_parallel_vacuum(RelationGetRelid(onerel), Irel,
@@ -782,7 +842,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 	}
 
 	/*
-	 * Allocate the space for dead tuples in case the parallel vacuum is not
+	 * Allocate the space for dead tuples in case parallel vacuum is not
 	 * initialized.
 	 */
 	if (!ParallelVacuumIsActive(lps))
@@ -892,6 +952,9 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 		(blkno == nblocks - 1 && should_attempt_truncation(params, vacrelstats))
 
 		pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_SCANNED, blkno);
+
+		update_vacuum_error_info(vacrelstats, NULL, VACUUM_ERRCB_PHASE_SCAN_HEAP,
+								 blkno, InvalidOffsetNumber);
 
 		if (blkno == next_unskippable_block)
 		{
@@ -1060,7 +1123,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 			 * to use lazy_check_needs_freeze() for both situations, though.
 			 */
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			if (!lazy_check_needs_freeze(buf, &hastup))
+			if (!lazy_check_needs_freeze(buf, &hastup, vacrelstats))
 			{
 				UnlockReleaseBuffer(buf);
 				vacrelstats->scanned_pages++;
@@ -1093,8 +1156,6 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 
 		if (PageIsNew(page))
 		{
-			bool		still_new;
-
 			/*
 			 * All-zeroes pages can be left over if either a backend extends
 			 * the relation by a single page, but crashes before the newly
@@ -1102,36 +1163,28 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 			 * the relation (which creates a number of empty pages at the tail
 			 * end of the relation, but enters them into the FSM).
 			 *
-			 * Make sure these pages are in the FSM, to ensure they can be
-			 * reused. Do that by testing if there's any space recorded for
-			 * the page. If not, enter it.
-			 *
 			 * Note we do not enter the page into the visibilitymap. That has
 			 * the downside that we repeatedly visit this page in subsequent
 			 * vacuums, but otherwise we'll never not discover the space on a
 			 * promoted standby. The harm of repeated checking ought to
 			 * normally not be too bad - the space usually should be used at
 			 * some point, otherwise there wouldn't be any regular vacuums.
+			 *
+			 * Make sure these pages are in the FSM, to ensure they can be
+			 * reused. Do that by testing if there's any space recorded for
+			 * the page. If not, enter it. We do so after releasing the lock
+			 * on the heap page, the FSM is approximate, after all.
 			 */
-
-			/*
-			 * Perform checking of FSM after releasing lock, the fsm is
-			 * approximate, after all.
-			 */
-			still_new = PageIsNew(page);
 			UnlockReleaseBuffer(buf);
 
-			if (still_new)
+			empty_pages++;
+
+			if (GetRecordedFreeSpace(onerel, blkno) == 0)
 			{
-				empty_pages++;
+				Size		freespace;
 
-				if (GetRecordedFreeSpace(onerel, blkno) == 0)
-				{
-					Size		freespace;
-
-					freespace = BufferGetPageSize(buf) - SizeOfPageHeaderData;
-					RecordPageWithFreeSpace(onerel, blkno, freespace);
-				}
+				freespace = BufferGetPageSize(buf) - SizeOfPageHeaderData;
+				RecordPageWithFreeSpace(onerel, blkno, freespace);
 			}
 			continue;
 		}
@@ -1183,8 +1236,10 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 		 *
 		 * We count tuples removed by the pruning step as removed by VACUUM.
 		 */
-		tups_vacuumed += heap_page_prune(onerel, buf, OldestXmin, false,
-										 &vacrelstats->latestRemovedXid);
+		tups_vacuumed += heap_page_prune(onerel, buf, vistest, false,
+										 InvalidTransactionId, 0,
+										 &vacrelstats->latestRemovedXid,
+										 &vacrelstats->offnum);
 
 		/*
 		 * Now scan the page to collect vacuumable items and check for tuples
@@ -1207,6 +1262,11 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 		{
 			ItemId		itemid;
 
+			/*
+			 * Set the offset number so that we can display it along with any
+			 * error that occurred while processing this tuple.
+			 */
+			vacrelstats->offnum = offnum;
 			itemid = PageGetItemId(page, offnum);
 
 			/* Unused items require no processing, but we count 'em */
@@ -1409,6 +1469,12 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 		}						/* scan along page */
 
 		/*
+		 * Clear the offset information once we have processed all the tuples
+		 * on the page.
+		 */
+		vacrelstats->offnum = InvalidOffsetNumber;
+
+		/*
 		 * If we froze any tuples, mark the buffer dirty, and write a WAL
 		 * record recording the changes.  We must log the changes to be
 		 * crash-safe against future truncation of CLOG.
@@ -1534,20 +1600,22 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 				 && VM_ALL_VISIBLE(onerel, blkno, &vmbuffer))
 		{
 			elog(WARNING, "page is not marked all-visible but visibility map bit is set in relation \"%s\" page %u",
-				 relname, blkno);
+				 vacrelstats->relname, blkno);
 			visibilitymap_clear(onerel, blkno, vmbuffer,
 								VISIBILITYMAP_VALID_BITS);
 		}
 
 		/*
-		 * It's possible for the value returned by GetOldestXmin() to move
-		 * backwards, so it's not wrong for us to see tuples that appear to
-		 * not be visible to everyone yet, while PD_ALL_VISIBLE is already
-		 * set. The real safe xmin value never moves backwards, but
-		 * GetOldestXmin() is conservative and sometimes returns a value
-		 * that's unnecessarily small, so if we see that contradiction it just
-		 * means that the tuples that we think are not visible to everyone yet
-		 * actually are, and the PD_ALL_VISIBLE flag is correct.
+		 * It's possible for the value returned by
+		 * GetOldestNonRemovableTransactionId() to move backwards, so it's not
+		 * wrong for us to see tuples that appear to not be visible to
+		 * everyone yet, while PD_ALL_VISIBLE is already set. The real safe
+		 * xmin value never moves backwards, but
+		 * GetOldestNonRemovableTransactionId() is conservative and sometimes
+		 * returns a value that's unnecessarily small, so if we see that
+		 * contradiction it just means that the tuples that we think are not
+		 * visible to everyone yet actually are, and the PD_ALL_VISIBLE flag
+		 * is correct.
 		 *
 		 * There should never be dead tuples on a page with PD_ALL_VISIBLE
 		 * set, however.
@@ -1555,7 +1623,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 		else if (PageIsAllVisible(page) && has_dead_tuples)
 		{
 			elog(WARNING, "page containing dead tuples is marked as all-visible in relation \"%s\" page %u",
-				 relname, blkno);
+				 vacrelstats->relname, blkno);
 			PageClearAllVisible(page);
 			MarkBufferDirty(buf);
 			visibilitymap_clear(onerel, blkno, vmbuffer,
@@ -1600,6 +1668,9 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 	/* report that everything is scanned and vacuumed */
 	pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_SCANNED, blkno);
 
+	/* Clear the block number information */
+	vacrelstats->blkno = InvalidBlockNumber;
+
 	pfree(frozen);
 
 	/* save stats for use later */
@@ -1612,9 +1683,12 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 														  vacrelstats->tupcount_pages,
 														  live_tuples);
 
-	/* also compute total number of surviving heap entries */
+	/*
+	 * Also compute the total number of surviving heap entries.  In the
+	 * (unlikely) scenario that new_live_tuples is -1, take it as zero.
+	 */
 	vacrelstats->new_rel_tuples =
-		vacrelstats->new_live_tuples + vacrelstats->new_dead_tuples;
+		Max(vacrelstats->new_live_tuples, 0) + vacrelstats->new_dead_tuples;
 
 	/*
 	 * Release any remaining pin on visibility map page.
@@ -1656,7 +1730,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 	 * during parallel mode.
 	 */
 	if (ParallelVacuumIsActive(lps))
-		end_parallel_vacuum(Irel, indstats, lps, nindexes);
+		end_parallel_vacuum(indstats, lps, nindexes);
 
 	/* Update index statistics */
 	update_index_statistics(Irel, indstats, nindexes);
@@ -1665,7 +1739,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 	if (vacuumed_pages)
 		ereport(elevel,
 				(errmsg("\"%s\": removed %.0f row versions in %u pages",
-						RelationGetRelationName(onerel),
+						vacrelstats->relname,
 						tups_vacuumed, vacuumed_pages)));
 
 	/*
@@ -1694,7 +1768,7 @@ lazy_scan_heap(Relation onerel, VacuumParams *params, LVRelStats *vacrelstats,
 
 	ereport(elevel,
 			(errmsg("\"%s\": found %.0f removable, %.0f nonremovable row versions in %u out of %u pages",
-					RelationGetRelationName(onerel),
+					vacrelstats->relname,
 					tups_vacuumed, num_tuples,
 					vacrelstats->scanned_pages, nblocks),
 			 errdetail_internal("%s", buf.data)));
@@ -1744,7 +1818,7 @@ lazy_vacuum_all_indexes(Relation onerel, Relation *Irel,
 
 		for (idx = 0; idx < nindexes; idx++)
 			lazy_vacuum_index(Irel[idx], &stats[idx], vacrelstats->dead_tuples,
-							  vacrelstats->old_live_tuples);
+							  vacrelstats->old_live_tuples, vacrelstats);
 	}
 
 	/* Increase and report the number of index scans */
@@ -1772,10 +1846,15 @@ lazy_vacuum_heap(Relation onerel, LVRelStats *vacrelstats)
 	int			npages;
 	PGRUsage	ru0;
 	Buffer		vmbuffer = InvalidBuffer;
+	LVSavedErrInfo saved_err_info;
 
 	/* Report that we are now vacuuming the heap */
 	pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
 								 PROGRESS_VACUUM_PHASE_VACUUM_HEAP);
+
+	/* Update error traceback information */
+	update_vacuum_error_info(vacrelstats, &saved_err_info, VACUUM_ERRCB_PHASE_VACUUM_HEAP,
+							 InvalidBlockNumber, InvalidOffsetNumber);
 
 	pg_rusage_init(&ru0);
 	npages = 0;
@@ -1791,6 +1870,7 @@ lazy_vacuum_heap(Relation onerel, LVRelStats *vacrelstats)
 		vacuum_delay_point();
 
 		tblk = ItemPointerGetBlockNumber(&vacrelstats->dead_tuples->itemptrs[tupindex]);
+		vacrelstats->blkno = tblk;
 		buf = ReadBufferExtended(onerel, MAIN_FORKNUM, tblk, RBM_NORMAL,
 								 vac_strategy);
 		if (!ConditionalLockBufferForCleanup(buf))
@@ -1811,6 +1891,9 @@ lazy_vacuum_heap(Relation onerel, LVRelStats *vacrelstats)
 		npages++;
 	}
 
+	/* Clear the block number information */
+	vacrelstats->blkno = InvalidBlockNumber;
+
 	if (BufferIsValid(vmbuffer))
 	{
 		ReleaseBuffer(vmbuffer);
@@ -1819,9 +1902,12 @@ lazy_vacuum_heap(Relation onerel, LVRelStats *vacrelstats)
 
 	ereport(elevel,
 			(errmsg("\"%s\": removed %d row versions in %d pages",
-					RelationGetRelationName(onerel),
+					vacrelstats->relname,
 					tupindex, npages),
 			 errdetail_internal("%s", pg_rusage_show(&ru0))));
+
+	/* Revert to the previous phase information for error traceback */
+	restore_vacuum_error_info(vacrelstats, &saved_err_info);
 }
 
 /*
@@ -1844,8 +1930,13 @@ lazy_vacuum_page(Relation onerel, BlockNumber blkno, Buffer buffer,
 	int			uncnt = 0;
 	TransactionId visibility_cutoff_xid;
 	bool		all_frozen;
+	LVSavedErrInfo saved_err_info;
 
 	pgstat_progress_update_param(PROGRESS_VACUUM_HEAP_BLKS_VACUUMED, blkno);
+
+	/* Update error traceback information */
+	update_vacuum_error_info(vacrelstats, &saved_err_info, VACUUM_ERRCB_PHASE_VACUUM_HEAP,
+							 blkno, InvalidOffsetNumber);
 
 	START_CRIT_SECTION();
 
@@ -1897,7 +1988,8 @@ lazy_vacuum_page(Relation onerel, BlockNumber blkno, Buffer buffer,
 	 * dirty, exclusively locked, and, if needed, a full page image has been
 	 * emitted in the log_heap_clean() above.
 	 */
-	if (heap_page_is_all_visible(onerel, buffer, &visibility_cutoff_xid,
+	if (heap_page_is_all_visible(onerel, buffer, vacrelstats,
+								 &visibility_cutoff_xid,
 								 &all_frozen))
 		PageSetAllVisible(page);
 
@@ -1923,6 +2015,8 @@ lazy_vacuum_page(Relation onerel, BlockNumber blkno, Buffer buffer,
 							  *vmbuffer, visibility_cutoff_xid, flags);
 	}
 
+	/* Revert to the previous phase information for error traceback */
+	restore_vacuum_error_info(vacrelstats, &saved_err_info);
 	return tupindex;
 }
 
@@ -1934,7 +2028,7 @@ lazy_vacuum_page(Relation onerel, BlockNumber blkno, Buffer buffer,
  * Also returns a flag indicating whether page contains any tuples at all.
  */
 static bool
-lazy_check_needs_freeze(Buffer buf, bool *hastup)
+lazy_check_needs_freeze(Buffer buf, bool *hastup, LVRelStats *vacrelstats)
 {
 	Page		page = BufferGetPage(buf);
 	OffsetNumber offnum,
@@ -1959,6 +2053,11 @@ lazy_check_needs_freeze(Buffer buf, bool *hastup)
 	{
 		ItemId		itemid;
 
+		/*
+		 * Set the offset number so that we can display it along with any
+		 * error that occurred while processing this tuple.
+		 */
+		vacrelstats->offnum = offnum;
 		itemid = PageGetItemId(page, offnum);
 
 		/* this should match hastup test in count_nondeletable_pages() */
@@ -1973,10 +2072,13 @@ lazy_check_needs_freeze(Buffer buf, bool *hastup)
 
 		if (heap_tuple_needs_freeze(tupleheader, FreezeLimit,
 									MultiXactCutoff, buf))
-			return true;
+			break;
 	}							/* scan along page */
 
-	return false;
+	/* Clear the offset information once we have processed the given page. */
+	vacrelstats->offnum = InvalidOffsetNumber;
+
+	return (offnum <= maxoff);
 }
 
 /*
@@ -2083,10 +2185,22 @@ lazy_parallel_vacuum_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
 	 * indexes in the case where no workers are launched.
 	 */
 	parallel_vacuum_index(Irel, stats, lps->lvshared,
-						  vacrelstats->dead_tuples, nindexes);
+						  vacrelstats->dead_tuples, nindexes, vacrelstats);
 
-	/* Wait for all vacuum workers to finish */
-	WaitForParallelWorkersToFinish(lps->pcxt);
+	/*
+	 * Next, accumulate buffer and WAL usage.  (This must wait for the workers
+	 * to finish, or we might get incomplete data.)
+	 */
+	if (nworkers > 0)
+	{
+		int			i;
+
+		/* Wait for all vacuum workers to finish */
+		WaitForParallelWorkersToFinish(lps->pcxt);
+
+		for (i = 0; i < lps->pcxt->nworkers_launched; i++)
+			InstrAccumParallelQuery(&lps->buffer_usage[i], &lps->wal_usage[i]);
+	}
 
 	/*
 	 * Carry the shared balance value to heap scan and disable shared costing
@@ -2106,7 +2220,7 @@ lazy_parallel_vacuum_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
 static void
 parallel_vacuum_index(Relation *Irel, IndexBulkDeleteResult **stats,
 					  LVShared *lvshared, LVDeadTuples *dead_tuples,
-					  int nindexes)
+					  int nindexes, LVRelStats *vacrelstats)
 {
 	/*
 	 * Increment the active worker count if we are able to launch any worker.
@@ -2131,7 +2245,7 @@ parallel_vacuum_index(Relation *Irel, IndexBulkDeleteResult **stats,
 		shared_indstats = get_indstats(lvshared, idx);
 
 		/*
-		 * Skip processing indexes that doesn't participate in parallel
+		 * Skip processing indexes that don't participate in parallel
 		 * operation
 		 */
 		if (shared_indstats == NULL ||
@@ -2140,7 +2254,7 @@ parallel_vacuum_index(Relation *Irel, IndexBulkDeleteResult **stats,
 
 		/* Do vacuum or cleanup of the index */
 		vacuum_one_index(Irel[idx], &(stats[idx]), lvshared, shared_indstats,
-						 dead_tuples);
+						 dead_tuples, vacrelstats);
 	}
 
 	/*
@@ -2180,7 +2294,8 @@ vacuum_indexes_leader(Relation *Irel, IndexBulkDeleteResult **stats,
 		if (shared_indstats == NULL ||
 			skip_parallel_vacuum_index(Irel[i], lps->lvshared))
 			vacuum_one_index(Irel[i], &(stats[i]), lps->lvshared,
-							 shared_indstats, vacrelstats->dead_tuples);
+							 shared_indstats, vacrelstats->dead_tuples,
+							 vacrelstats);
 	}
 
 	/*
@@ -2200,7 +2315,7 @@ vacuum_indexes_leader(Relation *Irel, IndexBulkDeleteResult **stats,
 static void
 vacuum_one_index(Relation indrel, IndexBulkDeleteResult **stats,
 				 LVShared *lvshared, LVSharedIndStats *shared_indstats,
-				 LVDeadTuples *dead_tuples)
+				 LVDeadTuples *dead_tuples, LVRelStats *vacrelstats)
 {
 	IndexBulkDeleteResult *bulkdelete_res = NULL;
 
@@ -2220,19 +2335,19 @@ vacuum_one_index(Relation indrel, IndexBulkDeleteResult **stats,
 	/* Do vacuum or cleanup of the index */
 	if (lvshared->for_cleanup)
 		lazy_cleanup_index(indrel, stats, lvshared->reltuples,
-						   lvshared->estimated_count);
+						   lvshared->estimated_count, vacrelstats);
 	else
 		lazy_vacuum_index(indrel, stats, dead_tuples,
-						  lvshared->reltuples);
+						  lvshared->reltuples, vacrelstats);
 
 	/*
 	 * Copy the index bulk-deletion result returned from ambulkdelete and
-	 * amvacuumcleanup to the DSM segment if it's the first time to get it
-	 * from them, because they allocate it locally and it's possible that an
-	 * index will be vacuumed by the different vacuum process at the next
-	 * time.  The copying of the result normally happens only after the first
-	 * time of index vacuuming.  From the second time, we pass the result on
-	 * the DSM segment so that they then update it directly.
+	 * amvacuumcleanup to the DSM segment if it's the first cycle because they
+	 * allocate locally and it's possible that an index will be vacuumed by a
+	 * different vacuum process the next cycle.  Copying the result normally
+	 * happens only the first time an index is vacuumed.  For any additional
+	 * vacuum pass, we directly point to the result on the DSM segment and
+	 * pass it to vacuum index APIs so that workers can update it directly.
 	 *
 	 * Since all vacuum workers write the bulk-deletion result at different
 	 * slots we can write them without locking.
@@ -2243,8 +2358,8 @@ vacuum_one_index(Relation indrel, IndexBulkDeleteResult **stats,
 		shared_indstats->updated = true;
 
 		/*
-		 * Now that the stats[idx] points to the DSM segment, we don't need
-		 * the locally allocated results.
+		 * Now that stats[idx] points to the DSM segment, we don't need the
+		 * locally allocated results.
 		 */
 		pfree(*stats);
 		*stats = bulkdelete_res;
@@ -2298,7 +2413,8 @@ lazy_cleanup_all_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
 		for (idx = 0; idx < nindexes; idx++)
 			lazy_cleanup_index(Irel[idx], &stats[idx],
 							   vacrelstats->new_rel_tuples,
-							   vacrelstats->tupcount_pages < vacrelstats->rel_pages);
+							   vacrelstats->tupcount_pages < vacrelstats->rel_pages,
+							   vacrelstats);
 	}
 }
 
@@ -2309,15 +2425,16 @@ lazy_cleanup_all_indexes(Relation *Irel, IndexBulkDeleteResult **stats,
  *		dead_tuples, and update running statistics.
  *
  *		reltuples is the number of heap tuples to be passed to the
- *		bulkdelete callback.
+ *		bulkdelete callback.  It's always assumed to be estimated.
  */
 static void
 lazy_vacuum_index(Relation indrel, IndexBulkDeleteResult **stats,
-				  LVDeadTuples *dead_tuples, double reltuples)
+				  LVDeadTuples *dead_tuples, double reltuples, LVRelStats *vacrelstats)
 {
 	IndexVacuumInfo ivinfo;
 	const char *msg;
 	PGRUsage	ru0;
+	LVSavedErrInfo saved_err_info;
 
 	pg_rusage_init(&ru0);
 
@@ -2328,6 +2445,18 @@ lazy_vacuum_index(Relation indrel, IndexBulkDeleteResult **stats,
 	ivinfo.message_level = elevel;
 	ivinfo.num_heap_tuples = reltuples;
 	ivinfo.strategy = vac_strategy;
+
+	/*
+	 * Update error traceback information.
+	 *
+	 * The index name is saved during this phase and restored immediately
+	 * after this phase.  See vacuum_error_callback.
+	 */
+	Assert(vacrelstats->indname == NULL);
+	vacrelstats->indname = pstrdup(RelationGetRelationName(indrel));
+	update_vacuum_error_info(vacrelstats, &saved_err_info,
+							 VACUUM_ERRCB_PHASE_VACUUM_INDEX,
+							 InvalidBlockNumber, InvalidOffsetNumber);
 
 	/* Do bulk deletion */
 	*stats = index_bulk_delete(&ivinfo, *stats,
@@ -2340,25 +2469,31 @@ lazy_vacuum_index(Relation indrel, IndexBulkDeleteResult **stats,
 
 	ereport(elevel,
 			(errmsg(msg,
-					RelationGetRelationName(indrel),
+					vacrelstats->indname,
 					dead_tuples->num_tuples),
 			 errdetail_internal("%s", pg_rusage_show(&ru0))));
+
+	/* Revert to the previous phase information for error traceback */
+	restore_vacuum_error_info(vacrelstats, &saved_err_info);
+	pfree(vacrelstats->indname);
+	vacrelstats->indname = NULL;
 }
 
 /*
  *	lazy_cleanup_index() -- do post-vacuum cleanup for one index relation.
  *
  *		reltuples is the number of heap tuples and estimated_count is true
- *		if the reltuples is an estimated value.
+ *		if reltuples is an estimated value.
  */
 static void
 lazy_cleanup_index(Relation indrel,
 				   IndexBulkDeleteResult **stats,
-				   double reltuples, bool estimated_count)
+				   double reltuples, bool estimated_count, LVRelStats *vacrelstats)
 {
 	IndexVacuumInfo ivinfo;
 	const char *msg;
 	PGRUsage	ru0;
+	LVSavedErrInfo saved_err_info;
 
 	pg_rusage_init(&ru0);
 
@@ -2371,27 +2506,44 @@ lazy_cleanup_index(Relation indrel,
 	ivinfo.num_heap_tuples = reltuples;
 	ivinfo.strategy = vac_strategy;
 
+	/*
+	 * Update error traceback information.
+	 *
+	 * The index name is saved during this phase and restored immediately
+	 * after this phase.  See vacuum_error_callback.
+	 */
+	Assert(vacrelstats->indname == NULL);
+	vacrelstats->indname = pstrdup(RelationGetRelationName(indrel));
+	update_vacuum_error_info(vacrelstats, &saved_err_info,
+							 VACUUM_ERRCB_PHASE_INDEX_CLEANUP,
+							 InvalidBlockNumber, InvalidOffsetNumber);
+
 	*stats = index_vacuum_cleanup(&ivinfo, *stats);
 
-	if (!(*stats))
-		return;
+	if (*stats)
+	{
+		if (IsParallelWorker())
+			msg = gettext_noop("index \"%s\" now contains %.0f row versions in %u pages as reported by parallel vacuum worker");
+		else
+			msg = gettext_noop("index \"%s\" now contains %.0f row versions in %u pages");
 
-	if (IsParallelWorker())
-		msg = gettext_noop("index \"%s\" now contains %.0f row versions in %u pages as reported by parallel vacuum worker");
-	else
-		msg = gettext_noop("index \"%s\" now contains %.0f row versions in %u pages");
+		ereport(elevel,
+				(errmsg(msg,
+						RelationGetRelationName(indrel),
+						(*stats)->num_index_tuples,
+						(*stats)->num_pages),
+				 errdetail("%.0f index row versions were removed.\n"
+						   "%u index pages have been deleted, %u are currently reusable.\n"
+						   "%s.",
+						   (*stats)->tuples_removed,
+						   (*stats)->pages_deleted, (*stats)->pages_free,
+						   pg_rusage_show(&ru0))));
+	}
 
-	ereport(elevel,
-			(errmsg(msg,
-					RelationGetRelationName(indrel),
-					(*stats)->num_index_tuples,
-					(*stats)->num_pages),
-			 errdetail("%.0f index row versions were removed.\n"
-					   "%u index pages have been deleted, %u are currently reusable.\n"
-					   "%s.",
-					   (*stats)->tuples_removed,
-					   (*stats)->pages_deleted, (*stats)->pages_free,
-					   pg_rusage_show(&ru0))));
+	/* Revert to the previous phase information for error traceback */
+	restore_vacuum_error_info(vacrelstats, &saved_err_info);
+	pfree(vacrelstats->indname);
+	vacrelstats->indname = NULL;
 }
 
 /*
@@ -2484,7 +2636,7 @@ lazy_truncate_heap(Relation onerel, LVRelStats *vacrelstats)
 				vacrelstats->lock_waiter_detected = true;
 				ereport(elevel,
 						(errmsg("\"%s\": stopping truncate due to conflicting lock request",
-								RelationGetRelationName(onerel))));
+								vacrelstats->relname)));
 				return;
 			}
 
@@ -2517,6 +2669,7 @@ lazy_truncate_heap(Relation onerel, LVRelStats *vacrelstats)
 		 * were vacuuming.
 		 */
 		new_rel_pages = count_nondeletable_pages(onerel, vacrelstats);
+		vacrelstats->blkno = new_rel_pages;
 
 		if (new_rel_pages >= old_rel_pages)
 		{
@@ -2549,7 +2702,7 @@ lazy_truncate_heap(Relation onerel, LVRelStats *vacrelstats)
 
 		ereport(elevel,
 				(errmsg("\"%s\": truncated %u to %u pages",
-						RelationGetRelationName(onerel),
+						vacrelstats->relname,
 						old_rel_pages, new_rel_pages),
 				 errdetail_internal("%s",
 									pg_rusage_show(&ru0))));
@@ -2614,7 +2767,7 @@ count_nondeletable_pages(Relation onerel, LVRelStats *vacrelstats)
 				{
 					ereport(elevel,
 							(errmsg("\"%s\": suspending truncate due to conflicting lock request",
-									RelationGetRelationName(onerel))));
+									vacrelstats->relname)));
 
 					vacrelstats->lock_waiter_detected = true;
 					return blkno;
@@ -2829,6 +2982,7 @@ vac_cmp_itemptr(const void *left, const void *right)
  */
 static bool
 heap_page_is_all_visible(Relation rel, Buffer buf,
+						 LVRelStats *vacrelstats,
 						 TransactionId *visibility_cutoff_xid,
 						 bool *all_frozen)
 {
@@ -2853,6 +3007,11 @@ heap_page_is_all_visible(Relation rel, Buffer buf,
 		ItemId		itemid;
 		HeapTupleData tuple;
 
+		/*
+		 * Set the offset number so that we can display it along with any
+		 * error that occurred while processing this tuple.
+		 */
+		vacrelstats->offnum = offnum;
 		itemid = PageGetItemId(page, offnum);
 
 		/* Unused or redirect line pointers are of no interest */
@@ -2930,15 +3089,18 @@ heap_page_is_all_visible(Relation rel, Buffer buf,
 		}
 	}							/* scan along page */
 
+	/* Clear the offset information once we have processed the given page. */
+	vacrelstats->offnum = InvalidOffsetNumber;
+
 	return all_visible;
 }
 
 /*
  * Compute the number of parallel worker processes to request.  Both index
  * vacuum and index cleanup can be executed with parallel workers.  The index
- * is eligible for parallel vacuum iff it's size is greater than
+ * is eligible for parallel vacuum iff its size is greater than
  * min_parallel_index_scan_size as invoking workers for very small indexes
- * can hurt the performance.
+ * can hurt performance.
  *
  * nrequested is the number of parallel workers that user requested.  If
  * nrequested is 0, we compute the parallel degree based on nindexes, that is
@@ -2957,7 +3119,7 @@ compute_parallel_vacuum_workers(Relation *Irel, int nindexes, int nrequested,
 	int			i;
 
 	/*
-	 * We don't allow to perform parallel operation in standalone backend or
+	 * We don't allow performing parallel operation in standalone backend or
 	 * when parallelism is disabled.
 	 */
 	if (!IsUnderPostmaster || max_parallel_maintenance_workers == 0)
@@ -3024,13 +3186,13 @@ prepare_index_statistics(LVShared *lvshared, bool *can_parallel_vacuum,
 		if (!can_parallel_vacuum[i])
 			continue;
 
-		/* Set NOT NULL as this index do support parallelism */
+		/* Set NOT NULL as this index does support parallelism */
 		lvshared->bitmap[i >> 3] |= 1 << (i & 0x07);
 	}
 }
 
 /*
- * Update index statistics in pg_class if the statistics is accurate.
+ * Update index statistics in pg_class if the statistics are accurate.
  */
 static void
 update_index_statistics(Relation *Irel, IndexBulkDeleteResult **stats,
@@ -3060,7 +3222,7 @@ update_index_statistics(Relation *Irel, IndexBulkDeleteResult **stats,
 
 /*
  * This function prepares and returns parallel vacuum state if we can launch
- * even one worker.  This function is responsible to enter parallel mode,
+ * even one worker.  This function is responsible for entering parallel mode,
  * create a parallel context, and then initialize the DSM segment.
  */
 static LVParallelState *
@@ -3071,9 +3233,10 @@ begin_parallel_vacuum(Oid relid, Relation *Irel, LVRelStats *vacrelstats,
 	ParallelContext *pcxt;
 	LVShared   *shared;
 	LVDeadTuples *dead_tuples;
+	BufferUsage *buffer_usage;
+	WalUsage   *wal_usage;
 	bool	   *can_parallel_vacuum;
 	long		maxtuples;
-	char	   *sharedquery;
 	Size		est_shared;
 	Size		est_deadtuples;
 	int			nindexes_mwm = 0;
@@ -3154,10 +3317,30 @@ begin_parallel_vacuum(Oid relid, Relation *Irel, LVRelStats *vacrelstats,
 	shm_toc_estimate_chunk(&pcxt->estimator, est_deadtuples);
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
 
-	/* Finally, estimate PARALLEL_VACUUM_KEY_QUERY_TEXT space */
-	querylen = strlen(debug_query_string);
-	shm_toc_estimate_chunk(&pcxt->estimator, querylen + 1);
+	/*
+	 * Estimate space for BufferUsage and WalUsage --
+	 * PARALLEL_VACUUM_KEY_BUFFER_USAGE and PARALLEL_VACUUM_KEY_WAL_USAGE.
+	 *
+	 * If there are no extensions loaded that care, we could skip this.  We
+	 * have no way of knowing whether anyone's looking at pgBufferUsage or
+	 * pgWalUsage, so do it unconditionally.
+	 */
+	shm_toc_estimate_chunk(&pcxt->estimator,
+						   mul_size(sizeof(BufferUsage), pcxt->nworkers));
 	shm_toc_estimate_keys(&pcxt->estimator, 1);
+	shm_toc_estimate_chunk(&pcxt->estimator,
+						   mul_size(sizeof(WalUsage), pcxt->nworkers));
+	shm_toc_estimate_keys(&pcxt->estimator, 1);
+
+	/* Finally, estimate PARALLEL_VACUUM_KEY_QUERY_TEXT space */
+	if (debug_query_string)
+	{
+		querylen = strlen(debug_query_string);
+		shm_toc_estimate_chunk(&pcxt->estimator, querylen + 1);
+		shm_toc_estimate_keys(&pcxt->estimator, 1);
+	}
+	else
+		querylen = 0;			/* keep compiler quiet */
 
 	InitializeParallelDSM(pcxt);
 
@@ -3188,11 +3371,30 @@ begin_parallel_vacuum(Oid relid, Relation *Irel, LVRelStats *vacrelstats,
 	shm_toc_insert(pcxt->toc, PARALLEL_VACUUM_KEY_DEAD_TUPLES, dead_tuples);
 	vacrelstats->dead_tuples = dead_tuples;
 
+	/*
+	 * Allocate space for each worker's BufferUsage and WalUsage; no need to
+	 * initialize
+	 */
+	buffer_usage = shm_toc_allocate(pcxt->toc,
+									mul_size(sizeof(BufferUsage), pcxt->nworkers));
+	shm_toc_insert(pcxt->toc, PARALLEL_VACUUM_KEY_BUFFER_USAGE, buffer_usage);
+	lps->buffer_usage = buffer_usage;
+	wal_usage = shm_toc_allocate(pcxt->toc,
+								 mul_size(sizeof(WalUsage), pcxt->nworkers));
+	shm_toc_insert(pcxt->toc, PARALLEL_VACUUM_KEY_WAL_USAGE, wal_usage);
+	lps->wal_usage = wal_usage;
+
 	/* Store query string for workers */
-	sharedquery = (char *) shm_toc_allocate(pcxt->toc, querylen + 1);
-	memcpy(sharedquery, debug_query_string, querylen + 1);
-	sharedquery[querylen] = '\0';
-	shm_toc_insert(pcxt->toc, PARALLEL_VACUUM_KEY_QUERY_TEXT, sharedquery);
+	if (debug_query_string)
+	{
+		char	   *sharedquery;
+
+		sharedquery = (char *) shm_toc_allocate(pcxt->toc, querylen + 1);
+		memcpy(sharedquery, debug_query_string, querylen + 1);
+		sharedquery[querylen] = '\0';
+		shm_toc_insert(pcxt->toc,
+					   PARALLEL_VACUUM_KEY_QUERY_TEXT, sharedquery);
+	}
 
 	pfree(can_parallel_vacuum);
 	return lps;
@@ -3201,15 +3403,15 @@ begin_parallel_vacuum(Oid relid, Relation *Irel, LVRelStats *vacrelstats,
 /*
  * Destroy the parallel context, and end parallel mode.
  *
- * Since writes are not allowed during the parallel mode, so we copy the
- * updated index statistics from DSM in local memory and then later use that
+ * Since writes are not allowed during parallel mode, copy the
+ * updated index statistics from DSM into local memory and then later use that
  * to update the index statistics.  One might think that we can exit from
  * parallel mode, update the index statistics and then destroy parallel
  * context, but that won't be safe (see ExitParallelMode).
  */
 static void
-end_parallel_vacuum(Relation *Irel, IndexBulkDeleteResult **stats,
-					LVParallelState *lps, int nindexes)
+end_parallel_vacuum(IndexBulkDeleteResult **stats, LVParallelState *lps,
+					int nindexes)
 {
 	int			i;
 
@@ -3308,7 +3510,7 @@ skip_parallel_vacuum_index(Relation indrel, LVShared *lvshared)
  * Perform work within a launched parallel process.
  *
  * Since parallel vacuum workers perform only index vacuum or index cleanup,
- * we don't need to report the progress information.
+ * we don't need to report progress information.
  */
 void
 parallel_vacuum_main(dsm_segment *seg, shm_toc *toc)
@@ -3317,20 +3519,25 @@ parallel_vacuum_main(dsm_segment *seg, shm_toc *toc)
 	Relation   *indrels;
 	LVShared   *lvshared;
 	LVDeadTuples *dead_tuples;
+	BufferUsage *buffer_usage;
+	WalUsage   *wal_usage;
 	int			nindexes;
 	char	   *sharedquery;
 	IndexBulkDeleteResult **stats;
+	LVRelStats	vacrelstats;
+	ErrorContextCallback errcallback;
 
 	lvshared = (LVShared *) shm_toc_lookup(toc, PARALLEL_VACUUM_KEY_SHARED,
 										   false);
 	elevel = lvshared->elevel;
 
-	ereport(DEBUG1,
-			(errmsg("starting parallel vacuum worker for %s",
-					lvshared->for_cleanup ? "cleanup" : "bulk delete")));
+	if (lvshared->for_cleanup)
+		elog(DEBUG1, "starting parallel vacuum worker for cleanup");
+	else
+		elog(DEBUG1, "starting parallel vacuum worker for bulk delete");
 
 	/* Set debug_query_string for individual workers */
-	sharedquery = shm_toc_lookup(toc, PARALLEL_VACUUM_KEY_QUERY_TEXT, false);
+	sharedquery = shm_toc_lookup(toc, PARALLEL_VACUUM_KEY_QUERY_TEXT, true);
 	debug_query_string = sharedquery;
 	pgstat_report_activity(STATE_RUNNING, debug_query_string);
 
@@ -3369,10 +3576,132 @@ parallel_vacuum_main(dsm_segment *seg, shm_toc *toc)
 	if (lvshared->maintenance_work_mem_worker > 0)
 		maintenance_work_mem = lvshared->maintenance_work_mem_worker;
 
+	/*
+	 * Initialize vacrelstats for use as error callback arg by parallel
+	 * worker.
+	 */
+	vacrelstats.relnamespace = get_namespace_name(RelationGetNamespace(onerel));
+	vacrelstats.relname = pstrdup(RelationGetRelationName(onerel));
+	vacrelstats.indname = NULL;
+	vacrelstats.phase = VACUUM_ERRCB_PHASE_UNKNOWN; /* Not yet processing */
+
+	/* Setup error traceback support for ereport() */
+	errcallback.callback = vacuum_error_callback;
+	errcallback.arg = &vacrelstats;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	/* Prepare to track buffer usage during parallel execution */
+	InstrStartParallelQuery();
+
 	/* Process indexes to perform vacuum/cleanup */
-	parallel_vacuum_index(indrels, stats, lvshared, dead_tuples, nindexes);
+	parallel_vacuum_index(indrels, stats, lvshared, dead_tuples, nindexes,
+						  &vacrelstats);
+
+	/* Report buffer/WAL usage during parallel execution */
+	buffer_usage = shm_toc_lookup(toc, PARALLEL_VACUUM_KEY_BUFFER_USAGE, false);
+	wal_usage = shm_toc_lookup(toc, PARALLEL_VACUUM_KEY_WAL_USAGE, false);
+	InstrEndParallelQuery(&buffer_usage[ParallelWorkerNumber],
+						  &wal_usage[ParallelWorkerNumber]);
+
+	/* Pop the error context stack */
+	error_context_stack = errcallback.previous;
 
 	vac_close_indexes(nindexes, indrels, RowExclusiveLock);
 	table_close(onerel, ShareUpdateExclusiveLock);
 	pfree(stats);
+}
+
+/*
+ * Error context callback for errors occurring during vacuum.
+ */
+static void
+vacuum_error_callback(void *arg)
+{
+	LVRelStats *errinfo = arg;
+
+	switch (errinfo->phase)
+	{
+		case VACUUM_ERRCB_PHASE_SCAN_HEAP:
+			if (BlockNumberIsValid(errinfo->blkno))
+			{
+				if (OffsetNumberIsValid(errinfo->offnum))
+					errcontext("while scanning block %u and offset %u of relation \"%s.%s\"",
+							   errinfo->blkno, errinfo->offnum, errinfo->relnamespace, errinfo->relname);
+				else
+					errcontext("while scanning block %u of relation \"%s.%s\"",
+							   errinfo->blkno, errinfo->relnamespace, errinfo->relname);
+			}
+			else
+				errcontext("while scanning relation \"%s.%s\"",
+						   errinfo->relnamespace, errinfo->relname);
+			break;
+
+		case VACUUM_ERRCB_PHASE_VACUUM_HEAP:
+			if (BlockNumberIsValid(errinfo->blkno))
+			{
+				if (OffsetNumberIsValid(errinfo->offnum))
+					errcontext("while vacuuming block %u and offset %u of relation \"%s.%s\"",
+							   errinfo->blkno, errinfo->offnum, errinfo->relnamespace, errinfo->relname);
+				else
+					errcontext("while vacuuming block %u of relation \"%s.%s\"",
+							   errinfo->blkno, errinfo->relnamespace, errinfo->relname);
+			}
+			else
+				errcontext("while vacuuming relation \"%s.%s\"",
+						   errinfo->relnamespace, errinfo->relname);
+			break;
+
+		case VACUUM_ERRCB_PHASE_VACUUM_INDEX:
+			errcontext("while vacuuming index \"%s\" of relation \"%s.%s\"",
+					   errinfo->indname, errinfo->relnamespace, errinfo->relname);
+			break;
+
+		case VACUUM_ERRCB_PHASE_INDEX_CLEANUP:
+			errcontext("while cleaning up index \"%s\" of relation \"%s.%s\"",
+					   errinfo->indname, errinfo->relnamespace, errinfo->relname);
+			break;
+
+		case VACUUM_ERRCB_PHASE_TRUNCATE:
+			if (BlockNumberIsValid(errinfo->blkno))
+				errcontext("while truncating relation \"%s.%s\" to %u blocks",
+						   errinfo->relnamespace, errinfo->relname, errinfo->blkno);
+			break;
+
+		case VACUUM_ERRCB_PHASE_UNKNOWN:
+		default:
+			return;				/* do nothing; the errinfo may not be
+								 * initialized */
+	}
+}
+
+/*
+ * Updates the information required for vacuum error callback.  This also saves
+ * the current information which can be later restored via restore_vacuum_error_info.
+ */
+static void
+update_vacuum_error_info(LVRelStats *errinfo, LVSavedErrInfo *saved_err_info, int phase,
+						 BlockNumber blkno, OffsetNumber offnum)
+{
+	if (saved_err_info)
+	{
+		saved_err_info->offnum = errinfo->offnum;
+		saved_err_info->blkno = errinfo->blkno;
+		saved_err_info->phase = errinfo->phase;
+	}
+
+	errinfo->blkno = blkno;
+	errinfo->offnum = offnum;
+	errinfo->phase = phase;
+}
+
+/*
+ * Restores the vacuum information saved via a prior call to update_vacuum_error_info.
+ */
+static void
+restore_vacuum_error_info(LVRelStats *errinfo, const LVSavedErrInfo *saved_err_info)
+{
+	errinfo->blkno = saved_err_info->blkno;
+	errinfo->offnum = saved_err_info->offnum;
+	errinfo->phase = saved_err_info->phase;
 }

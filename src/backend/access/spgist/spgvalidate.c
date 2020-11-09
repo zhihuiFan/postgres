@@ -159,6 +159,9 @@ spgvalidate(Oid opclassoid)
 												configOut.leafType, true,
 												1, 1, procform->amproclefttype);
 				break;
+			case SPGIST_OPTIONS_PROC:
+				ok = check_amoptsproc_signature(procform->amproc);
+				break;
 			default:
 				ereport(INFO,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
@@ -271,6 +274,8 @@ spgvalidate(Oid opclassoid)
 		{
 			if ((thisgroup->functionset & (((uint64) 1) << i)) != 0)
 				continue;		/* got it */
+			if (i == SPGIST_OPTIONS_PROC)
+				continue;		/* optional method */
 			ereport(INFO,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("operator family \"%s\" of access method %s is missing support function %d for type %s",
@@ -297,4 +302,70 @@ spgvalidate(Oid opclassoid)
 	ReleaseSysCache(classtup);
 
 	return result;
+}
+
+/*
+ * Prechecking function for adding operators/functions to an SP-GiST opfamily.
+ */
+void
+spgadjustmembers(Oid opfamilyoid,
+				 Oid opclassoid,
+				 List *operators,
+				 List *functions)
+{
+	ListCell   *lc;
+
+	/*
+	 * Operator members of an SP-GiST opfamily should never have hard
+	 * dependencies, since their connection to the opfamily depends only on
+	 * what the support functions think, and that can be altered.  For
+	 * consistency, we make all soft dependencies point to the opfamily,
+	 * though a soft dependency on the opclass would work as well in the
+	 * CREATE OPERATOR CLASS case.
+	 */
+	foreach(lc, operators)
+	{
+		OpFamilyMember *op = (OpFamilyMember *) lfirst(lc);
+
+		op->ref_is_hard = false;
+		op->ref_is_family = true;
+		op->refobjid = opfamilyoid;
+	}
+
+	/*
+	 * Required support functions should have hard dependencies.  Preferably
+	 * those are just dependencies on the opclass, but if we're in ALTER
+	 * OPERATOR FAMILY, we leave the dependency pointing at the whole
+	 * opfamily.  (Given that SP-GiST opclasses generally don't share
+	 * opfamilies, it seems unlikely to be worth working harder.)
+	 */
+	foreach(lc, functions)
+	{
+		OpFamilyMember *op = (OpFamilyMember *) lfirst(lc);
+
+		switch (op->number)
+		{
+			case SPGIST_CONFIG_PROC:
+			case SPGIST_CHOOSE_PROC:
+			case SPGIST_PICKSPLIT_PROC:
+			case SPGIST_INNER_CONSISTENT_PROC:
+			case SPGIST_LEAF_CONSISTENT_PROC:
+				/* Required support function */
+				op->ref_is_hard = true;
+				break;
+			case SPGIST_COMPRESS_PROC:
+			case SPGIST_OPTIONS_PROC:
+				/* Optional, so force it to be a soft family dependency */
+				op->ref_is_hard = false;
+				op->ref_is_family = true;
+				op->refobjid = opfamilyoid;
+				break;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+						 errmsg("support function number %d is invalid for access method %s",
+								op->number, "spgist")));
+				break;
+		}
+	}
 }

@@ -387,16 +387,16 @@ gistRedoPageReuse(XLogReaderState *record)
 	 * PAGE_REUSE records exist to provide a conflict point when we reuse
 	 * pages in the index via the FSM.  That's all they do though.
 	 *
-	 * latestRemovedXid was the page's deleteXid.  The deleteXid <
-	 * RecentGlobalXmin test in gistPageRecyclable() conceptually mirrors the
-	 * pgxact->xmin > limitXmin test in GetConflictingVirtualXIDs().
-	 * Consequently, one XID value achieves the same exclusion effect on
-	 * master and standby.
+	 * latestRemovedXid was the page's deleteXid.  The
+	 * GlobalVisIsRemovableFullXid(deleteXid) test in gistPageRecyclable()
+	 * conceptually mirrors the PGPROC->xmin > limitXmin test in
+	 * GetConflictingVirtualXIDs().  Consequently, one XID value achieves the
+	 * same exclusion effect on primary and standby.
 	 */
 	if (InHotStandby)
 	{
 		FullTransactionId latestRemovedFullXid = xlrec->latestRemovedFullXid;
-		FullTransactionId nextFullXid = ReadNextFullTransactionId();
+		FullTransactionId nextXid = ReadNextFullTransactionId();
 		uint64		diff;
 
 		/*
@@ -405,8 +405,7 @@ gistRedoPageReuse(XLogReaderState *record)
 		 * logged value is very old, so that XID wrap-around already happened
 		 * on it, there can't be any snapshots that still see it.
 		 */
-		nextFullXid = ReadNextFullTransactionId();
-		diff = U64FromFullTransactionId(nextFullXid) -
+		diff = U64FromFullTransactionId(nextXid) -
 			U64FromFullTransactionId(latestRemovedFullXid);
 		if (diff < MaxTransactionId / 2)
 		{
@@ -448,6 +447,9 @@ gist_redo(XLogReaderState *record)
 			break;
 		case XLOG_GIST_PAGE_DELETE:
 			gistRedoPageDelete(record);
+			break;
+		case XLOG_GIST_ASSIGN_LSN:
+			/* nop. See gistGetFakeLSN(). */
 			break;
 		default:
 			elog(PANIC, "gist_redo: unknown op code %u", info);
@@ -590,6 +592,24 @@ gistXLogPageDelete(Buffer buffer, FullTransactionId xid,
 	recptr = XLogInsert(RM_GIST_ID, XLOG_GIST_PAGE_DELETE);
 
 	return recptr;
+}
+
+/*
+ * Write an empty XLOG record to assign a distinct LSN.
+ */
+XLogRecPtr
+gistXLogAssignLSN(void)
+{
+	int			dummy = 0;
+
+	/*
+	 * Records other than SWITCH_WAL must have content. We use an integer 0 to
+	 * follow the restriction.
+	 */
+	XLogBeginInsert();
+	XLogSetRecordFlags(XLOG_MARK_UNIMPORTANT);
+	XLogRegisterData((char *) &dummy, sizeof(dummy));
+	return XLogInsert(RM_GIST_ID, XLOG_GIST_ASSIGN_LSN);
 }
 
 /*

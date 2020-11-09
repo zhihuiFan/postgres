@@ -16,6 +16,7 @@
 
 #include <sys/file.h>
 #include <dirent.h>
+#include <fcntl.h>
 #include <math.h>
 #include <unistd.h>
 
@@ -415,12 +416,16 @@ pg_get_keywords(PG_FUNCTION_ARGS)
 		funcctx = SRF_FIRSTCALL_INIT();
 		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-		tupdesc = CreateTemplateTupleDesc(3);
+		tupdesc = CreateTemplateTupleDesc(5);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "word",
 						   TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "catcode",
 						   CHAROID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "catdesc",
+		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "barelabel",
+						   BOOLOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "catdesc",
+						   TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "baredesc",
 						   TEXTOID, -1, 0);
 
 		funcctx->attinmeta = TupleDescGetAttInMetadata(tupdesc);
@@ -432,7 +437,7 @@ pg_get_keywords(PG_FUNCTION_ARGS)
 
 	if (funcctx->call_cntr < ScanKeywords.num_keywords)
 	{
-		char	   *values[3];
+		char	   *values[5];
 		HeapTuple	tuple;
 
 		/* cast-away-const is ugly but alternatives aren't much better */
@@ -444,24 +449,35 @@ pg_get_keywords(PG_FUNCTION_ARGS)
 		{
 			case UNRESERVED_KEYWORD:
 				values[1] = "U";
-				values[2] = _("unreserved");
+				values[3] = _("unreserved");
 				break;
 			case COL_NAME_KEYWORD:
 				values[1] = "C";
-				values[2] = _("unreserved (cannot be function or type name)");
+				values[3] = _("unreserved (cannot be function or type name)");
 				break;
 			case TYPE_FUNC_NAME_KEYWORD:
 				values[1] = "T";
-				values[2] = _("reserved (can be function or type name)");
+				values[3] = _("reserved (can be function or type name)");
 				break;
 			case RESERVED_KEYWORD:
 				values[1] = "R";
-				values[2] = _("reserved");
+				values[3] = _("reserved");
 				break;
 			default:			/* shouldn't be possible */
 				values[1] = NULL;
-				values[2] = NULL;
+				values[3] = NULL;
 				break;
+		}
+
+		if (ScanKeywordBareLabel[funcctx->call_cntr])
+		{
+			values[2] = "true";
+			values[4] = _("can be bare label");
+		}
+		else
+		{
+			values[2] = "false";
+			values[4] = _("requires AS");
 		}
 
 		tuple = BuildTupleFromCStrings(funcctx->attinmeta, values);
@@ -738,9 +754,6 @@ pg_current_logfile(PG_FUNCTION_ARGS)
 	FILE	   *fd;
 	char		lbuffer[MAXPGPATH];
 	char	   *logfmt;
-	char	   *log_filepath;
-	char	   *log_format = lbuffer;
-	char	   *nlpos;
 
 	/* The log format parameter is optional */
 	if (PG_NARGS() == 0 || PG_ARGISNULL(0))
@@ -767,16 +780,23 @@ pg_current_logfile(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	}
 
+#ifdef WIN32
+	/* syslogger.c writes CRLF line endings on Windows */
+	_setmode(_fileno(fd), _O_TEXT);
+#endif
+
 	/*
 	 * Read the file to gather current log filename(s) registered by the
 	 * syslogger.
 	 */
 	while (fgets(lbuffer, sizeof(lbuffer), fd) != NULL)
 	{
-		/*
-		 * Extract log format and log file path from the line; lbuffer ==
-		 * log_format, they share storage.
-		 */
+		char	   *log_format;
+		char	   *log_filepath;
+		char	   *nlpos;
+
+		/* Extract log format and log file path from the line. */
+		log_format = lbuffer;
 		log_filepath = strchr(lbuffer, ' ');
 		if (log_filepath == NULL)
 		{

@@ -182,7 +182,7 @@ WHERE p1.oid < p2.oid AND
 -- or when new polymorphic built-in functions are added!
 -- Note: ignore aggregate functions here, since they all point to the same
 -- dummy built-in function.  Likewise, ignore range constructor functions.
-SELECT DISTINCT p1.prorettype, p2.prorettype
+SELECT DISTINCT p1.prorettype::regtype, p2.prorettype::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
@@ -192,13 +192,15 @@ WHERE p1.oid != p2.oid AND
     p2.prosrc NOT LIKE E'range\\_constructor_' AND
     (p1.prorettype < p2.prorettype)
 ORDER BY 1, 2;
- prorettype | prorettype 
-------------+------------
-         25 |       1043
-       1114 |       1184
-(2 rows)
+         prorettype          |        prorettype        
+-----------------------------+--------------------------
+ bigint                      | xid8
+ text                        | character varying
+ timestamp without time zone | timestamp with time zone
+ txid_snapshot               | pg_snapshot
+(4 rows)
 
-SELECT DISTINCT p1.proargtypes[0], p2.proargtypes[0]
+SELECT DISTINCT p1.proargtypes[0]::regtype, p2.proargtypes[0]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
@@ -208,15 +210,17 @@ WHERE p1.oid != p2.oid AND
     p2.prosrc NOT LIKE E'range\\_constructor_' AND
     (p1.proargtypes[0] < p2.proargtypes[0])
 ORDER BY 1, 2;
- proargtypes | proargtypes 
--------------+-------------
-          25 |        1042
-          25 |        1043
-        1114 |        1184
-        1560 |        1562
-(4 rows)
+         proargtypes         |       proargtypes        
+-----------------------------+--------------------------
+ bigint                      | xid8
+ text                        | character
+ text                        | character varying
+ timestamp without time zone | timestamp with time zone
+ bit                         | bit varying
+ txid_snapshot               | pg_snapshot
+(6 rows)
 
-SELECT DISTINCT p1.proargtypes[1], p2.proargtypes[1]
+SELECT DISTINCT p1.proargtypes[1]::regtype, p2.proargtypes[1]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
@@ -226,14 +230,15 @@ WHERE p1.oid != p2.oid AND
     p2.prosrc NOT LIKE E'range\\_constructor_' AND
     (p1.proargtypes[1] < p2.proargtypes[1])
 ORDER BY 1, 2;
- proargtypes | proargtypes 
--------------+-------------
-          23 |          28
-        1114 |        1184
-        1560 |        1562
-(3 rows)
+         proargtypes         |       proargtypes        
+-----------------------------+--------------------------
+ integer                     | xid
+ timestamp without time zone | timestamp with time zone
+ bit                         | bit varying
+ txid_snapshot               | pg_snapshot
+(4 rows)
 
-SELECT DISTINCT p1.proargtypes[2], p2.proargtypes[2]
+SELECT DISTINCT p1.proargtypes[2]::regtype, p2.proargtypes[2]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
@@ -241,12 +246,12 @@ WHERE p1.oid != p2.oid AND
     p1.prokind != 'a' AND p2.prokind != 'a' AND
     (p1.proargtypes[2] < p2.proargtypes[2])
 ORDER BY 1, 2;
- proargtypes | proargtypes 
--------------+-------------
-        1114 |        1184
+         proargtypes         |       proargtypes        
+-----------------------------+--------------------------
+ timestamp without time zone | timestamp with time zone
 (1 row)
 
-SELECT DISTINCT p1.proargtypes[3], p2.proargtypes[3]
+SELECT DISTINCT p1.proargtypes[3]::regtype, p2.proargtypes[3]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
@@ -254,12 +259,12 @@ WHERE p1.oid != p2.oid AND
     p1.prokind != 'a' AND p2.prokind != 'a' AND
     (p1.proargtypes[3] < p2.proargtypes[3])
 ORDER BY 1, 2;
- proargtypes | proargtypes 
--------------+-------------
-        1114 |        1184
+         proargtypes         |       proargtypes        
+-----------------------------+--------------------------
+ timestamp without time zone | timestamp with time zone
 (1 row)
 
-SELECT DISTINCT p1.proargtypes[4], p2.proargtypes[4]
+SELECT DISTINCT p1.proargtypes[4]::regtype, p2.proargtypes[4]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
@@ -271,7 +276,7 @@ ORDER BY 1, 2;
 -------------+-------------
 (0 rows)
 
-SELECT DISTINCT p1.proargtypes[5], p2.proargtypes[5]
+SELECT DISTINCT p1.proargtypes[5]::regtype, p2.proargtypes[5]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
@@ -283,7 +288,7 @@ ORDER BY 1, 2;
 -------------+-------------
 (0 rows)
 
-SELECT DISTINCT p1.proargtypes[6], p2.proargtypes[6]
+SELECT DISTINCT p1.proargtypes[6]::regtype, p2.proargtypes[6]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
@@ -295,7 +300,7 @@ ORDER BY 1, 2;
 -------------+-------------
 (0 rows)
 
-SELECT DISTINCT p1.proargtypes[7], p2.proargtypes[7]
+SELECT DISTINCT p1.proargtypes[7]::regtype, p2.proargtypes[7]::regtype
 FROM pg_proc AS p1, pg_proc AS p2
 WHERE p1.oid != p2.oid AND
     p1.prosrc = p2.prosrc AND
@@ -379,10 +384,10 @@ WHERE p1.prorettype IN
 ORDER BY 2;
  oid  |         proname          
 ------+--------------------------
- 9559 | anycompatible_in
- 9561 | anycompatiblearray_in
- 9563 | anycompatiblearray_recv
- 9565 | anycompatiblenonarray_in
+ 5086 | anycompatible_in
+ 5088 | anycompatiblearray_in
+ 5090 | anycompatiblearray_recv
+ 5092 | anycompatiblenonarray_in
 (4 rows)
 
 SELECT p1.oid, p1.proname
@@ -393,7 +398,7 @@ WHERE p1.prorettype = 'anycompatiblerange'::regtype
 ORDER BY 2;
  oid  |        proname        
 ------+-----------------------
- 9567 | anycompatiblerange_in
+ 5094 | anycompatiblerange_in
 (1 row)
 
 -- Look for functions that accept cstring and are neither datatype input
@@ -567,6 +572,8 @@ int24ge(smallint,integer)
 int42ge(integer,smallint)
 oideq(oid,oid)
 oidne(oid,oid)
+float8(smallint)
+float4(smallint)
 nameeqtext(name,text)
 namelttext(name,text)
 nameletext(name,text)
@@ -605,6 +612,10 @@ float84lt(double precision,real)
 float84le(double precision,real)
 float84gt(double precision,real)
 float84ge(double precision,real)
+float8(real)
+int4(smallint)
+float8(integer)
+float4(integer)
 btint2cmp(smallint,smallint)
 btint4cmp(integer,integer)
 btfloat4cmp(real,real)
@@ -615,6 +626,9 @@ btnamecmp(name,name)
 bttextcmp(text,text)
 cash_cmp(money,money)
 btoidvectorcmp(oidvector,oidvector)
+text(name)
+name(text)
+name(character)
 text_larger(text,text)
 text_smaller(text,text)
 int8eq(bigint,bigint)
@@ -629,7 +643,10 @@ int84lt(bigint,integer)
 int84gt(bigint,integer)
 int84le(bigint,integer)
 int84ge(bigint,integer)
+int8(integer)
+float8(bigint)
 oidvectorne(oidvector,oidvector)
+float4(bigint)
 namelt(name,name)
 namele(name,name)
 namegt(name,name)
@@ -646,6 +663,7 @@ text_lt(text,text)
 text_le(text,text)
 text_gt(text,text)
 text_ge(text,text)
+int8(smallint)
 macaddr_eq(macaddr,macaddr)
 macaddr_lt(macaddr,macaddr)
 macaddr_le(macaddr,macaddr)
@@ -711,6 +729,7 @@ interval_ge(interval,interval)
 interval_gt(interval,interval)
 charlt("char","char")
 tidne(tid,tid)
+int8(oid)
 tideq(tid,tid)
 timestamptz_cmp(timestamp with time zone,timestamp with time zone)
 interval_cmp(interval,interval)
@@ -722,6 +741,9 @@ timetz_le(time with time zone,time with time zone)
 timetz_ge(time with time zone,time with time zone)
 timetz_gt(time with time zone,time with time zone)
 timetz_cmp(time with time zone,time with time zone)
+"interval"(time without time zone)
+name(character varying)
+"varchar"(name)
 circle_eq(circle,circle)
 circle_ne(circle,circle)
 circle_lt(circle,circle)
@@ -752,6 +774,11 @@ varbitcmp(bit varying,bit varying)
 boolle(boolean,boolean)
 boolge(boolean,boolean)
 btboolcmp(boolean,boolean)
+"numeric"(integer)
+"numeric"(real)
+"numeric"(double precision)
+"numeric"(bigint)
+"numeric"(smallint)
 int28eq(smallint,bigint)
 int28ne(smallint,bigint)
 int28lt(smallint,bigint)
@@ -798,6 +825,8 @@ btfloat48cmp(real,double precision)
 btfloat84cmp(double precision,real)
 md5(text)
 md5(bytea)
+bool(integer)
+int4(boolean)
 tidgt(tid,tid)
 tidlt(tid,tid)
 tidge(tid,tid)
@@ -832,6 +861,14 @@ macaddr8_gt(macaddr8,macaddr8)
 macaddr8_ge(macaddr8,macaddr8)
 macaddr8_ne(macaddr8,macaddr8)
 macaddr8_cmp(macaddr8,macaddr8)
+macaddr8(macaddr)
+xid8lt(xid8,xid8)
+xid8gt(xid8,xid8)
+xid8le(xid8,xid8)
+xid8ge(xid8,xid8)
+xid8eq(xid8,xid8)
+xid8ne(xid8,xid8)
+xid8cmp(xid8,xid8)
 zstideq(zstid,zstid)
 zstidle(zstid,zstid)
 zstidge(zstid,zstid)
@@ -1035,7 +1072,7 @@ WHERE condefault AND
 -- Look for illegal values in pg_operator fields.
 SELECT p1.oid, p1.oprname
 FROM pg_operator as p1
-WHERE (p1.oprkind != 'b' AND p1.oprkind != 'l' AND p1.oprkind != 'r') OR
+WHERE (p1.oprkind != 'b' AND p1.oprkind != 'l') OR
     p1.oprresult = 0 OR p1.oprcode = 0;
  oid | oprname 
 -----+---------
@@ -1046,8 +1083,7 @@ SELECT p1.oid, p1.oprname
 FROM pg_operator as p1
 WHERE (p1.oprleft = 0 and p1.oprkind != 'l') OR
     (p1.oprleft != 0 and p1.oprkind = 'l') OR
-    (p1.oprright = 0 and p1.oprkind != 'r') OR
-    (p1.oprright != 0 and p1.oprkind = 'r');
+    p1.oprright = 0;
  oid | oprname 
 -----+---------
 (0 rows)
@@ -1133,14 +1169,13 @@ ORDER BY 1, 2;
  ?-|  | ?-|
  ?|   | ?|
  ?||  | ?||
- @    | ~
  @@   | @@
  @@@  | @@@
  |    | |
  ~<=~ | ~>=~
  ~<~  | ~>~
  ~=   | ~=
-(30 rows)
+(29 rows)
 
 -- Likewise for negator pairs.
 SELECT DISTINCT o1.oprname AS op1, o2.oprname AS op2
@@ -1250,18 +1285,6 @@ WHERE p1.oprcode = p2.oid AND
      OR NOT binary_coercible(p2.prorettype, p1.oprresult)
      OR NOT binary_coercible(p1.oprright, p2.proargtypes[0])
      OR p1.oprleft != 0);
- oid | oprname | oid | proname 
------+---------+-----+---------
-(0 rows)
-
-SELECT p1.oid, p1.oprname, p2.oid, p2.proname
-FROM pg_operator AS p1, pg_proc AS p2
-WHERE p1.oprcode = p2.oid AND
-    p1.oprkind = 'r' AND
-    (p2.pronargs != 1
-     OR NOT binary_coercible(p2.prorettype, p1.oprresult)
-     OR NOT binary_coercible(p1.oprleft, p2.proargtypes[0])
-     OR p1.oprright != 0);
  oid | oprname | oid | proname 
 -----+---------+-----+---------
 (0 rows)
@@ -1972,8 +1995,6 @@ ORDER BY 1, 2, 3;
         783 |           11 | >^
         783 |           11 | |>>
         783 |           12 | |&>
-        783 |           13 | ~
-        783 |           14 | @
         783 |           15 | <->
         783 |           16 | @>
         783 |           18 | =
@@ -2066,7 +2087,7 @@ ORDER BY 1, 2, 3;
        4000 |           26 | >>
        4000 |           27 | >>=
        4000 |           28 | ^@
-(125 rows)
+(123 rows)
 
 -- Check that all opclass search operators have selectivity estimators.
 -- This is not absolutely required, but it seems a reasonable thing
@@ -2132,7 +2153,7 @@ WHERE p1.amopopr = p2.oid AND p2.oprcode = p3.oid AND
 SELECT p1.amprocfamily, p1.amprocnum
 FROM pg_amproc as p1
 WHERE p1.amprocfamily = 0 OR p1.amproclefttype = 0 OR p1.amprocrighttype = 0
-    OR p1.amprocnum < 1 OR p1.amproc = 0;
+    OR p1.amprocnum < 0 OR p1.amproc = 0;
  amprocfamily | amprocnum 
 --------------+-----------
 (0 rows)

@@ -109,6 +109,7 @@ blhandler(PG_FUNCTION_ARGS)
 
 	amroutine->amstrategies = BLOOM_NSTRATEGIES;
 	amroutine->amsupport = BLOOM_NPROC;
+	amroutine->amoptsprocnum = BLOOM_OPTIONS_PROC;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = false;
 	amroutine->amcanbackward = false;
@@ -138,6 +139,7 @@ blhandler(PG_FUNCTION_ARGS)
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;
 	amroutine->amvalidate = blvalidate;
+	amroutine->amadjustmembers = NULL;
 	amroutine->ambeginscan = blbeginscan;
 	amroutine->amrescan = blrescan;
 	amroutine->amgettuple = NULL;

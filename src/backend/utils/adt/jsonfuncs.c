@@ -489,14 +489,14 @@ static void transform_string_values_scalar(void *state, char *token, JsonTokenTy
 /*
  * pg_parse_json_or_ereport
  *
- * This fuction is like pg_parse_json, except that it does not return a
+ * This function is like pg_parse_json, except that it does not return a
  * JsonParseErrorType. Instead, in case of any failure, this function will
  * ereport(ERROR).
  */
 void
 pg_parse_json_or_ereport(JsonLexContext *lex, JsonSemAction *sem)
 {
-	JsonParseErrorType	result;
+	JsonParseErrorType result;
 
 	result = pg_parse_json(lex, sem);
 	if (result != JSON_SUCCESS)
@@ -4524,8 +4524,8 @@ jsonb_set_lax(PG_FUNCTION_ARGS)
 	/* ArrayType  *path = PG_GETARG_ARRAYTYPE_P(1); */
 	/* Jsonb	  *newval = PG_GETARG_JSONB_P(2); */
 	/* bool		create = PG_GETARG_BOOL(3); */
-	text       *handle_null;
-	char       *handle_val;
+	text	   *handle_null;
+	char	   *handle_val;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(3))
 		PG_RETURN_NULL();
@@ -4537,13 +4537,13 @@ jsonb_set_lax(PG_FUNCTION_ARGS)
 				 errmsg("null_value_treatment must be \"delete_key\", \"return_target\", \"use_json_null\", or \"raise_exception\"")));
 
 	/* if the new value isn't an SQL NULL just call jsonb_set */
-	if (! PG_ARGISNULL(2))
+	if (!PG_ARGISNULL(2))
 		return jsonb_set(fcinfo);
 
 	handle_null = PG_GETARG_TEXT_P(4);
 	handle_val = text_to_cstring(handle_null);
 
-	if (strcmp(handle_val,"raise_exception") == 0)
+	if (strcmp(handle_val, "raise_exception") == 0)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
@@ -4554,7 +4554,7 @@ jsonb_set_lax(PG_FUNCTION_ARGS)
 	}
 	else if (strcmp(handle_val, "use_json_null") == 0)
 	{
-		Datum	  newval;
+		Datum		newval;
 
 		newval = DirectFunctionCall1(jsonb_in, CStringGetDatum("null"));
 
@@ -4569,6 +4569,7 @@ jsonb_set_lax(PG_FUNCTION_ARGS)
 	else if (strcmp(handle_val, "return_target") == 0)
 	{
 		Jsonb	   *in = PG_GETARG_JSONB_P(0);
+
 		PG_RETURN_JSONB_P(in);
 	}
 	else
@@ -4686,8 +4687,8 @@ IteratorConcat(JsonbIterator **it1, JsonbIterator **it2,
 				rk1,
 				rk2;
 
-	r1 = rk1 = JsonbIteratorNext(it1, &v1, false);
-	r2 = rk2 = JsonbIteratorNext(it2, &v2, false);
+	rk1 = JsonbIteratorNext(it1, &v1, false);
+	rk2 = JsonbIteratorNext(it2, &v2, false);
 
 	/*
 	 * Both elements are objects.
@@ -4695,15 +4696,15 @@ IteratorConcat(JsonbIterator **it1, JsonbIterator **it2,
 	if (rk1 == WJB_BEGIN_OBJECT && rk2 == WJB_BEGIN_OBJECT)
 	{
 		/*
-		 * Append the all tokens from v1 to res, except last WJB_END_OBJECT
+		 * Append all the tokens from v1 to res, except last WJB_END_OBJECT
 		 * (because res will not be finished yet).
 		 */
-		pushJsonbValue(state, r1, NULL);
+		pushJsonbValue(state, rk1, NULL);
 		while ((r1 = JsonbIteratorNext(it1, &v1, true)) != WJB_END_OBJECT)
 			pushJsonbValue(state, r1, &v1);
 
 		/*
-		 * Append the all tokens from v2 to res, include last WJB_END_OBJECT
+		 * Append all the tokens from v2 to res, include last WJB_END_OBJECT
 		 * (the concatenation will be completed).
 		 */
 		while ((r2 = JsonbIteratorNext(it2, &v2, true)) != WJB_DONE)
@@ -4715,7 +4716,7 @@ IteratorConcat(JsonbIterator **it1, JsonbIterator **it2,
 	 */
 	else if (rk1 == WJB_BEGIN_ARRAY && rk2 == WJB_BEGIN_ARRAY)
 	{
-		pushJsonbValue(state, r1, NULL);
+		pushJsonbValue(state, rk1, NULL);
 
 		while ((r1 = JsonbIteratorNext(it1, &v1, true)) != WJB_END_ARRAY)
 		{
@@ -4735,10 +4736,8 @@ IteratorConcat(JsonbIterator **it1, JsonbIterator **it2,
 	else if (((rk1 == WJB_BEGIN_ARRAY && !(*it1)->isScalar) && rk2 == WJB_BEGIN_OBJECT) ||
 			 (rk1 == WJB_BEGIN_OBJECT && (rk2 == WJB_BEGIN_ARRAY && !(*it2)->isScalar)))
 	{
-
 		JsonbIterator **it_array = rk1 == WJB_BEGIN_ARRAY ? it1 : it2;
 		JsonbIterator **it_object = rk1 == WJB_BEGIN_OBJECT ? it1 : it2;
-
 		bool		prepend = (rk1 == WJB_BEGIN_OBJECT);
 
 		pushJsonbValue(state, WJB_BEGIN_ARRAY, NULL);

@@ -246,9 +246,6 @@ aclparse(const char *s, AclItem *aip)
 
 	Assert(s && aip);
 
-#ifdef ACLDEBUG
-	elog(LOG, "aclparse: input = \"%s\"", s);
-#endif
 	s = getid(s, name);
 	if (*s != '=')
 	{
@@ -357,11 +354,6 @@ aclparse(const char *s, AclItem *aip)
 	}
 
 	ACLITEM_SET_PRIVS_GOPTIONS(*aip, privs, goption);
-
-#ifdef ACLDEBUG
-	elog(LOG, "aclparse: correctly read [%u %x %x]",
-		 aip->ai_grantee, privs, goption);
-#endif
 
 	return s;
 }
@@ -5225,6 +5217,7 @@ get_rolespec_oid(const RoleSpec *role, bool missing_ok)
 			oid = get_role_oid(role->rolename, missing_ok);
 			break;
 
+		case ROLESPEC_CURRENT_ROLE:
 		case ROLESPEC_CURRENT_USER:
 			oid = GetUserId();
 			break;
@@ -5267,6 +5260,7 @@ get_rolespec_tuple(const RoleSpec *role)
 						 errmsg("role \"%s\" does not exist", role->rolename)));
 			break;
 
+		case ROLESPEC_CURRENT_ROLE:
 		case ROLESPEC_CURRENT_USER:
 			tuple = SearchSysCache1(AUTHOID, GetUserId());
 			if (!HeapTupleIsValid(tuple))

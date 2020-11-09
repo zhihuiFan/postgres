@@ -136,13 +136,6 @@
 #endif
 
 /*
- * Disable UNIX sockets for certain operating systems.
- */
-#if defined(WIN32)
-#undef HAVE_UNIX_SOCKETS
-#endif
-
-/*
  * USE_POSIX_FADVISE controls whether Postgres will attempt to use the
  * posix_fadvise() kernel call.  Usually the automatic configure tests are
  * sufficient, but some older Linux distributions had broken versions of
@@ -202,8 +195,16 @@
  * server will not create an AF_UNIX socket unless the run-time configuration
  * is changed, a client will connect via TCP/IP by default and will only use
  * an AF_UNIX socket if one is explicitly specified.
+ *
+ * This is done by default on Windows because there is no good standard
+ * location for AF_UNIX sockets and many installations on Windows don't
+ * support them yet.
  */
+#ifndef WIN32
 #define DEFAULT_PGSOCKET_DIR  "/tmp"
+#else
+#define DEFAULT_PGSOCKET_DIR ""
+#endif
 
 /*
  * This is the default event source for Windows event log.
@@ -268,12 +269,15 @@
 /*
  * Include Valgrind "client requests", mostly in the memory allocator, so
  * Valgrind understands PostgreSQL memory contexts.  This permits detecting
- * memory errors that Valgrind would not detect on a vanilla build.  See also
- * src/tools/valgrind.supp.  "make installcheck" runs 20-30x longer under
- * Valgrind.  Note that USE_VALGRIND slowed older versions of Valgrind by an
- * additional order of magnitude; Valgrind 3.8.1 does not have this problem.
- * The client requests fall in hot code paths, so USE_VALGRIND also slows
- * native execution by a few percentage points.
+ * memory errors that Valgrind would not detect on a vanilla build.  It also
+ * enables detection of buffer accesses that take place without holding a
+ * buffer pin (or without holding a buffer lock in the case of index access
+ * methods that superimpose their own custom client requests on top of the
+ * generic bufmgr.c requests).  See also src/tools/valgrind.supp.
+ *
+ * "make installcheck" is significantly slower under Valgrind.  The client
+ * requests fall in hot code paths, so USE_VALGRIND slows execution by a few
+ * percentage points even when not run under Valgrind.
  *
  * You should normally use MEMORY_CONTEXT_CHECKING with USE_VALGRIND;
  * instrumentation of repalloc() is inferior without it.
@@ -347,9 +351,3 @@
  * Enable tracing of syncscan operations (see also the trace_syncscan GUC var).
  */
 /* #define TRACE_SYNCSCAN */
-
-/*
- * Other debug #defines (documentation, anyone?)
- */
-/* #define HEAPDEBUGALL */
-/* #define ACLDEBUG */

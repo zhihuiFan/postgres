@@ -43,7 +43,9 @@ int			max_standby_streaming_delay = 30 * 1000;
 static HTAB *RecoveryLockLists;
 
 static void ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
-												   ProcSignalReason reason, bool report_waiting);
+												   ProcSignalReason reason,
+												   uint32 wait_event_info,
+												   bool report_waiting);
 static void SendRecoveryConflictWithBufferPin(ProcSignalReason reason);
 static XLogRecPtr LogCurrentRunningXacts(RunningTransactions CurrRunningXacts);
 static void LogAccessExclusiveLocks(int nlocks, xl_standby_lock *locks);
@@ -59,7 +61,7 @@ typedef struct RecoveryLockListsEntry
 
 /*
  * InitRecoveryTransactionEnvironment
- *		Initialize tracking of in-progress transactions in master
+ *		Initialize tracking of our primary's in-progress transactions.
  *
  * We need to issue shared invalidations and hold locks. Holding locks
  * means others may want to wait on us, so we need to make a lock table
@@ -90,7 +92,7 @@ InitRecoveryTransactionEnvironment(void)
 	/*
 	 * Initialize shared invalidation management for Startup process, being
 	 * careful to register ourselves as a sendOnly process so we don't need to
-	 * read messages, nor will we get signalled when the queue starts filling
+	 * read messages, nor will we get signaled when the queue starts filling
 	 * up.
 	 */
 	SharedInvalBackendInit(true);
@@ -184,7 +186,7 @@ static int	standbyWait_us = STANDBY_INITIAL_WAIT_US;
  * more then we return true, if we can wait some more return false.
  */
 static bool
-WaitExceedsMaxStandbyDelay(void)
+WaitExceedsMaxStandbyDelay(uint32 wait_event_info)
 {
 	TimestampTz ltime;
 
@@ -198,7 +200,9 @@ WaitExceedsMaxStandbyDelay(void)
 	/*
 	 * Sleep a bit (this is essential to avoid busy-waiting).
 	 */
+	pgstat_report_wait_start(wait_event_info);
 	pg_usleep(standbyWait_us);
+	pgstat_report_wait_end();
 
 	/*
 	 * Progressively increase the sleep times, but not to more than 1s, since
@@ -223,7 +227,8 @@ WaitExceedsMaxStandbyDelay(void)
  */
 static void
 ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
-									   ProcSignalReason reason, bool report_waiting)
+									   ProcSignalReason reason, uint32 wait_event_info,
+									   bool report_waiting)
 {
 	TimestampTz waitStart = 0;
 	char	   *new_status;
@@ -264,7 +269,7 @@ ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
 			}
 
 			/* Is it time to kill it? */
-			if (WaitExceedsMaxStandbyDelay())
+			if (WaitExceedsMaxStandbyDelay(wait_event_info))
 			{
 				pid_t		pid;
 
@@ -317,6 +322,7 @@ ResolveRecoveryConflictWithSnapshot(TransactionId latestRemovedXid, RelFileNode 
 
 	ResolveRecoveryConflictWithVirtualXIDs(backends,
 										   PROCSIG_RECOVERY_CONFLICT_SNAPSHOT,
+										   WAIT_EVENT_RECOVERY_CONFLICT_SNAPSHOT,
 										   true);
 }
 
@@ -346,6 +352,7 @@ ResolveRecoveryConflictWithTablespace(Oid tsid)
 												InvalidOid);
 	ResolveRecoveryConflictWithVirtualXIDs(temp_file_users,
 										   PROCSIG_RECOVERY_CONFLICT_TABLESPACE,
+										   WAIT_EVENT_RECOVERY_CONFLICT_TABLESPACE,
 										   true);
 }
 
@@ -417,6 +424,7 @@ ResolveRecoveryConflictWithLock(LOCKTAG locktag)
 		 */
 		ResolveRecoveryConflictWithVirtualXIDs(backends,
 											   PROCSIG_RECOVERY_CONFLICT_LOCK,
+											   PG_WAIT_LOCK | locktag.locktag_type,
 											   false);
 	}
 	else
@@ -881,7 +889,7 @@ standby_redo(XLogReaderState *record)
  * up from a checkpoint and are immediately at our starting point, we
  * unconditionally move to STANDBY_INITIALIZED. After this point we
  * must do 4 things:
- *	* move shared nextFullXid forwards as we see new xids
+ *	* move shared nextXid forwards as we see new xids
  *	* extend the clog and subtrans with each new xid
  *	* keep track of uncommitted known assigned xids
  *	* keep track of uncommitted AccessExclusiveLocks

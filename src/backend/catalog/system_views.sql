@@ -554,6 +554,12 @@ CREATE VIEW pg_shmem_allocations AS
 REVOKE ALL ON pg_shmem_allocations FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_get_shmem_allocations() FROM PUBLIC;
 
+CREATE VIEW pg_backend_memory_contexts AS
+    SELECT * FROM pg_get_backend_memory_contexts();
+
+REVOKE ALL ON pg_backend_memory_contexts FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION pg_get_backend_memory_contexts() FROM PUBLIC;
+
 -- Statistics views
 
 CREATE VIEW pg_stat_all_tables AS
@@ -573,6 +579,7 @@ CREATE VIEW pg_stat_all_tables AS
             pg_stat_get_live_tuples(C.oid) AS n_live_tup,
             pg_stat_get_dead_tuples(C.oid) AS n_dead_tup,
             pg_stat_get_mod_since_analyze(C.oid) AS n_mod_since_analyze,
+            pg_stat_get_ins_since_vacuum(C.oid) AS n_ins_since_vacuum,
             pg_stat_get_last_vacuum_time(C.oid) as last_vacuum,
             pg_stat_get_last_autovacuum_time(C.oid) as last_autovacuum,
             pg_stat_get_last_analyze_time(C.oid) as last_analyze,
@@ -641,16 +648,16 @@ CREATE VIEW pg_statio_all_tables AS
             pg_stat_get_blocks_fetched(T.oid) -
                     pg_stat_get_blocks_hit(T.oid) AS toast_blks_read,
             pg_stat_get_blocks_hit(T.oid) AS toast_blks_hit,
-            sum(pg_stat_get_blocks_fetched(X.indexrelid) -
-                    pg_stat_get_blocks_hit(X.indexrelid))::bigint AS tidx_blks_read,
-            sum(pg_stat_get_blocks_hit(X.indexrelid))::bigint AS tidx_blks_hit
+            pg_stat_get_blocks_fetched(X.indexrelid) -
+                    pg_stat_get_blocks_hit(X.indexrelid) AS tidx_blks_read,
+            pg_stat_get_blocks_hit(X.indexrelid) AS tidx_blks_hit
     FROM pg_class C LEFT JOIN
             pg_index I ON C.oid = I.indrelid LEFT JOIN
             pg_class T ON C.reltoastrelid = T.oid LEFT JOIN
             pg_index X ON T.oid = X.indrelid
             LEFT JOIN pg_namespace N ON (N.oid = C.relnamespace)
     WHERE C.relkind IN ('r', 't', 'm')
-    GROUP BY C.oid, N.nspname, C.relname, T.oid, X.indrelid;
+    GROUP BY C.oid, N.nspname, C.relname, T.oid, X.indexrelid;
 
 CREATE VIEW pg_statio_sys_tables AS
     SELECT * FROM pg_statio_all_tables
@@ -784,13 +791,35 @@ CREATE VIEW pg_stat_replication AS
             W.replay_lag,
             W.sync_priority,
             W.sync_state,
-            W.reply_time,
-            W.spill_txns,
-            W.spill_count,
-            W.spill_bytes
+            W.reply_time
     FROM pg_stat_get_activity(NULL) AS S
         JOIN pg_stat_get_wal_senders() AS W ON (S.pid = W.pid)
         LEFT JOIN pg_authid AS U ON (S.usesysid = U.oid);
+
+CREATE VIEW pg_stat_replication_slots AS
+    SELECT
+            s.slot_name,
+            s.spill_txns,
+            s.spill_count,
+            s.spill_bytes,
+            s.stream_txns,
+            s.stream_count,
+            s.stream_bytes,
+            s.stats_reset
+    FROM pg_stat_get_replication_slots() AS s;
+
+CREATE VIEW pg_stat_slru AS
+    SELECT
+            s.name,
+            s.blks_zeroed,
+            s.blks_hit,
+            s.blks_read,
+            s.blks_written,
+            s.blks_exists,
+            s.flushes,
+            s.truncates,
+            s.stats_reset
+    FROM pg_stat_get_slru() s;
 
 CREATE VIEW pg_stat_wal_receiver AS
     SELECT
@@ -798,7 +827,8 @@ CREATE VIEW pg_stat_wal_receiver AS
             s.status,
             s.receive_start_lsn,
             s.receive_start_tli,
-            s.received_lsn,
+            s.written_lsn,
+            s.flushed_lsn,
             s.received_tli,
             s.last_msg_send_time,
             s.last_msg_receipt_time,
@@ -862,7 +892,9 @@ CREATE VIEW pg_replication_slots AS
             L.xmin,
             L.catalog_xmin,
             L.restart_lsn,
-            L.confirmed_flush_lsn
+            L.confirmed_flush_lsn,
+            L.wal_status,
+            L.safe_wal_size
     FROM pg_get_replication_slots() AS L
             LEFT JOIN pg_database D ON (L.datoid = D.oid);
 
@@ -958,6 +990,12 @@ CREATE VIEW pg_stat_bgwriter AS
         pg_stat_get_buf_fsync_backend() AS buffers_backend_fsync,
         pg_stat_get_buf_alloc() AS buffers_alloc,
         pg_stat_get_bgwriter_stat_reset_time() AS stats_reset;
+
+CREATE VIEW pg_stat_wal AS
+    SELECT
+        w.wal_buffers_full,
+        w.stats_reset
+    FROM pg_stat_get_wal() w;
 
 CREATE VIEW pg_stat_progress_analyze AS
     SELECT
@@ -1070,10 +1108,10 @@ CREATE VIEW pg_stat_progress_basebackup AS
                       WHEN 4 THEN 'waiting for wal archiving to finish'
                       WHEN 5 THEN 'transferring wal files'
                       END AS phase,
-	CASE S.param2 WHEN -1 THEN NULL ELSE S.param2 END AS backup_total,
-	S.param3 AS backup_streamed,
-	S.param4 AS tablespaces_total,
-	S.param5 AS tablespaces_streamed
+        CASE S.param2 WHEN -1 THEN NULL ELSE S.param2 END AS backup_total,
+        S.param3 AS backup_streamed,
+        S.param4 AS tablespaces_total,
+        S.param5 AS tablespaces_streamed
     FROM pg_stat_get_progress_info('BASEBACKUP') AS S;
 
 CREATE VIEW pg_user_mappings AS
@@ -1108,7 +1146,7 @@ REVOKE ALL ON pg_replication_origin_status FROM public;
 
 -- All columns of pg_subscription except subconninfo are readable.
 REVOKE ALL ON pg_subscription FROM public;
-GRANT SELECT (subdbid, subname, subowner, subenabled, subslotname, subpublications)
+GRANT SELECT (subdbid, subname, subowner, subenabled, subbinary, substream, subslotname, subpublications)
     ON pg_subscription TO public;
 
 
@@ -1386,6 +1424,21 @@ LANGUAGE INTERNAL
 STRICT STABLE PARALLEL SAFE
 AS 'jsonb_path_query_first_tz';
 
+-- default normalization form is NFC, per SQL standard
+CREATE OR REPLACE FUNCTION
+  "normalize"(text, text DEFAULT 'NFC')
+RETURNS text
+LANGUAGE internal
+STRICT IMMUTABLE PARALLEL SAFE
+AS 'unicode_normalize_func';
+
+CREATE OR REPLACE FUNCTION
+  is_normalized(text, text DEFAULT 'NFC')
+RETURNS boolean
+LANGUAGE internal
+STRICT IMMUTABLE PARALLEL SAFE
+AS 'unicode_is_normalized';
+
 --
 -- The default permissions for functions mean that anyone can execute them.
 -- A number of functions shouldn't be executable by just anyone, but rather
@@ -1409,8 +1462,10 @@ REVOKE EXECUTE ON FUNCTION pg_promote(boolean, integer) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_stat_reset() FROM public;
 REVOKE EXECUTE ON FUNCTION pg_stat_reset_shared(text) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_stat_reset_slru(text) FROM public;
 REVOKE EXECUTE ON FUNCTION pg_stat_reset_single_table_counters(oid) FROM public;
 REVOKE EXECUTE ON FUNCTION pg_stat_reset_single_function_counters(oid) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_stat_reset_replication_slot(text) FROM public;
 
 REVOKE EXECUTE ON FUNCTION lo_import(text) FROM public;
 REVOKE EXECUTE ON FUNCTION lo_import(text, oid) FROM public;
@@ -1429,6 +1484,19 @@ REVOKE EXECUTE ON FUNCTION pg_read_file(text,bigint,bigint,boolean) FROM public;
 REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text) FROM public;
 REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text,bigint,bigint) FROM public;
 REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text,bigint,bigint,boolean) FROM public;
+
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_advance(text, pg_lsn) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_create(text) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_drop(text) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_oid(text) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_progress(text, boolean) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_session_is_setup() FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_session_progress(boolean) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_session_reset() FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_session_setup(text) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_xact_reset() FROM public;
+REVOKE EXECUTE ON FUNCTION pg_replication_origin_xact_setup(pg_lsn, timestamp with time zone) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_show_replication_origin_status() FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_stat_file(text) FROM public;
 REVOKE EXECUTE ON FUNCTION pg_stat_file(text,boolean) FROM public;

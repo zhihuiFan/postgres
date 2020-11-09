@@ -170,7 +170,7 @@ CREATE [ CONSTRAINT ] TRIGGER <replaceable class="parameter">name</replaceable> 
    When the <literal>CONSTRAINT</literal> option is specified, this command creates a
    <firstterm>constraint trigger</firstterm>.  This is the same as a regular trigger
    except that the timing of the trigger firing can be adjusted using
-   <xref linkend="sql-set-constraints"/>.
+   <link linkend="sql-set-constraints"><command>SET CONSTRAINTS</command></link>.
    Constraint triggers must be <literal>AFTER ROW</literal> triggers on plain
    tables (not foreign tables).  They
    can be fired either at the end of the statement causing the triggering
@@ -442,7 +442,7 @@ UPDATE OF <replaceable>column_name1</replaceable> [, <replaceable>column_name2</
   </para>
 
   <para>
-   Use <xref linkend="sql-droptrigger"/> to remove a trigger.
+   Use <link linkend="sql-droptrigger"><command>DROP TRIGGER</command></link> to remove a trigger.
   </para>
 
   <para>
@@ -455,6 +455,12 @@ UPDATE OF <replaceable>column_name1</replaceable> [, <replaceable>column_name2</
    Conversely, a command such as <literal>UPDATE ... SET x = x ...</literal>
    will fire a trigger on column <literal>x</literal>, even though the column's
    value did not change.
+  </para>
+
+  <para>
+   There are a few built-in trigger functions that can be used to
+   solve common problems without having to write your own trigger code;
+   see <xref linkend="functions-trigger"/>.
   </para>
 
   <para>
@@ -526,6 +532,7 @@ UPDATE OF <replaceable>column_name1</replaceable> [, <replaceable>column_name2</
    Creating a row-level trigger on a partitioned table will cause identical
    triggers to be created in all its existing partitions; and any partitions
    created or attached later will contain an identical trigger, too.
+   If the partition is detached from its parent, the trigger is removed.
    Triggers on partitioned tables may not be <literal>INSTEAD OF</literal>.
   </para>
 

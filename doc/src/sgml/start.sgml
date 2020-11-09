@@ -113,7 +113,7 @@
     From that point on, the client and the new server process
     communicate without intervention by the original
     <filename>postgres</filename> process.  Thus, the
-    master server process is always running, waiting for
+    supervisor server process is always running, waiting for
     client connections, whereas client and associated server processes
     come and go.  (All of this is of course invisible to the user.  We
     only mention it here for completeness.)
@@ -362,7 +362,7 @@ mydb=#
 <screen>
 <prompt>mydb=&gt;</prompt> <userinput>SELECT version();</userinput>
                                          version
-------------------------------------------------------------------------------------------
+-------------------------------------------------------------------&zwsp;-----------------------
  PostgreSQL &version; on x86_64-pc-linux-gnu, compiled by gcc (Debian 4.9.2-10) 4.9.2, 64-bit
 (1 row)
 

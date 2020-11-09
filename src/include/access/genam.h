@@ -38,8 +38,8 @@ typedef struct IndexBuildResult
  *
  * num_heap_tuples is accurate only when estimated_count is false;
  * otherwise it's just an estimate (currently, the estimate is the
- * prior value of the relation's pg_class.reltuples field).  It will
- * always just be an estimate during ambulkdelete.
+ * prior value of the relation's pg_class.reltuples field, so it could
+ * even be -1).  It will always just be an estimate during ambulkdelete.
  */
 typedef struct IndexVacuumInfo
 {
@@ -188,6 +188,9 @@ extern void index_store_float8_orderby_distances(IndexScanDesc scan,
 												 Oid *orderByTypes,
 												 IndexOrderByDistance *distances,
 												 bool recheckOrderBy);
+extern bytea *index_opclass_options(Relation relation, AttrNumber attnum,
+									Datum attoptions, bool validate);
+
 
 /*
  * index access method support routines (in genam.c)

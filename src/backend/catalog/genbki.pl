@@ -1,4 +1,4 @@
-#!/usr/bin/perl -w
+#!/usr/bin/perl
 #----------------------------------------------------------------------
 #
 # genbki.pl
@@ -17,9 +17,8 @@ use strict;
 use warnings;
 use Getopt::Long;
 
-use File::Basename;
-use File::Spec;
-BEGIN { use lib File::Spec->rel2abs(dirname(__FILE__)); }
+use FindBin;
+use lib $FindBin::RealBin;
 
 use Catalog;
 
@@ -110,7 +109,7 @@ foreach my $header (@ARGV)
 				}
 				else
 				{
-					push @{ $catalog_data{pg_description}}, \%descr;
+					push @{ $catalog_data{pg_description} }, \%descr;
 				}
 			}
 
@@ -589,9 +588,13 @@ EOM
 		}
 
 		# Special hack to generate OID symbols for pg_type entries
-		# that lack one.
-		if ($catname eq 'pg_type' and !exists $bki_values{oid_symbol})
+		if ($catname eq 'pg_type')
 		{
+			die sprintf
+			  "custom OID symbols are not allowed for pg_type entries: '%s'",
+			  $bki_values{oid_symbol}
+			  if defined $bki_values{oid_symbol};
+
 			my $symbol = form_pg_type_symbol($bki_values{typname});
 			$bki_values{oid_symbol} = $symbol
 			  if defined $symbol;
@@ -603,6 +606,13 @@ EOM
 		# Emit OID symbol
 		if (defined $bki_values{oid_symbol})
 		{
+			# OID symbols for builtin functions are handled automatically
+			# by utils/Gen_fmgrtab.pl
+			die sprintf
+			  "custom OID symbols are not allowed for pg_proc entries: '%s'",
+			  $bki_values{oid_symbol}
+			  if $catname eq 'pg_proc';
+
 			printf $def "#define %s %s\n",
 			  $bki_values{oid_symbol}, $bki_values{oid};
 		}
@@ -680,8 +690,8 @@ close $bki;
 close $schemapg;
 
 # Finally, rename the completed files into place.
-Catalog::RenameTempFile($bkifile,     $tmpext);
-Catalog::RenameTempFile($schemafile,  $tmpext);
+Catalog::RenameTempFile($bkifile,    $tmpext);
+Catalog::RenameTempFile($schemafile, $tmpext);
 
 exit 0;
 
@@ -714,8 +724,8 @@ sub gen_pg_attribute
 		push @tables_needing_macros, $table_name;
 
 		# Generate entries for user attributes.
-		my $attnum       = 0;
-		my $priornotnull = 1;
+		my $attnum          = 0;
+		my $priorfixedwidth = 1;
 		foreach my $attr (@{ $table->{columns} })
 		{
 			$attnum++;
@@ -723,8 +733,12 @@ sub gen_pg_attribute
 			$row{attnum}   = $attnum;
 			$row{attrelid} = $table->{relation_oid};
 
-			morph_row_for_pgattr(\%row, $schema, $attr, $priornotnull);
-			$priornotnull &= ($row{attnotnull} eq 't');
+			morph_row_for_pgattr(\%row, $schema, $attr, $priorfixedwidth);
+
+			# Update $priorfixedwidth --- must match morph_row_for_pgattr
+			$priorfixedwidth &=
+			  ($row{attnotnull} eq 't'
+				  && ($row{attlen} eq 'NAMEDATALEN' || $row{attlen} > 0));
 
 			# If it's bootstrapped, put an entry in postgres.bki.
 			print_bki_insert(\%row, $schema) if $table->{bootstrap};
@@ -766,13 +780,13 @@ sub gen_pg_attribute
 
 # Given $pgattr_schema (the pg_attribute schema for a catalog sufficient for
 # AddDefaultValues), $attr (the description of a catalog row), and
-# $priornotnull (whether all prior attributes in this catalog are not null),
+# $priorfixedwidth (all prior columns are fixed-width and not null),
 # modify the $row hashref for print_bki_insert.  This includes setting data
 # from the corresponding pg_type element and filling in any default values.
 # Any value not handled here must be supplied by caller.
 sub morph_row_for_pgattr
 {
-	my ($row, $pgattr_schema, $attr, $priornotnull) = @_;
+	my ($row, $pgattr_schema, $attr, $priorfixedwidth) = @_;
 	my $attname = $attr->{name};
 	my $atttype = $attr->{type};
 
@@ -802,19 +816,18 @@ sub morph_row_for_pgattr
 	{
 		$row->{attnotnull} = 'f';
 	}
-	elsif ($priornotnull)
+	elsif ($priorfixedwidth)
 	{
 
 		# attnotnull will automatically be set if the type is
-		# fixed-width and prior columns are all NOT NULL ---
-		# compare DefineAttr in bootstrap.c. oidvector and
-		# int2vector are also treated as not-nullable.
+		# fixed-width and prior columns are likewise fixed-width
+		# and NOT NULL --- compare DefineAttr in bootstrap.c.
+		# At this point the width of type name is still symbolic,
+		# so we need a special test.
 		$row->{attnotnull} =
-		    $type->{typname} eq 'oidvector'  ? 't'
-		  : $type->{typname} eq 'int2vector' ? 't'
-		  : $type->{typlen} eq 'NAMEDATALEN' ? 't'
-		  : $type->{typlen} > 0              ? 't'
-		  :                                    'f';
+		    $row->{attlen} eq 'NAMEDATALEN' ? 't'
+		  : $row->{attlen} > 0              ? 't'
+		  :                                   'f';
 	}
 	else
 	{
@@ -843,17 +856,15 @@ sub print_bki_insert
 		# since that represents a NUL char in C code.
 		$bki_value = '' if $bki_value eq '\0';
 
-		# Handle single quotes by doubling them, and double quotes by
-		# converting them to octal escapes, because that's what the
+		# Handle single quotes by doubling them, because that's what the
 		# bootstrap scanner requires.  We do not process backslashes
 		# specially; this allows escape-string-style backslash escapes
 		# to be used in catalog data.
 		$bki_value =~ s/'/''/g;
-		$bki_value =~ s/"/\\042/g;
 
 		# Quote value if needed.  We need not quote values that satisfy
 		# the "id" pattern in bootscanner.l, currently "[-A-Za-z0-9_]+".
-		$bki_value = sprintf(qq'"%s"', $bki_value)
+		$bki_value = sprintf("'%s'", $bki_value)
 		  if length($bki_value) == 0
 		  or $bki_value =~ /[^-A-Za-z0-9_]/;
 

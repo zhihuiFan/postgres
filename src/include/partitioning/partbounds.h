@@ -12,10 +12,10 @@
 #define PARTBOUNDS_H
 
 #include "fmgr.h"
-#include "nodes/parsenodes.h"
-#include "nodes/pg_list.h"
+#include "parser/parse_node.h"
 #include "partitioning/partdefs.h"
-#include "utils/relcache.h"
+
+struct RelOptInfo;				/* avoid including pathnodes.h here */
 
 
 /*
@@ -87,9 +87,18 @@ extern bool partition_bounds_equal(int partnatts, int16 *parttyplen,
 								   PartitionBoundInfo b2);
 extern PartitionBoundInfo partition_bounds_copy(PartitionBoundInfo src,
 												PartitionKey key);
+extern PartitionBoundInfo partition_bounds_merge(int partnatts,
+												 FmgrInfo *partsupfunc,
+												 Oid *partcollation,
+												 struct RelOptInfo *outer_rel,
+												 struct RelOptInfo *inner_rel,
+												 JoinType jointype,
+												 List **outer_parts,
+												 List **inner_parts);
 extern bool partitions_are_ordered(PartitionBoundInfo boundinfo, int nparts);
 extern void check_new_partition_bound(char *relname, Relation parent,
-									  PartitionBoundSpec *spec);
+									  PartitionBoundSpec *spec,
+									  ParseState *pstate);
 extern void check_default_partition_contents(Relation parent,
 											 Relation defaultRel,
 											 PartitionBoundSpec *new_spec);

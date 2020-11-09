@@ -41,6 +41,7 @@ ginhandler(PG_FUNCTION_ARGS)
 
 	amroutine->amstrategies = 0;
 	amroutine->amsupport = GINNProcs;
+	amroutine->amoptsprocnum = GIN_OPTIONS_PROC;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = false;
 	amroutine->amcanbackward = false;
@@ -70,6 +71,7 @@ ginhandler(PG_FUNCTION_ARGS)
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;
 	amroutine->amvalidate = ginvalidate;
+	amroutine->amadjustmembers = ginadjustmembers;
 	amroutine->ambeginscan = ginbeginscan;
 	amroutine->amrescan = ginrescan;
 	amroutine->amgettuple = NULL;

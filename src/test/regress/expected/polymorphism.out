@@ -729,10 +729,10 @@ select q2, sql_if(q2 > 0, q2, q2 + 1) from int8_tbl;
 (5 rows)
 
 -- another sort of polymorphic aggregate
-CREATE AGGREGATE array_cat_accum (anyarray)
+CREATE AGGREGATE array_cat_accum (anycompatiblearray)
 (
     sfunc = array_cat,
-    stype = anyarray,
+    stype = anycompatiblearray,
     initcond = '{}'
 );
 SELECT array_cat_accum(i)
@@ -786,16 +786,16 @@ create aggregate build_group(int8, integer) (
   STYPE = int8[]
 );
 -- check proper resolution of data types for polymorphic transfn/finalfn
-create function first_el(anyarray) returns anyelement as
+create function first_el(anycompatiblearray) returns anycompatible as
 'select $1[1]' language sql strict immutable;
 create aggregate first_el_agg_f8(float8) (
   SFUNC = array_append,
   STYPE = float8[],
   FINALFUNC = first_el
 );
-create aggregate first_el_agg_any(anyelement) (
+create aggregate first_el_agg_any(anycompatible) (
   SFUNC = array_append,
-  STYPE = anyarray,
+  STYPE = anycompatiblearray,
   FINALFUNC = first_el
 );
 select first_el_agg_f8(x::float8) from generate_series(1,10) x;
@@ -852,6 +852,19 @@ where histogram_bounds is not null;
 -- (WHERE clause here is to avoid possibly getting a collation error instead)
 select max(histogram_bounds) from pg_stats where tablename = 'pg_am';
 ERROR:  cannot compare arrays of different element types
+-- another corner case is the input functions for polymorphic pseudotypes
+select array_in('{1,2,3}','int4'::regtype,-1);  -- this has historically worked
+ array_in 
+----------
+ {1,2,3}
+(1 row)
+
+select * from array_in('{1,2,3}','int4'::regtype,-1);  -- this not
+ERROR:  function "array_in" in FROM has unsupported return type anyarray
+LINE 1: select * from array_in('{1,2,3}','int4'::regtype,-1);
+                      ^
+select anyrange_in('[10,20)','int4range'::regtype,-1);
+ERROR:  cannot accept a value of type anyrange
 -- test variadic polymorphic functions
 create function myleast(variadic anyarray) returns anyelement as $$
   select min($1[i]) from generate_subscripts($1,1) g(i)

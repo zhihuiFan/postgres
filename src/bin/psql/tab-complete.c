@@ -45,6 +45,7 @@
 
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_class_d.h"
+#include "catalog/pg_collation_d.h"
 #include "common.h"
 #include "libpq-fe.h"
 #include "pqexpbuffer.h"
@@ -330,6 +331,9 @@ do { \
 
 /*
  * Assembly instructions for schema queries
+ *
+ * Note that toast tables are not included in those queries to avoid
+ * unnecessary bloat in the completions generated.
  */
 
 static const SchemaQuery Query_for_list_of_aggregates[] = {
@@ -573,8 +577,14 @@ static const SchemaQuery Query_for_list_of_indexables = {
 	.result = "pg_catalog.quote_ident(c.relname)",
 };
 
-/* Relations supporting VACUUM */
-static const SchemaQuery Query_for_list_of_vacuumables = {
+/*
+ * Relations supporting VACUUM are currently same as those supporting
+ * indexing.
+ */
+#define Query_for_list_of_vacuumables Query_for_list_of_indexables
+
+/* Relations supporting CLUSTER */
+static const SchemaQuery Query_for_list_of_clusterables = {
 	.catname = "pg_catalog.pg_class c",
 	.selcondition =
 	"c.relkind IN (" CppAsString2(RELKIND_RELATION) ", "
@@ -583,9 +593,6 @@ static const SchemaQuery Query_for_list_of_vacuumables = {
 	.namespace = "c.relnamespace",
 	.result = "pg_catalog.quote_ident(c.relname)",
 };
-
-/* Relations supporting CLUSTER are currently same as those supporting VACUUM */
-#define Query_for_list_of_clusterables Query_for_list_of_vacuumables
 
 static const SchemaQuery Query_for_list_of_constraints_with_schema = {
 	.catname = "pg_catalog.pg_constraint c",
@@ -813,6 +820,20 @@ static const SchemaQuery Query_for_list_of_statistics = {
 "   AND oid IN "\
 "       (SELECT tgrelid FROM pg_catalog.pg_trigger "\
 "         WHERE pg_catalog.quote_ident(tgname)='%s')"
+
+/* the silly-looking length condition is just to eat up the current word */
+#define Query_for_list_of_colls_for_one_index \
+" SELECT DISTINCT pg_catalog.quote_ident(coll.collname) " \
+"   FROM pg_catalog.pg_depend d, pg_catalog.pg_collation coll, " \
+"     pg_catalog.pg_class c" \
+" WHERE (%d = pg_catalog.length('%s'))" \
+"   AND d.refclassid = " CppAsString2(CollationRelationId) \
+"   AND d.refobjid = coll.oid " \
+"   AND d.classid = " CppAsString2(RelationRelationId) \
+"   AND d.objid = c.oid " \
+"   AND c.relkind = " CppAsString2(RELKIND_INDEX) \
+"   AND pg_catalog.pg_table_is_visible(c.oid) " \
+"   AND c.relname = '%s'"
 
 #define Query_for_list_of_ts_configurations \
 "SELECT pg_catalog.quote_ident(cfgname) FROM pg_catalog.pg_ts_config "\
@@ -1078,6 +1099,8 @@ static const char *const table_storage_parameters[] = {
 	"autovacuum_multixact_freeze_table_age",
 	"autovacuum_vacuum_cost_delay",
 	"autovacuum_vacuum_cost_limit",
+	"autovacuum_vacuum_insert_scale_factor",
+	"autovacuum_vacuum_insert_threshold",
 	"autovacuum_vacuum_scale_factor",
 	"autovacuum_vacuum_threshold",
 	"fillfactor",
@@ -1092,6 +1115,8 @@ static const char *const table_storage_parameters[] = {
 	"toast.autovacuum_multixact_freeze_table_age",
 	"toast.autovacuum_vacuum_cost_delay",
 	"toast.autovacuum_vacuum_cost_limit",
+	"toast.autovacuum_vacuum_insert_scale_factor",
+	"toast.autovacuum_vacuum_insert_threshold",
 	"toast.autovacuum_vacuum_scale_factor",
 	"toast.autovacuum_vacuum_threshold",
 	"toast.log_autovacuum_min_duration",
@@ -1705,14 +1730,15 @@ psql_completion(const char *text, int start, int end)
 	/* ALTER INDEX <name> */
 	else if (Matches("ALTER", "INDEX", MatchAny))
 		COMPLETE_WITH("ALTER COLUMN", "OWNER TO", "RENAME TO", "SET",
-					  "RESET", "ATTACH PARTITION");
+					  "RESET", "ATTACH PARTITION", "DEPENDS", "NO DEPENDS",
+					  "ALTER COLLATION");
 	else if (Matches("ALTER", "INDEX", MatchAny, "ATTACH"))
 		COMPLETE_WITH("PARTITION");
 	else if (Matches("ALTER", "INDEX", MatchAny, "ATTACH", "PARTITION"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexes, NULL);
 	/* ALTER INDEX <name> ALTER */
 	else if (Matches("ALTER", "INDEX", MatchAny, "ALTER"))
-		COMPLETE_WITH("COLUMN");
+		COMPLETE_WITH("COLLATION", "COLUMN");
 	/* ALTER INDEX <name> ALTER COLUMN */
 	else if (Matches("ALTER", "INDEX", MatchAny, "ALTER", "COLUMN"))
 	{
@@ -1739,18 +1765,31 @@ psql_completion(const char *text, int start, int end)
 	/* ALTER INDEX <foo> SET|RESET ( */
 	else if (Matches("ALTER", "INDEX", MatchAny, "RESET", "("))
 		COMPLETE_WITH("fillfactor",
-					  "vacuum_cleanup_index_scale_factor", "deduplicate_items",	/* BTREE */
+					  "vacuum_cleanup_index_scale_factor", "deduplicate_items", /* BTREE */
 					  "fastupdate", "gin_pending_list_limit",	/* GIN */
 					  "buffering",	/* GiST */
 					  "pages_per_range", "autosummarize"	/* BRIN */
 			);
 	else if (Matches("ALTER", "INDEX", MatchAny, "SET", "("))
 		COMPLETE_WITH("fillfactor =",
-					  "vacuum_cleanup_index_scale_factor =", "deduplicate_items =",	/* BTREE */
+					  "vacuum_cleanup_index_scale_factor =", "deduplicate_items =", /* BTREE */
 					  "fastupdate =", "gin_pending_list_limit =",	/* GIN */
 					  "buffering =",	/* GiST */
 					  "pages_per_range =", "autosummarize ="	/* BRIN */
 			);
+	else if (Matches("ALTER", "INDEX", MatchAny, "NO", "DEPENDS"))
+		COMPLETE_WITH("ON EXTENSION");
+	else if (Matches("ALTER", "INDEX", MatchAny, "DEPENDS"))
+		COMPLETE_WITH("ON EXTENSION");
+	/* ALTER INDEX <name> ALTER COLLATION */
+	else if (Matches("ALTER", "INDEX", MatchAny, "ALTER", "COLLATION"))
+	{
+		completion_info_charp = prev3_wd;
+		COMPLETE_WITH_QUERY(Query_for_list_of_colls_for_one_index);
+	}
+	/* ALTER INDEX <name> ALTER COLLATION <name> */
+	else if (Matches("ALTER", "INDEX", MatchAny, "ALTER", "COLLATION", MatchAny))
+		COMPLETE_WITH("REFRESH VERSION");
 
 	/* ALTER LANGUAGE <name> */
 	else if (Matches("ALTER", "LANGUAGE", MatchAny))
@@ -1960,10 +1999,10 @@ psql_completion(const char *text, int start, int end)
 	 */
 	else if (Matches("ALTER", "TABLE", MatchAny))
 		COMPLETE_WITH("ADD", "ALTER", "CLUSTER ON", "DISABLE", "DROP",
-					  "ENABLE", "INHERIT", "NO INHERIT", "RENAME", "RESET",
+					  "ENABLE", "INHERIT", "NO", "RENAME", "RESET",
 					  "OWNER TO", "SET", "VALIDATE CONSTRAINT",
 					  "REPLICA IDENTITY", "ATTACH PARTITION",
-					  "DETACH PARTITION");
+					  "DETACH PARTITION", "FORCE ROW LEVEL SECURITY");
 	/* ALTER TABLE xxx ENABLE */
 	else if (Matches("ALTER", "TABLE", MatchAny, "ENABLE"))
 		COMPLETE_WITH("ALWAYS", "REPLICA", "ROW LEVEL SECURITY", "RULE",
@@ -1993,6 +2032,9 @@ psql_completion(const char *text, int start, int end)
 	/* ALTER TABLE xxx INHERIT */
 	else if (Matches("ALTER", "TABLE", MatchAny, "INHERIT"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables, "");
+	/* ALTER TABLE xxx NO */
+	else if (Matches("ALTER", "TABLE", MatchAny, "NO"))
+		COMPLETE_WITH("FORCE ROW LEVEL SECURITY", "INHERIT");
 	/* ALTER TABLE xxx NO INHERIT */
 	else if (Matches("ALTER", "TABLE", MatchAny, "NO", "INHERIT"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables, "");
@@ -2308,19 +2350,14 @@ psql_completion(const char *text, int start, int end)
 	else if (Matches("COPY|\\copy"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables,
 								   " UNION ALL SELECT '('");
-	/* If we have COPY BINARY, complete with list of tables */
-	else if (Matches("COPY", "BINARY"))
-		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_tables, NULL);
-	/* If we have COPY (, complete it with legal commands */
+	/* Complete COPY ( with legal query commands */
 	else if (Matches("COPY|\\copy", "("))
 		COMPLETE_WITH("SELECT", "TABLE", "VALUES", "INSERT", "UPDATE", "DELETE", "WITH");
-	/* If we have COPY [BINARY] <sth>, complete it with "TO" or "FROM" */
-	else if (Matches("COPY|\\copy", MatchAny) ||
-			 Matches("COPY", "BINARY", MatchAny))
+	/* Complete COPY <sth> */
+	else if (Matches("COPY|\\copy", MatchAny))
 		COMPLETE_WITH("FROM", "TO");
-	/* If we have COPY [BINARY] <sth> FROM|TO, complete with filename */
-	else if (Matches("COPY", MatchAny, "FROM|TO") ||
-			 Matches("COPY", "BINARY", MatchAny, "FROM|TO"))
+	/* Complete COPY <sth> FROM|TO with filename */
+	else if (Matches("COPY", MatchAny, "FROM|TO"))
 	{
 		completion_charp = "";
 		completion_force_quote = true;	/* COPY requires quoted filename */
@@ -2332,17 +2369,28 @@ psql_completion(const char *text, int start, int end)
 		completion_force_quote = false;
 		matches = rl_completion_matches(text, complete_from_files);
 	}
-	/* Offer options after COPY [BINARY] <sth> FROM|TO filename */
-	else if (Matches("COPY|\\copy", MatchAny, "FROM|TO", MatchAny) ||
-			 Matches("COPY", "BINARY", MatchAny, "FROM|TO", MatchAny))
-		COMPLETE_WITH("BINARY", "DELIMITER", "NULL", "CSV",
-					  "ENCODING");
 
-	/* Offer options after COPY [BINARY] <sth> FROM|TO filename CSV */
-	else if (Matches("COPY|\\copy", MatchAny, "FROM|TO", MatchAny, "CSV") ||
-			 Matches("COPY", "BINARY", MatchAny, "FROM|TO", MatchAny, "CSV"))
-		COMPLETE_WITH("HEADER", "QUOTE", "ESCAPE", "FORCE QUOTE",
-					  "FORCE NOT NULL");
+	/* Complete COPY <sth> TO <sth> */
+	else if (Matches("COPY|\\copy", MatchAny, "TO", MatchAny))
+		COMPLETE_WITH("WITH (");
+
+	/* Complete COPY <sth> FROM <sth> */
+	else if (Matches("COPY|\\copy", MatchAny, "FROM", MatchAny))
+		COMPLETE_WITH("WITH (", "WHERE");
+
+	/* Complete COPY <sth> FROM|TO filename WITH ( */
+	else if (Matches("COPY|\\copy", MatchAny, "FROM|TO", MatchAny, "WITH", "("))
+		COMPLETE_WITH("FORMAT", "FREEZE", "DELIMITER", "NULL",
+					  "HEADER", "QUOTE", "ESCAPE", "FORCE_QUOTE",
+					  "FORCE_NOT_NULL", "FORCE_NULL", "ENCODING");
+
+	/* Complete COPY <sth> FROM|TO filename WITH (FORMAT */
+	else if (Matches("COPY|\\copy", MatchAny, "FROM|TO", MatchAny, "WITH", "(", "FORMAT"))
+		COMPLETE_WITH("binary", "csv", "text");
+
+	/* Complete COPY <sth> FROM <sth> WITH (<options>) */
+	else if (Matches("COPY|\\copy", MatchAny, "FROM", MatchAny, "WITH", MatchAny))
+		COMPLETE_WITH("WHERE");
 
 	/* CREATE ACCESS METHOD */
 	/* Complete "CREATE ACCESS METHOD <name>" */
@@ -2891,7 +2939,8 @@ psql_completion(const char *text, int start, int end)
 
 /* DEALLOCATE */
 	else if (Matches("DEALLOCATE"))
-		COMPLETE_WITH_QUERY(Query_for_list_of_prepared_statements);
+		COMPLETE_WITH_QUERY(Query_for_list_of_prepared_statements
+							" UNION SELECT 'ALL'");
 
 /* DECLARE */
 	else if (Matches("DECLARE", MatchAny))
@@ -3041,8 +3090,8 @@ psql_completion(const char *text, int start, int end)
 		 */
 		if (ends_with(prev_wd, '(') || ends_with(prev_wd, ','))
 			COMPLETE_WITH("ANALYZE", "VERBOSE", "COSTS", "SETTINGS",
-						  "BUFFERS", "TIMING", "SUMMARY", "FORMAT");
-		else if (TailMatches("ANALYZE|VERBOSE|COSTS|SETTINGS|BUFFERS|TIMING|SUMMARY"))
+						  "BUFFERS", "WAL", "TIMING", "SUMMARY", "FORMAT");
+		else if (TailMatches("ANALYZE|VERBOSE|COSTS|SETTINGS|BUFFERS|WAL|TIMING|SUMMARY"))
 			COMPLETE_WITH("ON", "OFF");
 		else if (TailMatches("FORMAT"))
 			COMPLETE_WITH("TEXT", "XML", "JSON", "YAML");
@@ -3056,19 +3105,27 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH("SELECT", "INSERT", "DELETE", "UPDATE", "DECLARE");
 
 /* FETCH && MOVE */
-	/* Complete FETCH with one of FORWARD, BACKWARD, RELATIVE */
-	else if (Matches("FETCH|MOVE"))
-		COMPLETE_WITH("ABSOLUTE", "BACKWARD", "FORWARD", "RELATIVE");
-	/* Complete FETCH <sth> with one of ALL, NEXT, PRIOR */
-	else if (Matches("FETCH|MOVE", MatchAny))
-		COMPLETE_WITH("ALL", "NEXT", "PRIOR");
 
 	/*
-	 * Complete FETCH <sth1> <sth2> with "FROM" or "IN". These are equivalent,
+	 * Complete FETCH with one of ABSOLUTE, BACKWARD, FORWARD, RELATIVE, ALL,
+	 * NEXT, PRIOR, FIRST, LAST
+	 */
+	else if (Matches("FETCH|MOVE"))
+		COMPLETE_WITH("ABSOLUTE", "BACKWARD", "FORWARD", "RELATIVE",
+					  "ALL", "NEXT", "PRIOR", "FIRST", "LAST");
+
+	/* Complete FETCH BACKWARD or FORWARD with one of ALL, FROM, IN */
+	else if (Matches("FETCH|MOVE", "BACKWARD|FORWARD"))
+		COMPLETE_WITH("ALL", "FROM", "IN");
+
+	/*
+	 * Complete FETCH <direction> with "FROM" or "IN". These are equivalent,
 	 * but we may as well tab-complete both: perhaps some users prefer one
 	 * variant or the other.
 	 */
-	else if (Matches("FETCH|MOVE", MatchAny, MatchAny))
+	else if (Matches("FETCH|MOVE", "ABSOLUTE|BACKWARD|FORWARD|RELATIVE",
+					 MatchAnyExcept("FROM|IN")) ||
+			 Matches("FETCH|MOVE", "ALL|NEXT|PRIOR|FIRST|LAST"))
 		COMPLETE_WITH("FROM", "IN");
 
 /* FOREIGN DATA WRAPPER */
@@ -3273,6 +3330,17 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH("FOREIGN SCHEMA");
 	else if (Matches("IMPORT", "FOREIGN"))
 		COMPLETE_WITH("SCHEMA");
+	else if (Matches("IMPORT", "FOREIGN", "SCHEMA", MatchAny))
+		COMPLETE_WITH("EXCEPT (", "FROM SERVER", "LIMIT TO (");
+	else if (TailMatches("LIMIT", "TO", "(*)") ||
+			 TailMatches("EXCEPT", "(*)"))
+		COMPLETE_WITH("FROM SERVER");
+	else if (TailMatches("FROM", "SERVER", MatchAny))
+		COMPLETE_WITH("INTO");
+	else if (TailMatches("FROM", "SERVER", MatchAny, "INTO"))
+		COMPLETE_WITH_QUERY(Query_for_list_of_schemas);
+	else if (TailMatches("FROM", "SERVER", MatchAny, "INTO", MatchAny))
+		COMPLETE_WITH("OPTIONS (");
 
 /* INSERT --- can be inside EXPLAIN, RULE, etc */
 	/* Complete INSERT with "INTO" */
@@ -3410,28 +3478,48 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH("DATA");
 
 /* REINDEX */
-	else if (Matches("REINDEX"))
+	else if (Matches("REINDEX") ||
+			 Matches("REINDEX", "(*)"))
 		COMPLETE_WITH("TABLE", "INDEX", "SYSTEM", "SCHEMA", "DATABASE");
-	else if (Matches("REINDEX", "TABLE"))
+	else if (Matches("REINDEX", "TABLE") ||
+			 Matches("REINDEX", "(*)", "TABLE"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexables,
 								   " UNION SELECT 'CONCURRENTLY'");
-	else if (Matches("REINDEX", "INDEX"))
+	else if (Matches("REINDEX", "INDEX") ||
+			 Matches("REINDEX", "(*)", "INDEX"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexes,
 								   " UNION SELECT 'CONCURRENTLY'");
-	else if (Matches("REINDEX", "SCHEMA"))
+	else if (Matches("REINDEX", "SCHEMA") ||
+			 Matches("REINDEX", "(*)", "SCHEMA"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_schemas
 							" UNION SELECT 'CONCURRENTLY'");
-	else if (Matches("REINDEX", "SYSTEM|DATABASE"))
+	else if (Matches("REINDEX", "SYSTEM|DATABASE") ||
+			 Matches("REINDEX", "(*)", "SYSTEM|DATABASE"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_databases
 							" UNION SELECT 'CONCURRENTLY'");
-	else if (Matches("REINDEX", "TABLE", "CONCURRENTLY"))
+	else if (Matches("REINDEX", "TABLE", "CONCURRENTLY") ||
+			 Matches("REINDEX", "(*)", "TABLE", "CONCURRENTLY"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexables, NULL);
-	else if (Matches("REINDEX", "INDEX", "CONCURRENTLY"))
+	else if (Matches("REINDEX", "INDEX", "CONCURRENTLY") ||
+			 Matches("REINDEX", "(*)", "INDEX", "CONCURRENTLY"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_indexes, NULL);
-	else if (Matches("REINDEX", "SCHEMA", "CONCURRENTLY"))
+	else if (Matches("REINDEX", "SCHEMA", "CONCURRENTLY") ||
+			 Matches("REINDEX", "(*)", "SCHEMA", "CONCURRENTLY"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_schemas);
-	else if (Matches("REINDEX", "SYSTEM|DATABASE", "CONCURRENTLY"))
+	else if (Matches("REINDEX", "SYSTEM|DATABASE", "CONCURRENTLY") ||
+			 Matches("REINDEX", "(*)", "SYSTEM|DATABASE", "CONCURRENTLY"))
 		COMPLETE_WITH_QUERY(Query_for_list_of_databases);
+	else if (HeadMatches("REINDEX", "(*") &&
+			 !HeadMatches("REINDEX", "(*)"))
+	{
+		/*
+		 * This fires if we're in an unfinished parenthesized option list.
+		 * get_previous_words treats a completed parenthesized option list as
+		 * one word, so the above test is correct.
+		 */
+		if (ends_with(prev_wd, '(') || ends_with(prev_wd, ','))
+			COMPLETE_WITH("VERBOSE");
+	}
 
 /* SECURITY LABEL */
 	else if (Matches("SECURITY"))
@@ -3882,7 +3970,7 @@ psql_completion(const char *text, int start, int end)
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_routines, NULL);
 	else if (TailMatchesCS("\\sv*"))
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_list_of_views, NULL);
-	else if (TailMatchesCS("\\cd|\\e|\\edit|\\g|\\i|\\include|"
+	else if (TailMatchesCS("\\cd|\\e|\\edit|\\g|\\gx|\\i|\\include|"
 						   "\\ir|\\include_relative|\\o|\\out|"
 						   "\\s|\\w|\\write|\\lo_import"))
 	{
@@ -4183,7 +4271,7 @@ _complete_from_query(const char *simple_query,
 			 */
 			if (strcmp(schema_query->catname,
 					   "pg_catalog.pg_class c") == 0 &&
-				strncmp(text, "pg_", 3) !=0)
+				strncmp(text, "pg_", 3) != 0)
 			{
 				appendPQExpBufferStr(&query_buffer,
 									 " AND c.relnamespace <> (SELECT oid FROM"

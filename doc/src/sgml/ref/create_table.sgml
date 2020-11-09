@@ -171,8 +171,9 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       If specified, the table is created as a temporary table.
       Temporary tables are automatically dropped at the end of a
       session, or optionally at the end of the current transaction
-      (see <literal>ON COMMIT</literal> below).  Existing permanent
-      tables with the same name are not visible to the current session
+      (see <literal>ON COMMIT</literal> below).  The default
+      search_path includes the temporary schema first and so identically
+      named existing permanent tables are not chosen for new plans
       while the temporary table exists, unless they are referenced
       with schema-qualified names. Any indexes created on a temporary
       table are automatically temporary as well.
@@ -192,8 +193,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       can be written before <literal>TEMPORARY</literal> or <literal>TEMP</literal>.
       This presently makes no difference in <productname>PostgreSQL</productname>
       and is deprecated; see
-      <xref linkend="sql-createtable-compatibility"
-      endterm="sql-createtable-compatibility-title"/>.
+      <xref linkend="sql-createtable-compatibility"/> below.
      </para>
     </listitem>
    </varlistentry>
@@ -399,7 +399,9 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       Creates the table as a <firstterm>partition</firstterm> of the specified
       parent table. The table can be created either as a partition for specific
       values using <literal>FOR VALUES</literal> or as a default partition
-      using <literal>DEFAULT</literal>.
+      using <literal>DEFAULT</literal>.  Any indexes, constraints and
+      user-defined row-level triggers that exist in the parent table are cloned
+      on the new partition.
      </para>
 
      <para>
@@ -842,15 +844,27 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
 
      <para>
       The clauses <literal>ALWAYS</literal> and <literal>BY DEFAULT</literal>
-      determine how the sequence value is given precedence over a
-      user-specified value in an <command>INSERT</command> statement.
-      If <literal>ALWAYS</literal> is specified, a user-specified value is
-      only accepted if the <command>INSERT</command> statement
-      specifies <literal>OVERRIDING SYSTEM VALUE</literal>.  If <literal>BY
-      DEFAULT</literal> is specified, then the user-specified value takes
-      precedence.  See <xref linkend="sql-insert"/> for details.  (In
-      the <command>COPY</command> command, user-specified values are always
-      used regardless of this setting.)
+      determine how explicitly user-specified values are handled in
+      <command>INSERT</command> and <command>UPDATE</command> commands.
+     </para>
+
+     <para>
+      In an <command>INSERT</command> command, if <literal>ALWAYS</literal> is
+      selected, a user-specified value is only accepted if the
+      <command>INSERT</command> statement specifies <literal>OVERRIDING SYSTEM
+      VALUE</literal>.  If <literal>BY DEFAULT</literal> is selected, then the
+      user-specified value takes precedence.  See <xref linkend="sql-insert"/>
+      for details.  (In the <command>COPY</command> command, user-specified
+      values are always used regardless of this setting.)
+     </para>
+
+     <para>
+      In an <command>UPDATE</command> command, if <literal>ALWAYS</literal> is
+      selected, any update of the column to any value other than
+      <literal>DEFAULT</literal> will be rejected.  If <literal>BY
+      DEFAULT</literal> is selected, the column can be updated normally.
+      (There is no <literal>OVERRIDING</literal> clause for the
+      <command>UPDATE</command> command.)
      </para>
 
      <para>
@@ -901,7 +915,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       one or more columns on which the uniqueness is not enforced.
       Note that although the constraint is not enforced on the included columns,
       it still depends on them.  Consequently, some operations on these columns
-      (e.g. <literal>DROP COLUMN</literal>) can cause cascaded constraint and
+      (e.g., <literal>DROP COLUMN</literal>) can cause cascaded constraint and
       index deletion.
      </para>
     </listitem>
@@ -947,7 +961,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       of columns to be specified which will be included in the non-key portion
       of the index.  Although uniqueness is not enforced on the included columns,
       the constraint still depends on them. Consequently, some operations on the
-      included columns (e.g. <literal>DROP COLUMN</literal>) can cause cascaded
+      included columns (e.g., <literal>DROP COLUMN</literal>) can cause cascaded
       constraint and index deletion.
      </para>
     </listitem>
@@ -1139,7 +1153,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       constraint that is not deferrable will be checked immediately
       after every command.  Checking of constraints that are
       deferrable can be postponed until the end of the transaction
-      (using the <xref linkend="sql-set-constraints"/> command).
+      (using the <link linkend="sql-set-constraints"><command>SET CONSTRAINTS</command></link> command).
       <literal>NOT DEFERRABLE</literal> is the default.
       Currently, only <literal>UNIQUE</literal>, <literal>PRIMARY KEY</literal>,
       <literal>EXCLUDE</literal>, and
@@ -1163,7 +1177,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       statement. This is the default.  If the constraint is
       <literal>INITIALLY DEFERRED</literal>, it is checked only at the
       end of the transaction.  The constraint check time can be
-      altered with the <xref linkend="sql-set-constraints"/> command.
+      altered with the <link linkend="sql-set-constraints"><command>SET CONSTRAINTS</command></link> command.
      </para>
     </listitem>
    </varlistentry>
@@ -1187,8 +1201,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     <listitem>
      <para>
       This clause specifies optional storage parameters for a table or index;
-      see <xref linkend="sql-createtable-storage-parameters"
-      endterm="sql-createtable-storage-parameters-title"/> for more
+      see <xref linkend="sql-createtable-storage-parameters"/> below for more
       information.  For backward-compatibility the <literal>WITH</literal>
       clause for a table can also include <literal>OIDS=FALSE</literal> to
       specify that rows of the new table should not contain OIDs (object
@@ -1232,8 +1245,8 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
         <listitem>
          <para>
           All rows in the temporary table will be deleted at the end
-          of each transaction block.  Essentially, an automatic <xref
-          linkend="sql-truncate"/> is done
+          of each transaction block.  Essentially, an automatic <link
+          linkend="sql-truncate"><command>TRUNCATE</command></link> is done
           at each commit.  When used on a partitioned table, this
           is not cascaded to its partitions.
          </para>
@@ -1288,8 +1301,8 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
 
   </variablelist>
 
-  <refsect2 id="sql-createtable-storage-parameters">
-   <title id="sql-createtable-storage-parameters-title">Storage Parameters</title>
+  <refsect2 id="sql-createtable-storage-parameters" xreflabel="Storage Parameters">
+   <title>Storage Parameters</title>
 
  <indexterm zone="sql-createtable-storage-parameters">
   <primary>storage parameters</primary>
@@ -1347,13 +1360,14 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     <listitem>
      <para>
       The toast_tuple_target specifies the minimum tuple length required before
-      we try to move long column values into TOAST tables, and is also the
-      target length we try to reduce the length below once toasting begins.
-      This only affects columns marked as either External or Extended
-      and applies only to new tuples; there is no effect on existing rows.
+      we try to compress and/or move long column values into TOAST tables, and
+      is also the target length we try to reduce the length below once toasting
+      begins. This affects columns marked as External (for move),
+      Main (for compression), or Extended (for both) and applies only to new
+      tuples. There is no effect on existing rows.
       By default this parameter is set to allow at least 4 tuples per block,
-      which with the default blocksize will be 2040 bytes. Valid values are
-      between 128 bytes and the (blocksize - header), by default 8160 bytes.
+      which with the default block size will be 2040 bytes. Valid values are
+      between 128 bytes and the (block size - header), by default 8160 bytes.
       Changing this value may not be useful for very short or very long rows.
       Note that the default setting is often close to optimal, and
       it is possible that setting this parameter could have negative
@@ -1418,7 +1432,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       Disabling index cleanup can speed up <command>VACUUM</command> very
       significantly, but may also lead to severely bloated indexes if table
       modifications are frequent.  The <literal>INDEX_CLEANUP</literal>
-      parameter of <xref linkend="sql-vacuum"/>, if specified, overrides
+      parameter of <link linkend="sql-vacuum"><command>VACUUM</command></link>, if specified, overrides
       the value of this option.
      </para>
     </listitem>
@@ -1439,7 +1453,7 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       the truncated pages is returned to the operating system.
       Note that the truncation requires <literal>ACCESS EXCLUSIVE</literal>
       lock on the table. The <literal>TRUNCATE</literal> parameter
-      of <xref linkend="sql-vacuum"/>, if specified, overrides the value
+      of <link linkend="sql-vacuum"><command>VACUUM</command></link>, if specified, overrides the value
       of this option.
      </para>
     </listitem>
@@ -1470,6 +1484,36 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     <listitem>
      <para>
       Per-table value for <xref linkend="guc-autovacuum-vacuum-scale-factor"/>
+      parameter.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="reloption-autovacuum-vacuum-insert-threshold" xreflabel="autovacuum_vacuum_insert_threshold">
+    <term><literal>autovacuum_vacuum_insert_threshold</literal>, <literal>toast.autovacuum_vacuum_insert_threshold</literal> (<type>integer</type>)
+    <indexterm>
+     <primary><varname>autovacuum_vacuum_insert_threshold</varname></primary>
+     <secondary>storage parameter</secondary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Per-table value for <xref linkend="guc-autovacuum-vacuum-insert-threshold"/>
+      parameter.  The special value of -1 may be used to disable insert vacuums on the table.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="reloption-autovacuum-vacuum-insert-scale-factor" xreflabel="autovacuum_vacuum_insert_scale_factor">
+    <term><literal>autovacuum_vacuum_insert_scale_factor</literal>, <literal>toast.autovacuum_vacuum_insert_scale_factor</literal> (<type>float4</type>)
+    <indexterm>
+     <primary><varname>autovacuum_vacuum_insert_scale_factor</varname> </primary>
+     <secondary>storage parameter</secondary>
+    </indexterm>
+    </term>
+    <listitem>
+     <para>
+      Per-table value for <xref linkend="guc-autovacuum-vacuum-insert-scale-factor"/>
       parameter.
      </para>
     </listitem>
@@ -2019,8 +2063,8 @@ CREATE TABLE cities_partdef
 </programlisting></para>
  </refsect1>
 
- <refsect1 id="sql-createtable-compatibility">
-  <title id="sql-createtable-compatibility-title">Compatibility</title>
+ <refsect1 id="sql-createtable-compatibility" xreflabel="Compatibility">
+  <title>Compatibility</title>
 
   <para>
    The <command>CREATE TABLE</command> command conforms to the

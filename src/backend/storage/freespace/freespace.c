@@ -287,7 +287,8 @@ FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber nblocks)
 	{
 		buf = fsm_readbuf(rel, first_removed_address, false);
 		if (!BufferIsValid(buf))
-			return InvalidBlockNumber;	/* nothing to do; the FSM was already smaller */
+			return InvalidBlockNumber;	/* nothing to do; the FSM was already
+										 * smaller */
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
 		/* NO EREPORT(ERROR) from here till changes are logged */
@@ -317,7 +318,8 @@ FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber nblocks)
 	{
 		new_nfsmblocks = fsm_logical_to_physical(first_removed_address);
 		if (smgrnblocks(rel->rd_smgr, FSM_FORKNUM) <= new_nfsmblocks)
-			return InvalidBlockNumber;	/* nothing to do; the FSM was already smaller */
+			return InvalidBlockNumber;	/* nothing to do; the FSM was already
+										 * smaller */
 	}
 
 	return new_nfsmblocks;
@@ -539,18 +541,19 @@ fsm_readbuf(Relation rel, FSMAddress addr, bool extend)
 	 * value might be stale.  (We send smgr inval messages on truncation, but
 	 * not on extension.)
 	 */
-	if (rel->rd_smgr->smgr_fsm_nblocks == InvalidBlockNumber ||
-		blkno >= rel->rd_smgr->smgr_fsm_nblocks)
+	if (rel->rd_smgr->smgr_cached_nblocks[FSM_FORKNUM] == InvalidBlockNumber ||
+		blkno >= rel->rd_smgr->smgr_cached_nblocks[FSM_FORKNUM])
 	{
+		/* Invalidate the cache so smgrnblocks asks the kernel. */
+		rel->rd_smgr->smgr_cached_nblocks[FSM_FORKNUM] = InvalidBlockNumber;
 		if (smgrexists(rel->rd_smgr, FSM_FORKNUM))
-			rel->rd_smgr->smgr_fsm_nblocks = smgrnblocks(rel->rd_smgr,
-														 FSM_FORKNUM);
+			smgrnblocks(rel->rd_smgr, FSM_FORKNUM);
 		else
-			rel->rd_smgr->smgr_fsm_nblocks = 0;
+			rel->rd_smgr->smgr_cached_nblocks[FSM_FORKNUM] = 0;
 	}
 
 	/* Handle requests beyond EOF */
-	if (blkno >= rel->rd_smgr->smgr_fsm_nblocks)
+	if (blkno >= rel->rd_smgr->smgr_cached_nblocks[FSM_FORKNUM])
 	{
 		if (extend)
 			fsm_extend(rel, blkno + 1);
@@ -619,14 +622,17 @@ fsm_extend(Relation rel, BlockNumber fsm_nblocks)
 	RelationOpenSmgr(rel);
 
 	/*
-	 * Create the FSM file first if it doesn't exist.  If smgr_fsm_nblocks is
-	 * positive then it must exist, no need for an smgrexists call.
+	 * Create the FSM file first if it doesn't exist.  If
+	 * smgr_cached_nblocks[FSM_FORKNUM] is positive then it must exist, no
+	 * need for an smgrexists call.
 	 */
-	if ((rel->rd_smgr->smgr_fsm_nblocks == 0 ||
-		 rel->rd_smgr->smgr_fsm_nblocks == InvalidBlockNumber) &&
+	if ((rel->rd_smgr->smgr_cached_nblocks[FSM_FORKNUM] == 0 ||
+		 rel->rd_smgr->smgr_cached_nblocks[FSM_FORKNUM] == InvalidBlockNumber) &&
 		!smgrexists(rel->rd_smgr, FSM_FORKNUM))
 		smgrcreate(rel->rd_smgr, FSM_FORKNUM, false);
 
+	/* Invalidate cache so that smgrnblocks() asks the kernel. */
+	rel->rd_smgr->smgr_cached_nblocks[FSM_FORKNUM] = InvalidBlockNumber;
 	fsm_nblocks_now = smgrnblocks(rel->rd_smgr, FSM_FORKNUM);
 
 	while (fsm_nblocks_now < fsm_nblocks)
@@ -637,9 +643,6 @@ fsm_extend(Relation rel, BlockNumber fsm_nblocks)
 				   pg.data, false);
 		fsm_nblocks_now++;
 	}
-
-	/* Update local cache with the up-to-date size */
-	rel->rd_smgr->smgr_fsm_nblocks = fsm_nblocks_now;
 
 	UnlockRelationForExtension(rel, ExclusiveLock);
 }

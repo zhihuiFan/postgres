@@ -33,8 +33,18 @@ CATALOG(pg_subscription_rel,6102,SubscriptionRelRelationId)
 	Oid			srsubid;		/* Oid of subscription */
 	Oid			srrelid;		/* Oid of relation */
 	char		srsubstate;		/* state of the relation in subscription */
-	XLogRecPtr	srsublsn;		/* remote lsn of the state change used for
-								 * synchronization coordination */
+
+	/*
+	 * Although srsublsn is a fixed-width type, it is allowed to be NULL, so
+	 * we prevent direct C code access to it just as for a varlena field.
+	 */
+#ifdef CATALOG_VARLEN			/* variable-length fields start here */
+
+	XLogRecPtr	srsublsn BKI_FORCE_NULL;	/* remote LSN of the state change
+											 * used for synchronization
+											 * coordination, or NULL if not
+											 * valid */
+#endif
 } FormData_pg_subscription_rel;
 
 typedef FormData_pg_subscription_rel *Form_pg_subscription_rel;
@@ -70,8 +80,7 @@ extern void AddSubscriptionRelState(Oid subid, Oid relid, char state,
 									XLogRecPtr sublsn);
 extern void UpdateSubscriptionRelState(Oid subid, Oid relid, char state,
 									   XLogRecPtr sublsn);
-extern char GetSubscriptionRelState(Oid subid, Oid relid,
-									XLogRecPtr *sublsn, bool missing_ok);
+extern char GetSubscriptionRelState(Oid subid, Oid relid, XLogRecPtr *sublsn);
 extern void RemoveSubscriptionRel(Oid subid, Oid relid);
 
 extern List *GetSubscriptionRelations(Oid subid);

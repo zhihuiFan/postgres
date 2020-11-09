@@ -224,8 +224,8 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 				/*
 				 * Surprisingly, ALTER SYSTEM meets all our definitions of
 				 * read-only: it changes nothing that affects the output of
-				 * pg_dump, it doesn't write WAL or imperil the application
-				 * of future WAL, and it doesn't depend on any state that needs
+				 * pg_dump, it doesn't write WAL or imperil the application of
+				 * future WAL, and it doesn't depend on any state that needs
 				 * to be synchronized with parallel workers.
 				 *
 				 * So, despite the fact that it writes to a file, it's read
@@ -271,10 +271,10 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_VariableSetStmt:
 			{
 				/*
-				 * These modify only backend-local state, so they're OK to
-				 * run in a read-only transaction or on a standby. However,
-				 * they are disallowed in parallel mode, because they either
-				 * rely upon or modify backend-local state that might not be
+				 * These modify only backend-local state, so they're OK to run
+				 * in a read-only transaction or on a standby. However, they
+				 * are disallowed in parallel mode, because they either rely
+				 * upon or modify backend-local state that might not be
 				 * synchronized among cooperating backends.
 				 */
 				return COMMAND_OK_IN_RECOVERY | COMMAND_OK_IN_READ_ONLY_TXN;
@@ -285,8 +285,9 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_VacuumStmt:
 			{
 				/*
-				 * These commands write WAL, so they're not strictly read-only,
-				 * and running them in parallel workers isn't supported.
+				 * These commands write WAL, so they're not strictly
+				 * read-only, and running them in parallel workers isn't
+				 * supported.
 				 *
 				 * However, they don't change the database state in a way that
 				 * would affect pg_dump output, so it's fine to run them in a
@@ -299,11 +300,11 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 
 		case T_CopyStmt:
 			{
-				CopyStmt *stmt = (CopyStmt *) parsetree;
+				CopyStmt   *stmt = (CopyStmt *) parsetree;
 
 				/*
-				 * You might think that COPY FROM is not at all read only,
-				 * but it's OK to copy into a temporary table, because that
+				 * You might think that COPY FROM is not at all read only, but
+				 * it's OK to copy into a temporary table, because that
 				 * wouldn't change the output of pg_dump.  If the target table
 				 * turns out to be non-temporary, DoCopy itself will call
 				 * PreventCommandIfReadOnly.
@@ -318,8 +319,8 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 		case T_VariableShowStmt:
 			{
 				/*
-				 * These commands don't modify any data and are safe to run
-				 * in a parallel worker.
+				 * These commands don't modify any data and are safe to run in
+				 * a parallel worker.
 				 */
 				return COMMAND_IS_STRICTLY_READ_ONLY;
 			}
@@ -329,8 +330,8 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 			{
 				/*
 				 * NOTIFY requires an XID assignment, so it can't be permitted
-				 * on a standby. Perhaps LISTEN could, since without NOTIFY
-				 * it would be OK to just do nothing, at least until promotion,
+				 * on a standby. Perhaps LISTEN could, since without NOTIFY it
+				 * would be OK to just do nothing, at least until promotion,
 				 * but we currently prohibit it lest the user get the wrong
 				 * idea.
 				 *
@@ -342,11 +343,12 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 
 		case T_LockStmt:
 			{
-				LockStmt *stmt = (LockStmt *) parsetree;
+				LockStmt   *stmt = (LockStmt *) parsetree;
 
 				/*
 				 * Only weaker locker modes are allowed during recovery. The
-				 * restrictions here must match those in LockAcquireExtended().
+				 * restrictions here must match those in
+				 * LockAcquireExtended().
 				 */
 				if (stmt->mode > RowExclusiveLock)
 					return COMMAND_OK_IN_READ_ONLY_TXN;
@@ -359,10 +361,10 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 				TransactionStmt *stmt = (TransactionStmt *) parsetree;
 
 				/*
-				 * PREPARE, COMMIT PREPARED, and ROLLBACK PREPARED all
-				 * write WAL, so they're not read-only in the strict sense;
-				 * but the first and third do not change pg_dump output, so
-				 * they're OK in a read-only transactions.
+				 * PREPARE, COMMIT PREPARED, and ROLLBACK PREPARED all write
+				 * WAL, so they're not read-only in the strict sense; but the
+				 * first and third do not change pg_dump output, so they're OK
+				 * in a read-only transactions.
 				 *
 				 * We also consider COMMIT PREPARED to be OK in a read-only
 				 * transaction environment, by way of exception.
@@ -917,17 +919,19 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				ReindexStmt *stmt = (ReindexStmt *) parsetree;
 
-				if (stmt->concurrent)
+				if ((stmt->options & REINDEXOPT_CONCURRENTLY) != 0)
 					PreventInTransactionBlock(isTopLevel,
 											  "REINDEX CONCURRENTLY");
 
 				switch (stmt->kind)
 				{
 					case REINDEX_OBJECT_INDEX:
-						ReindexIndex(stmt->relation, stmt->options, stmt->concurrent);
+						ReindexIndex(stmt->relation, stmt->options,
+									 isTopLevel);
 						break;
 					case REINDEX_OBJECT_TABLE:
-						ReindexTable(stmt->relation, stmt->options, stmt->concurrent);
+						ReindexTable(stmt->relation, stmt->options,
+									 isTopLevel);
 						break;
 					case REINDEX_OBJECT_SCHEMA:
 					case REINDEX_OBJECT_SYSTEM:
@@ -943,7 +947,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 												  (stmt->kind == REINDEX_OBJECT_SCHEMA) ? "REINDEX SCHEMA" :
 												  (stmt->kind == REINDEX_OBJECT_SYSTEM) ? "REINDEX SYSTEM" :
 												  "REINDEX DATABASE");
-						ReindexMultipleTables(stmt->name, stmt->kind, stmt->options, stmt->concurrent);
+						ReindexMultipleTables(stmt->name, stmt->kind, stmt->options);
 						break;
 					default:
 						elog(ERROR, "unrecognized object type: %d",
@@ -1135,6 +1139,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				{
 					List	   *stmts;
 					ListCell   *l;
+					RangeVar   *table_rv = NULL;
 
 					/* Run parse analysis ... */
 					stmts = transformCreateStmt((CreateStmt *) parsetree,
@@ -1147,11 +1152,15 @@ ProcessUtilitySlow(ParseState *pstate,
 
 						if (IsA(stmt, CreateStmt))
 						{
+							CreateStmt *cstmt = (CreateStmt *) stmt;
 							Datum		toast_options;
 							static char *validnsps[] = HEAP_RELOPT_NAMESPACES;
 
+							/* Remember transformed RangeVar for LIKE */
+							table_rv = cstmt->relation;
+
 							/* Create the table itself */
-							address = DefineRelation((CreateStmt *) stmt,
+							address = DefineRelation(cstmt,
 													 RELKIND_RELATION,
 													 InvalidOid, NULL,
 													 queryString);
@@ -1170,7 +1179,7 @@ ProcessUtilitySlow(ParseState *pstate,
 							 * table
 							 */
 							toast_options = transformRelOptions((Datum) 0,
-																((CreateStmt *) stmt)->options,
+																cstmt->options,
 																"toast",
 																validnsps,
 																true,
@@ -1184,16 +1193,44 @@ ProcessUtilitySlow(ParseState *pstate,
 						}
 						else if (IsA(stmt, CreateForeignTableStmt))
 						{
+							CreateForeignTableStmt *cstmt = (CreateForeignTableStmt *) stmt;
+
+							/* Remember transformed RangeVar for LIKE */
+							table_rv = cstmt->base.relation;
+
 							/* Create the table itself */
-							address = DefineRelation((CreateStmt *) stmt,
+							address = DefineRelation(&cstmt->base,
 													 RELKIND_FOREIGN_TABLE,
 													 InvalidOid, NULL,
 													 queryString);
-							CreateForeignTable((CreateForeignTableStmt *) stmt,
+							CreateForeignTable(cstmt,
 											   address.objectId);
 							EventTriggerCollectSimpleCommand(address,
 															 secondaryObject,
 															 stmt);
+						}
+						else if (IsA(stmt, TableLikeClause))
+						{
+							/*
+							 * Do delayed processing of LIKE options.  This
+							 * will result in additional sub-statements for us
+							 * to process.  We can just tack those onto the
+							 * to-do list.
+							 */
+							TableLikeClause *like = (TableLikeClause *) stmt;
+							List	   *morestmts;
+
+							Assert(table_rv != NULL);
+
+							morestmts = expandTableLikeClause(table_rv, like);
+							stmts = list_concat(stmts, morestmts);
+
+							/*
+							 * We don't need a CCI now, besides which the "l"
+							 * list pointer is now possibly invalid, so just
+							 * skip the CCI test below.
+							 */
+							continue;
 						}
 						else
 						{
@@ -1403,6 +1440,7 @@ ProcessUtilitySlow(ParseState *pstate,
 					IndexStmt  *stmt = (IndexStmt *) parsetree;
 					Oid			relid;
 					LOCKMODE	lockmode;
+					bool		is_alter_table;
 
 					if (stmt->concurrent)
 						PreventInTransactionBlock(isTopLevel,
@@ -1464,6 +1502,17 @@ ProcessUtilitySlow(ParseState *pstate,
 						list_free(inheritors);
 					}
 
+					/*
+					 * If the IndexStmt is already transformed, it must have
+					 * come from generateClonedIndexStmt, which in current
+					 * usage means it came from expandTableLikeClause rather
+					 * than from original parse analysis.  And that means we
+					 * must treat it like ALTER TABLE ADD INDEX, not CREATE.
+					 * (This is a bit grotty, but currently it doesn't seem
+					 * worth adding a separate bool field for the purpose.)
+					 */
+					is_alter_table = stmt->transformed;
+
 					/* Run parse analysis ... */
 					stmt = transformIndexStmt(relid, stmt, queryString);
 
@@ -1475,7 +1524,7 @@ ProcessUtilitySlow(ParseState *pstate,
 									InvalidOid, /* no predefined OID */
 									InvalidOid, /* no parent index */
 									InvalidOid, /* no parent constraint */
-									false,	/* is_alter_table */
+									is_alter_table,
 									true,	/* check_rights */
 									true,	/* check_not_in_use */
 									false,	/* skip_build */
@@ -1791,10 +1840,6 @@ ProcessUtilitySlow(ParseState *pstate,
 
 			case T_AlterStatsStmt:
 				address = AlterStatistics((AlterStatsStmt *) parsetree);
-				break;
-
-			case T_AlterCollationStmt:
-				address = AlterCollation((AlterCollationStmt *) parsetree);
 				break;
 
 			default:
@@ -2572,7 +2617,7 @@ CreateCommandTag(Node *parsetree)
 			break;
 
 		case T_AlterTableStmt:
-			tag = AlterObjectTypeCommandTag(((AlterTableStmt *) parsetree)->relkind);
+			tag = AlterObjectTypeCommandTag(((AlterTableStmt *) parsetree)->objtype);
 			break;
 
 		case T_AlterDomainStmt:
@@ -2750,7 +2795,7 @@ CreateCommandTag(Node *parsetree)
 			break;
 
 		case T_CreateTableAsStmt:
-			switch (((CreateTableAsStmt *) parsetree)->relkind)
+			switch (((CreateTableAsStmt *) parsetree)->objtype)
 			{
 				case OBJECT_TABLE:
 					if (((CreateTableAsStmt *) parsetree)->is_select_into)
@@ -2942,10 +2987,6 @@ CreateCommandTag(Node *parsetree)
 
 		case T_DropSubscriptionStmt:
 			tag = CMDTAG_DROP_SUBSCRIPTION;
-			break;
-
-		case T_AlterCollationStmt:
-			tag = CMDTAG_ALTER_COLLATION;
 			break;
 
 		case T_PrepareStmt:
@@ -3557,10 +3598,6 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_AlterStatsStmt:
-			lev = LOGSTMT_DDL;
-			break;
-
-		case T_AlterCollationStmt:
 			lev = LOGSTMT_DDL;
 			break;
 

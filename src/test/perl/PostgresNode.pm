@@ -116,7 +116,7 @@ INIT
 
 	# Set PGHOST for backward compatibility.  This doesn't work for own_host
 	# nodes, so prefer to not rely on this when writing new tests.
-	$use_tcp            = $TestLib::windows_os;
+	$use_tcp            = !$TestLib::use_unix_sockets;
 	$test_localhost     = "127.0.0.1";
 	$last_host_assigned = 1;
 	$test_pghost        = $use_tcp ? $test_localhost : TestLib::tempdir_short;
@@ -387,7 +387,7 @@ sub set_replication_conf
 
 	open my $hba, '>>', "$pgdata/pg_hba.conf";
 	print $hba "\n# Allow replication (set up by PostgresNode.pm)\n";
-	if ($TestLib::windows_os)
+	if ($TestLib::windows_os && !$TestLib::use_unix_sockets)
 	{
 		print $hba
 		  "host replication all $test_localhost/32 sspi include_realm=1 map=regress\n";
@@ -469,13 +469,15 @@ sub init
 		{
 			print $conf "wal_level = replica\n";
 		}
-		print $conf "max_wal_senders = 5\n";
-		print $conf "max_replication_slots = 5\n";
-		print $conf "max_wal_size = 128MB\n";
-		print $conf "shared_buffers = 1MB\n";
+		print $conf "max_wal_senders = 10\n";
+		print $conf "max_replication_slots = 10\n";
 		print $conf "wal_log_hints = on\n";
 		print $conf "hot_standby = on\n";
+		# conservative settings to ensure we can run multiple postmasters:
+		print $conf "shared_buffers = 1MB\n";
 		print $conf "max_connections = 10\n";
+		# limit disk space consumption, too:
+		print $conf "max_wal_size = 128MB\n";
 	}
 	else
 	{
@@ -551,8 +553,10 @@ sub backup
 	my $name        = $self->name;
 
 	print "# Taking pg_basebackup $backup_name from node \"$name\"\n";
-	TestLib::system_or_bail('pg_basebackup', '-D', $backup_path, '-h',
-		$self->host, '-p', $self->port, '--no-sync');
+	TestLib::system_or_bail(
+		'pg_basebackup', '-D', $backup_path, '-h',
+		$self->host,     '-p', $self->port,  '--checkpoint',
+		'fast',          '--no-sync');
 	print "# Backup finished\n";
 	return;
 }
@@ -672,7 +676,7 @@ sub init_from_backup
 
 	$params{has_streaming} = 0 unless defined $params{has_streaming};
 	$params{has_restoring} = 0 unless defined $params{has_restoring};
-	$params{standby} = 1 unless defined $params{standby};
+	$params{standby}       = 1 unless defined $params{standby};
 
 	print
 	  "# Initializing node \"$node_name\" from backup \"$backup_name\" of node \"$root_name\"\n";
@@ -703,7 +707,8 @@ port = $port
 			"unix_socket_directories = '$host'");
 	}
 	$self->enable_streaming($root_node) if $params{has_streaming};
-	$self->enable_restoring($root_node, $params{standby}) if $params{has_restoring};
+	$self->enable_restoring($root_node, $params{standby})
+	  if $params{has_restoring};
 	return;
 }
 
@@ -1233,10 +1238,8 @@ sub can_bind
 	return $ret;
 }
 
-# Automatically shut down any still-running nodes when the test script exits.
-# Note that this just stops the postmasters (in the same order the nodes were
-# created in).  Any temporary directories are deleted, in an unspecified
-# order, later when the File::Temp objects are destroyed.
+# Automatically shut down any still-running nodes (in the same order the nodes
+# were created in) when the test script exits.
 END
 {
 
@@ -1323,7 +1326,6 @@ sub safe_psql
 		print "\n#### End standard error\n";
 	}
 
-	$stdout =~ s/\r//g if $TestLib::windows_os;
 	return $stdout;
 }
 
@@ -1385,6 +1387,12 @@ the B<timed_out> parameter is also given.
 If B<timeout> is set and this parameter is given, the scalar it references
 is set to true if the psql call times out.
 
+=item replication => B<value>
+
+If set, add B<replication=value> to the conninfo string.
+Passing the literal value C<database> results in a logical replication
+connection.
+
 =item extra_params => ['--single-transaction']
 
 If given, it must be an array reference containing additional parameters to B<psql>.
@@ -1413,10 +1421,17 @@ sub psql
 
 	my $stdout            = $params{stdout};
 	my $stderr            = $params{stderr};
+	my $replication       = $params{replication};
 	my $timeout           = undef;
 	my $timeout_exception = 'psql timed out';
-	my @psql_params =
-	  ('psql', '-XAtq', '-d', $self->connstr($dbname), '-f', '-');
+	my @psql_params       = (
+		'psql',
+		'-XAtq',
+		'-d',
+		$self->connstr($dbname)
+		  . (defined $replication ? " replication=$replication" : ""),
+		'-f',
+		'-');
 
 	# If the caller wants an array and hasn't passed stdout/stderr
 	# references, allocate temporary ones to capture them so we
@@ -1499,16 +1514,20 @@ sub psql
 		}
 	};
 
+	# Note: on Windows, IPC::Run seems to convert \r\n to \n in program output
+	# if we're using native Perl, but not if we're using MSys Perl.  So do it
+	# by hand in the latter case, here and elsewhere.
+
 	if (defined $$stdout)
 	{
+		$$stdout =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 		chomp $$stdout;
-		$$stdout =~ s/\r//g if $TestLib::windows_os;
 	}
 
 	if (defined $$stderr)
 	{
+		$$stderr =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 		chomp $$stderr;
-		$$stderr =~ s/\r//g if $TestLib::windows_os;
 	}
 
 	# See http://perldoc.perl.org/perlvar.html#%24CHILD_ERROR
@@ -1638,8 +1657,8 @@ sub poll_query_until
 	{
 		my $result = IPC::Run::run $cmd, '>', \$stdout, '2>', \$stderr;
 
+		$stdout =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 		chomp($stdout);
-		$stdout =~ s/\r//g if $TestLib::windows_os;
 
 		if ($stdout eq $expected)
 		{
@@ -1654,8 +1673,8 @@ sub poll_query_until
 
 	# The query result didn't change in 180 seconds. Give up. Print the
 	# output from the last attempt, hopefully that's useful for debugging.
+	$stderr =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 	chomp($stderr);
-	$stderr =~ s/\r//g if $TestLib::windows_os;
 	diag qq(poll_query_until timed out executing this query:
 $query
 expecting this output:
@@ -1808,11 +1827,11 @@ sub run_log
 
 Look up WAL locations on the server:
 
- * insert location (master only, error on replica)
- * write location (master only, error on replica)
- * flush location (master only, error on replica)
- * receive location (always undef on master)
- * replay location (always undef on master)
+ * insert location (primary only, error on replica)
+ * write location (primary only, error on replica)
+ * flush location (primary only, error on replica)
+ * receive location (always undef on primary)
+ * replay location (always undef on primary)
 
 mode must be specified.
 
@@ -1862,7 +1881,7 @@ poll_query_until timeout.
 
 Requires that the 'postgres' db exists and is accessible.
 
-target_lsn may be any arbitrary lsn, but is typically $master_node->lsn('insert').
+target_lsn may be any arbitrary lsn, but is typically $primary_node->lsn('insert').
 If omitted, pg_current_wal_lsn() is used.
 
 This is not a test. It die()s on failure.
@@ -1921,7 +1940,7 @@ This is not a test. It die()s on failure.
 
 If the slot is not active, will time out after poll_query_until's timeout.
 
-target_lsn may be any arbitrary lsn, but is typically $master_node->lsn('insert').
+target_lsn may be any arbitrary lsn, but is typically $primary_node->lsn('insert').
 
 Note that for logical slots, restart_lsn is held down by the oldest in-progress tx.
 
@@ -2099,8 +2118,8 @@ sub pg_recvlogical_upto
 		}
 	};
 
-	$stdout =~ s/\r//g if $TestLib::windows_os;
-	$stderr =~ s/\r//g if $TestLib::windows_os;
+	$stdout =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
+	$stderr =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 
 	if (wantarray)
 	{

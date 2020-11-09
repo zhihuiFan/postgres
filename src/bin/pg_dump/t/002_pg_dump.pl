@@ -524,6 +524,8 @@ my %tests = (
 						 FUNCTION 1 (int4, int4) btint4cmp(int4,int4),
 						 FUNCTION 2 (int4, int4) btint4sortsupport(internal),
 						 FUNCTION 4 (int4, int4) btequalimage(oid);',
+		# note: it's correct that btint8sortsupport and bigint btequalimage
+		# are included here:
 		regexp => qr/^
 			\QALTER OPERATOR FAMILY dump_test.op_family USING btree ADD\E\n\s+
 			\QOPERATOR 1 <(bigint,integer) ,\E\n\s+
@@ -532,7 +534,9 @@ my %tests = (
 			\QOPERATOR 4 >=(bigint,integer) ,\E\n\s+
 			\QOPERATOR 5 >(bigint,integer) ,\E\n\s+
 			\QFUNCTION 1 (integer, integer) btint4cmp(integer,integer) ,\E\n\s+
+			\QFUNCTION 2 (bigint, bigint) btint8sortsupport(internal) ,\E\n\s+
 			\QFUNCTION 2 (integer, integer) btint4sortsupport(internal) ,\E\n\s+
+			\QFUNCTION 4 (bigint, bigint) btequalimage(oid) ,\E\n\s+
 			\QFUNCTION 4 (integer, integer) btequalimage(oid);\E
 			/xm,
 		like =>
@@ -1378,7 +1382,7 @@ my %tests = (
 	'CREATE COLLATION test0 FROM "C"' => {
 		create_order => 76,
 		create_sql   => 'CREATE COLLATION test0 FROM "C";',
-		regexp       =>
+		regexp =>
 		  qr/CREATE COLLATION public.test0 \(provider = libc, locale = 'C'(, version = '[^']*')?\);/m,
 		collation => 1,
 		like      => { %full_runs, section_pre_data => 1, },
@@ -1411,8 +1415,9 @@ my %tests = (
 
 	"CREATE DATABASE dump_test2 LOCALE = 'C'" => {
 		create_order => 47,
-		create_sql   => "CREATE DATABASE dump_test2 LOCALE = 'C' TEMPLATE = template0;",
-		regexp       => qr/^
+		create_sql =>
+		  "CREATE DATABASE dump_test2 LOCALE = 'C' TEMPLATE = template0;",
+		regexp => qr/^
 			\QCREATE DATABASE dump_test2 \E.*\QLOCALE = 'C';\E
 			/xm,
 		like => { pg_dumpall_dbprivs => 1, },
@@ -1558,6 +1563,8 @@ my %tests = (
 						 FUNCTION 1 btint8cmp(bigint,bigint),
 						 FUNCTION 2 btint8sortsupport(internal),
 						 FUNCTION 4 btequalimage(oid);',
+		# note: it's correct that btint8sortsupport and btequalimage
+		# are NOT included here (they're optional support functions):
 		regexp => qr/^
 			\QCREATE OPERATOR CLASS dump_test.op_class\E\n\s+
 			\QFOR TYPE bigint USING btree FAMILY dump_test.op_family AS\E\n\s+
@@ -1566,16 +1573,14 @@ my %tests = (
 			\QOPERATOR 3 =(bigint,bigint) ,\E\n\s+
 			\QOPERATOR 4 >=(bigint,bigint) ,\E\n\s+
 			\QOPERATOR 5 >(bigint,bigint) ,\E\n\s+
-			\QFUNCTION 1 (bigint, bigint) btint8cmp(bigint,bigint) ,\E\n\s+
-			\QFUNCTION 2 (bigint, bigint) btint8sortsupport(internal) ,\E\n\s+
-			\QFUNCTION 4 (bigint, bigint) btequalimage(oid);\E
+			\QFUNCTION 1 (bigint, bigint) btint8cmp(bigint,bigint);\E
 			/xm,
 		like =>
 		  { %full_runs, %dump_test_schema_runs, section_pre_data => 1, },
 		unlike => { exclude_dump_test_schema => 1, },
 	},
 
-    # verify that a custom operator/opclass/range type is dumped in right order
+	# verify that a custom operator/opclass/range type is dumped in right order
 	'CREATE OPERATOR CLASS dump_test.op_class_custom' => {
 		create_order => 74,
 		create_sql   => 'CREATE OPERATOR dump_test.~~ (
@@ -2574,7 +2579,8 @@ my %tests = (
 
 	'ALTER STATISTICS extended_stats_options' => {
 		create_order => 98,
-		create_sql   => 'ALTER STATISTICS dump_test.test_ext_stats_opts SET STATISTICS 1000',
+		create_sql =>
+		  'ALTER STATISTICS dump_test.test_ext_stats_opts SET STATISTICS 1000',
 		regexp => qr/^
 			\QALTER STATISTICS dump_test.test_ext_stats_opts SET STATISTICS 1000;\E
 		    /xms,

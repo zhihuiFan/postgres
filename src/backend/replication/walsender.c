@@ -54,8 +54,8 @@
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlog_internal.h"
+#include "access/xlogreader.h"
 #include "access/xlogutils.h"
-
 #include "catalog/pg_authid.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
@@ -129,8 +129,12 @@ bool		log_replication_commands = false;
  */
 bool		wake_wal_senders = false;
 
-static WALOpenSegment *sendSeg = NULL;
-static WALSegmentContext *sendCxt = NULL;
+/*
+ * xlogreader used for replication.  Note that a WAL sender doing physical
+ * replication does not need xlogreader to read WAL, but it needs one to
+ * keep a state of its work.
+ */
+static XLogReaderState *xlogreader = NULL;
 
 /*
  * These variables keep track of the state of the timeline we're currently
@@ -147,7 +151,7 @@ static XLogRecPtr sendTimeLineValidUpto = InvalidXLogRecPtr;
  * How far have we sent WAL already? This is also advertised in
  * MyWalSnd->sentPtr.  (Actually, this is the next WAL location to send.)
  */
-static XLogRecPtr sentPtr = 0;
+static XLogRecPtr sentPtr = InvalidXLogRecPtr;
 
 /* Buffers for constructing outgoing messages and processing reply messages. */
 static StringInfoData output_message;
@@ -248,9 +252,8 @@ static void LagTrackerWrite(XLogRecPtr lsn, TimestampTz local_flush_time);
 static TimeOffset LagTrackerRead(int head, XLogRecPtr lsn, TimestampTz now);
 static bool TransactionIdInRecentPast(TransactionId xid, uint32 epoch);
 
-static int	WalSndSegmentOpen(XLogSegNo nextSegNo, WALSegmentContext *segcxt,
+static void WalSndSegmentOpen(XLogReaderState *state, XLogSegNo nextSegNo,
 							  TimeLineID *tli_p);
-static void UpdateSpillStats(LogicalDecodingContext *ctx);
 
 
 /* Initialize walsender process before entering the main command loop */
@@ -279,13 +282,6 @@ InitWalSender(void)
 
 	/* Initialize empty timestamp buffer for lag tracking. */
 	lag_tracker = MemoryContextAllocZero(TopMemoryContext, sizeof(LagTracker));
-
-	/* Make sure we can remember the current read position in XLOG. */
-	sendSeg = (WALOpenSegment *)
-		MemoryContextAlloc(TopMemoryContext, sizeof(WALOpenSegment));
-	sendCxt = (WALSegmentContext *)
-		MemoryContextAlloc(TopMemoryContext, sizeof(WALSegmentContext));
-	WALOpenSegmentInit(sendSeg, sendCxt, wal_segment_size, NULL);
 }
 
 /*
@@ -302,11 +298,8 @@ WalSndErrorCleanup(void)
 	ConditionVariableCancelSleep();
 	pgstat_report_wait_end();
 
-	if (sendSeg->ws_file >= 0)
-	{
-		close(sendSeg->ws_file);
-		sendSeg->ws_file = -1;
-	}
+	if (xlogreader != NULL && xlogreader->seg.ws_file >= 0)
+		wal_segment_close(xlogreader);
 
 	if (MyReplicationSlot != NULL)
 		ReplicationSlotRelease();
@@ -315,11 +308,47 @@ WalSndErrorCleanup(void)
 
 	replication_active = false;
 
+	/*
+	 * If there is a transaction in progress, it will clean up our
+	 * ResourceOwner, but if a replication command set up a resource owner
+	 * without a transaction, we've got to clean that up now.
+	 */
+	if (!IsTransactionOrTransactionBlock())
+		WalSndResourceCleanup(false);
+
 	if (got_STOPPING || got_SIGUSR2)
 		proc_exit(0);
 
 	/* Revert back to startup state */
 	WalSndSetState(WALSNDSTATE_STARTUP);
+}
+
+/*
+ * Clean up any ResourceOwner we created.
+ */
+void
+WalSndResourceCleanup(bool isCommit)
+{
+	ResourceOwner resowner;
+
+	if (CurrentResourceOwner == NULL)
+		return;
+
+	/*
+	 * Deleting CurrentResourceOwner is not allowed, so we must save a pointer
+	 * in a local variable and clear it first.
+	 */
+	resowner = CurrentResourceOwner;
+	CurrentResourceOwner = NULL;
+
+	/* Now we can release resources and delete it. */
+	ResourceOwnerRelease(resowner,
+						 RESOURCE_RELEASE_BEFORE_LOCKS, isCommit, true);
+	ResourceOwnerRelease(resowner,
+						 RESOURCE_RELEASE_LOCKS, isCommit, true);
+	ResourceOwnerRelease(resowner,
+						 RESOURCE_RELEASE_AFTER_LOCKS, isCommit, true);
+	ResourceOwnerDelete(resowner);
 }
 
 /*
@@ -548,6 +577,18 @@ StartReplication(StartReplicationCmd *cmd)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("IDENTIFY_SYSTEM has not been run before START_REPLICATION")));
 
+	/* create xlogreader for physical replication */
+	xlogreader =
+		XLogReaderAllocate(wal_segment_size, NULL,
+						   XL_ROUTINE(.segment_open = WalSndSegmentOpen,
+									  .segment_close = wal_segment_close),
+						   NULL);
+
+	if (!xlogreader)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory")));
+
 	/*
 	 * We assume here that we're logging enough information in the WAL for
 	 * log-shipping, since this is checked in PostmasterMain().
@@ -559,11 +600,17 @@ StartReplication(StartReplicationCmd *cmd)
 
 	if (cmd->slotname)
 	{
-		ReplicationSlotAcquire(cmd->slotname, true);
+		(void) ReplicationSlotAcquire(cmd->slotname, SAB_Error);
 		if (SlotIsLogical(MyReplicationSlot))
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 					 errmsg("cannot use a logical replication slot for physical replication")));
+
+		/*
+		 * We don't need to verify the slot's restart_lsn here; instead we
+		 * rely on the caller requesting the starting point to use.  If the
+		 * WAL segment doesn't exist, we'll fail later.
+		 */
 	}
 
 	/*
@@ -752,11 +799,12 @@ StartReplication(StartReplicationCmd *cmd)
 	}
 
 	/* Send CommandComplete message */
-	pq_puttextmessage('C', "START_STREAMING");
+	EndReplicationCommand("START_STREAMING");
 }
 
 /*
- * read_page callback for logical decoding contexts, as a walsender process.
+ * XLogReaderRoutine->page_read callback for logical decoding contexts, as a
+ * walsender process.
  *
  * Inside the walsender we can do better than read_local_xlog_page,
  * which has to do a plain sleep/busy loop, because the walsender's latch gets
@@ -790,15 +838,13 @@ logical_read_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr, int req
 		count = flushptr - targetPagePtr;	/* part of the page available */
 
 	/* now actually read the data, we know it's there */
-	if (!WALRead(cur_page,
+	if (!WALRead(state,
+				 cur_page,
 				 targetPagePtr,
 				 XLOG_BLCKSZ,
-				 sendSeg->ws_tli,	/* Pass the current TLI because only
+				 state->seg.ws_tli, /* Pass the current TLI because only
 									 * WalSndSegmentOpen controls whether new
 									 * TLI is needed. */
-				 sendSeg,
-				 sendCxt,
-				 WalSndSegmentOpen,
 				 &errinfo))
 		WALReadRaiseError(&errinfo);
 
@@ -809,8 +855,8 @@ logical_read_xlog_page(XLogReaderState *state, XLogRecPtr targetPagePtr, int req
 	 * read() succeeds in that case, but the data we tried to read might
 	 * already have been overwritten with new WAL records.
 	 */
-	XLByteToSeg(targetPagePtr, segno, sendCxt->ws_segsize);
-	CheckXLogRemoved(segno, sendSeg->ws_tli);
+	XLByteToSeg(targetPagePtr, segno, state->segcxt.ws_segsize);
+	CheckXLogRemoved(segno, state->seg.ws_tli);
 
 	return count;
 }
@@ -889,7 +935,7 @@ CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
 
 	parseCreateReplSlotOptions(cmd, &reserve_wal, &snapshot_action);
 
-	/* setup state for XLogRead */
+	/* setup state for WalSndSegmentOpen */
 	sendTimeLineIsHistoric = false;
 	sendTimeLine = ThisTimeLineID;
 
@@ -963,7 +1009,9 @@ CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
 
 		ctx = CreateInitDecodingContext(cmd->plugin, NIL, need_full_snapshot,
 										InvalidXLogRecPtr,
-										logical_read_xlog_page,
+										XL_ROUTINE(.page_read = logical_read_xlog_page,
+												   .segment_open = WalSndSegmentOpen,
+												   .segment_close = wal_segment_close),
 										WalSndPrepareWrite, WalSndWriteData,
 										WalSndUpdateProgress);
 
@@ -1074,11 +1122,7 @@ CreateReplicationSlot(CreateReplicationSlotCmd *cmd)
 static void
 DropReplicationSlot(DropReplicationSlotCmd *cmd)
 {
-	QueryCompletion qc;
-
 	ReplicationSlotDrop(cmd->slotname, !cmd->wait);
-	SetQueryCompletion(&qc, CMDTAG_DROP_REPLICATION_SLOT, 0);
-	EndCommand(&qc, DestRemote, false);
 }
 
 /*
@@ -1096,7 +1140,14 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 
 	Assert(!MyReplicationSlot);
 
-	ReplicationSlotAcquire(cmd->slotname, true);
+	(void) ReplicationSlotAcquire(cmd->slotname, SAB_Error);
+
+	if (XLogRecPtrIsInvalid(MyReplicationSlot->data.restart_lsn))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot read from logical replication slot \"%s\"",
+						cmd->slotname),
+				 errdetail("This slot has been invalidated because it exceeded the maximum reserved size.")));
 
 	/*
 	 * Force a disconnect, so that the decoding code doesn't need to care
@@ -1119,10 +1170,12 @@ StartLogicalReplication(StartReplicationCmd *cmd)
 	 */
 	logical_decoding_ctx =
 		CreateDecodingContext(cmd->startpoint, cmd->options, false,
-							  logical_read_xlog_page,
+							  XL_ROUTINE(.page_read = logical_read_xlog_page,
+										 .segment_open = WalSndSegmentOpen,
+										 .segment_close = wal_segment_close),
 							  WalSndPrepareWrite, WalSndWriteData,
 							  WalSndUpdateProgress);
-
+	xlogreader = logical_decoding_ctx->reader;
 
 	WalSndSetState(WALSNDSTATE_CATCHUP);
 
@@ -1290,8 +1343,7 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 /*
  * LogicalDecodingContext 'update_progress' callback.
  *
- * Write the current position to the lag tracker (see XLogSendPhysical),
- * and update the spill statistics.
+ * Write the current position to the lag tracker (see XLogSendPhysical).
  */
 static void
 WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid)
@@ -1310,11 +1362,6 @@ WalSndUpdateProgress(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId 
 
 	LagTrackerWrite(lsn, now);
 	sendTime = now;
-
-	/*
-	 * Update statistics about transactions that spilled to disk.
-	 */
-	UpdateSpillStats(ctx);
 }
 
 /*
@@ -1392,16 +1439,15 @@ WalSndWaitForWal(XLogRecPtr loc)
 		/*
 		 * We only send regular messages to the client for full decoded
 		 * transactions, but a synchronous replication and walsender shutdown
-		 * possibly are waiting for a later location. So we send pings
-		 * containing the flush location every now and then.
+		 * possibly are waiting for a later location. So, before sleeping, we
+		 * send a ping containing the flush location. If the receiver is
+		 * otherwise idle, this keepalive will trigger a reply. Processing the
+		 * reply will update these MyWalSnd locations.
 		 */
 		if (MyWalSnd->flush < sentPtr &&
 			MyWalSnd->write < sentPtr &&
 			!waiting_for_ping_response)
-		{
 			WalSndKeepalive(false);
-			waiting_for_ping_response = true;
-		}
 
 		/* check whether we're done */
 		if (loc <= RecentFlushPtr)
@@ -1467,9 +1513,9 @@ exec_replication_command(const char *cmd_string)
 {
 	int			parse_rc;
 	Node	   *cmd_node;
+	const char *cmdtag;
 	MemoryContext cmd_context;
 	MemoryContext old_context;
-	QueryCompletion qc;
 
 	/*
 	 * If WAL sender has been told that shutdown is getting close, switch its
@@ -1495,6 +1541,9 @@ exec_replication_command(const char *cmd_string)
 
 	CHECK_FOR_INTERRUPTS();
 
+	/*
+	 * Parse the command.
+	 */
 	cmd_context = AllocSetContextCreate(CurrentMemoryContext,
 										"Replication command context",
 										ALLOCSET_DEFAULT_SIZES);
@@ -1507,31 +1556,47 @@ exec_replication_command(const char *cmd_string)
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg_internal("replication command parser returned %d",
 								 parse_rc)));
+	replication_scanner_finish();
 
 	cmd_node = replication_parse_result;
 
 	/*
+	 * If it's a SQL command, just clean up our mess and return false; the
+	 * caller will take care of executing it.
+	 */
+	if (IsA(cmd_node, SQLCmd))
+	{
+		if (MyDatabaseId == InvalidOid)
+			ereport(ERROR,
+					(errmsg("cannot execute SQL commands in WAL sender for physical replication")));
+
+		MemoryContextSwitchTo(old_context);
+		MemoryContextDelete(cmd_context);
+
+		/* Tell the caller that this wasn't a WalSender command. */
+		return false;
+	}
+
+	/*
+	 * Report query to various monitoring facilities.  For this purpose, we
+	 * report replication commands just like SQL commands.
+	 */
+	debug_query_string = cmd_string;
+
+	pgstat_report_activity(STATE_RUNNING, cmd_string);
+
+	/*
 	 * Log replication command if log_replication_commands is enabled. Even
 	 * when it's disabled, log the command with DEBUG1 level for backward
-	 * compatibility. Note that SQL commands are not logged here, and will be
-	 * logged later if log_statement is enabled.
+	 * compatibility.
 	 */
-	if (cmd_node->type != T_SQLCmd)
-		ereport(log_replication_commands ? LOG : DEBUG1,
-				(errmsg("received replication command: %s", cmd_string)));
+	ereport(log_replication_commands ? LOG : DEBUG1,
+			(errmsg("received replication command: %s", cmd_string)));
 
 	/*
-	 * CREATE_REPLICATION_SLOT ... LOGICAL exports a snapshot. If it was
-	 * called outside of transaction the snapshot should be cleared here.
+	 * Disallow replication commands in aborted transaction blocks.
 	 */
-	if (!IsTransactionBlock())
-		SnapBuildClearExportedSnapshot();
-
-	/*
-	 * For aborted transactions, don't allow anything except pure SQL, the
-	 * exec_simple_query() will handle it correctly.
-	 */
-	if (IsAbortedTransactionBlockState() && !IsA(cmd_node, SQLCmd))
+	if (IsAbortedTransactionBlockState())
 		ereport(ERROR,
 				(errcode(ERRCODE_IN_FAILED_SQL_TRANSACTION),
 				 errmsg("current transaction is aborted, "
@@ -1547,44 +1612,63 @@ exec_replication_command(const char *cmd_string)
 	initStringInfo(&reply_message);
 	initStringInfo(&tmpbuf);
 
-	/* Report to pgstat that this process is running */
-	pgstat_report_activity(STATE_RUNNING, NULL);
-
 	switch (cmd_node->type)
 	{
 		case T_IdentifySystemCmd:
+			cmdtag = "IDENTIFY_SYSTEM";
+			set_ps_display(cmdtag);
 			IdentifySystem();
+			EndReplicationCommand(cmdtag);
 			break;
 
 		case T_BaseBackupCmd:
-			PreventInTransactionBlock(true, "BASE_BACKUP");
+			cmdtag = "BASE_BACKUP";
+			set_ps_display(cmdtag);
+			PreventInTransactionBlock(true, cmdtag);
 			SendBaseBackup((BaseBackupCmd *) cmd_node);
+			EndReplicationCommand(cmdtag);
 			break;
 
 		case T_CreateReplicationSlotCmd:
+			cmdtag = "CREATE_REPLICATION_SLOT";
+			set_ps_display(cmdtag);
 			CreateReplicationSlot((CreateReplicationSlotCmd *) cmd_node);
+			EndReplicationCommand(cmdtag);
 			break;
 
 		case T_DropReplicationSlotCmd:
+			cmdtag = "DROP_REPLICATION_SLOT";
+			set_ps_display(cmdtag);
 			DropReplicationSlot((DropReplicationSlotCmd *) cmd_node);
+			EndReplicationCommand(cmdtag);
 			break;
 
 		case T_StartReplicationCmd:
 			{
 				StartReplicationCmd *cmd = (StartReplicationCmd *) cmd_node;
 
-				PreventInTransactionBlock(true, "START_REPLICATION");
+				cmdtag = "START_REPLICATION";
+				set_ps_display(cmdtag);
+				PreventInTransactionBlock(true, cmdtag);
 
 				if (cmd->kind == REPLICATION_KIND_PHYSICAL)
 					StartReplication(cmd);
 				else
 					StartLogicalReplication(cmd);
+
+				/* dupe, but necessary per libpqrcv_endstreaming */
+				EndReplicationCommand(cmdtag);
+
+				Assert(xlogreader != NULL);
 				break;
 			}
 
 		case T_TimeLineHistoryCmd:
-			PreventInTransactionBlock(true, "TIMELINE_HISTORY");
+			cmdtag = "TIMELINE_HISTORY";
+			set_ps_display(cmdtag);
+			PreventInTransactionBlock(true, cmdtag);
 			SendTimeLineHistory((TimeLineHistoryCmd *) cmd_node);
+			EndReplicationCommand(cmdtag);
 			break;
 
 		case T_VariableShowStmt:
@@ -1592,23 +1676,16 @@ exec_replication_command(const char *cmd_string)
 				DestReceiver *dest = CreateDestReceiver(DestRemoteSimple);
 				VariableShowStmt *n = (VariableShowStmt *) cmd_node;
 
+				cmdtag = "SHOW";
+				set_ps_display(cmdtag);
+
 				/* syscache access needs a transaction environment */
 				StartTransactionCommand();
 				GetPGVariable(n->name, dest);
 				CommitTransactionCommand();
+				EndReplicationCommand(cmdtag);
 			}
 			break;
-
-		case T_SQLCmd:
-			if (MyDatabaseId == InvalidOid)
-				ereport(ERROR,
-						(errmsg("cannot execute SQL commands in WAL sender for physical replication")));
-
-			/* Report to pgstat that this process is now idle */
-			pgstat_report_activity(STATE_IDLE, NULL);
-
-			/* Tell the caller that this wasn't a WalSender command. */
-			return false;
 
 		default:
 			elog(ERROR, "unrecognized replication command node tag: %u",
@@ -1619,12 +1696,12 @@ exec_replication_command(const char *cmd_string)
 	MemoryContextSwitchTo(old_context);
 	MemoryContextDelete(cmd_context);
 
-	/* Send CommandComplete message */
-	SetQueryCompletion(&qc, CMDTAG_SELECT, 0);
-	EndCommand(&qc, DestRemote, true);
-
-	/* Report to pgstat that this process is now idle */
-	pgstat_report_activity(STATE_IDLE, NULL);
+	/*
+	 * We need not update ps display or pg_stat_activity, because PostgresMain
+	 * will reset those to "idle".  But we must reset debug_query_string to
+	 * ensure it doesn't become a dangling pointer.
+	 */
+	debug_query_string = NULL;
 
 	return true;
 }
@@ -1912,7 +1989,7 @@ PhysicalReplicationSlotNewXmin(TransactionId feedbackXmin, TransactionId feedbac
 	ReplicationSlot *slot = MyReplicationSlot;
 
 	SpinLockAcquire(&slot->mutex);
-	MyPgXact->xmin = InvalidTransactionId;
+	MyProc->xmin = InvalidTransactionId;
 
 	/*
 	 * For physical replication we don't need the interlock provided by xmin
@@ -2041,7 +2118,7 @@ ProcessStandbyHSFeedbackMessage(void)
 	if (!TransactionIdIsNormal(feedbackXmin)
 		&& !TransactionIdIsNormal(feedbackCatalogXmin))
 	{
-		MyPgXact->xmin = InvalidTransactionId;
+		MyProc->xmin = InvalidTransactionId;
 		if (MyReplicationSlot != NULL)
 			PhysicalReplicationSlotNewXmin(feedbackXmin, feedbackCatalogXmin);
 		return;
@@ -2061,9 +2138,10 @@ ProcessStandbyHSFeedbackMessage(void)
 
 	/*
 	 * Set the WalSender's xmin equal to the standby's requested xmin, so that
-	 * the xmin will be taken into account by GetOldestXmin.  This will hold
-	 * back the removal of dead rows and thereby prevent the generation of
-	 * cleanup conflicts on the standby server.
+	 * the xmin will be taken into account by GetSnapshotData() /
+	 * ComputeXidHorizons().  This will hold back the removal of dead rows and
+	 * thereby prevent the generation of cleanup conflicts on the standby
+	 * server.
 	 *
 	 * There is a small window for a race condition here: although we just
 	 * checked that feedbackXmin precedes nextXid, the nextXid could have
@@ -2076,13 +2154,13 @@ ProcessStandbyHSFeedbackMessage(void)
 	 * own xmin would prevent nextXid from advancing so far.
 	 *
 	 * We don't bother taking the ProcArrayLock here.  Setting the xmin field
-	 * is assumed atomic, and there's no real need to prevent a concurrent
-	 * GetOldestXmin.  (If we're moving our xmin forward, this is obviously
-	 * safe, and if we're moving it backwards, well, the data is at risk
-	 * already since a VACUUM could have just finished calling GetOldestXmin.)
+	 * is assumed atomic, and there's no real need to prevent concurrent
+	 * horizon determinations.  (If we're moving our xmin forward, this is
+	 * obviously safe, and if we're moving it backwards, well, the data is at
+	 * risk already since a VACUUM could already have determined the horizon.)
 	 *
 	 * If we're using a replication slot we reserve the xmin via that,
-	 * otherwise via the walsender's PGXACT entry. We can only track the
+	 * otherwise via the walsender's PGPROC entry. We can only track the
 	 * catalog xmin separately when using a slot, so we store the least of the
 	 * two provided when not using a slot.
 	 *
@@ -2095,9 +2173,9 @@ ProcessStandbyHSFeedbackMessage(void)
 	{
 		if (TransactionIdIsNormal(feedbackCatalogXmin)
 			&& TransactionIdPrecedes(feedbackCatalogXmin, feedbackXmin))
-			MyPgXact->xmin = feedbackCatalogXmin;
+			MyProc->xmin = feedbackCatalogXmin;
 		else
-			MyPgXact->xmin = feedbackXmin;
+			MyProc->xmin = feedbackXmin;
 	}
 }
 
@@ -2278,14 +2356,14 @@ WalSndLoop(WalSndSendDataCallback send_data)
 		WalSndKeepaliveIfNecessary();
 
 		/*
-		 * We don't block if not caught up, unless there is unsent data
-		 * pending in which case we'd better block until the socket is
-		 * write-ready.  This test is only needed for the case where the
-		 * send_data callback handled a subset of the available data but then
-		 * pq_flush_if_writable flushed it all --- we should immediately try
-		 * to send more.
+		 * Block if we have unsent data.  XXX For logical replication, let
+		 * WalSndWaitForWal() handle any other blocking; idle receivers need
+		 * its additional actions.  For physical replication, also block if
+		 * caught up; its send_data does not block.
 		 */
-		if ((WalSndCaughtUp && !streamingDoneSending) || pq_is_send_pending())
+		if ((WalSndCaughtUp && send_data != XLogSendLogical &&
+			 !streamingDoneSending) ||
+			pq_is_send_pending())
 		{
 			long		sleeptime;
 			int			wakeEvents;
@@ -2344,19 +2422,18 @@ InitWalSenderSlot(void)
 			 * Found a free slot. Reserve it for us.
 			 */
 			walsnd->pid = MyProcPid;
+			walsnd->state = WALSNDSTATE_STARTUP;
 			walsnd->sentPtr = InvalidXLogRecPtr;
+			walsnd->needreload = false;
 			walsnd->write = InvalidXLogRecPtr;
 			walsnd->flush = InvalidXLogRecPtr;
 			walsnd->apply = InvalidXLogRecPtr;
 			walsnd->writeLag = -1;
 			walsnd->flushLag = -1;
 			walsnd->applyLag = -1;
-			walsnd->state = WALSNDSTATE_STARTUP;
+			walsnd->sync_standby_priority = 0;
 			walsnd->latch = &MyProc->procLatch;
 			walsnd->replyTime = 0;
-			walsnd->spillTxns = 0;
-			walsnd->spillCount = 0;
-			walsnd->spillBytes = 0;
 			SpinLockRelease(&walsnd->mutex);
 			/* don't need the lock anymore */
 			MyWalSnd = (WalSnd *) walsnd;
@@ -2389,13 +2466,12 @@ WalSndKill(int code, Datum arg)
 	SpinLockRelease(&walsnd->mutex);
 }
 
-/* walsender's openSegment callback for WALRead */
-static int
-WalSndSegmentOpen(XLogSegNo nextSegNo, WALSegmentContext *segcxt,
+/* XLogReaderRoutine->segment_open callback */
+static void
+WalSndSegmentOpen(XLogReaderState *state, XLogSegNo nextSegNo,
 				  TimeLineID *tli_p)
 {
 	char		path[MAXPGPATH];
-	int			fd;
 
 	/*-------
 	 * When reading from a historic timeline, and there is a timeline switch
@@ -2426,15 +2502,15 @@ WalSndSegmentOpen(XLogSegNo nextSegNo, WALSegmentContext *segcxt,
 	{
 		XLogSegNo	endSegNo;
 
-		XLByteToSeg(sendTimeLineValidUpto, endSegNo, segcxt->ws_segsize);
-		if (sendSeg->ws_segno == endSegNo)
+		XLByteToSeg(sendTimeLineValidUpto, endSegNo, state->segcxt.ws_segsize);
+		if (state->seg.ws_segno == endSegNo)
 			*tli_p = sendTimeLineNextTLI;
 	}
 
-	XLogFilePath(path, *tli_p, nextSegNo, segcxt->ws_segsize);
-	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
-	if (fd >= 0)
-		return fd;
+	XLogFilePath(path, *tli_p, nextSegNo, state->segcxt.ws_segsize);
+	state->seg.ws_file = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+	if (state->seg.ws_file >= 0)
+		return;
 
 	/*
 	 * If the file is not found, assume it's because the standby asked for a
@@ -2457,7 +2533,6 @@ WalSndSegmentOpen(XLogSegNo nextSegNo, WALSegmentContext *segcxt,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m",
 						path)));
-	return -1;					/* keep compiler quiet */
 }
 
 /*
@@ -2566,14 +2641,14 @@ XLogSendPhysical(void)
 	else
 	{
 		/*
-		 * Streaming the current timeline on a master.
+		 * Streaming the current timeline on a primary.
 		 *
 		 * Attempt to send all data that's already been written out and
 		 * fsync'd to disk.  We cannot go further than what's been written out
-		 * given the current implementation of XLogRead().  And in any case
+		 * given the current implementation of WALRead().  And in any case
 		 * it's unsafe to send WAL that is not securely down to disk on the
-		 * master: if the master subsequently crashes and restarts, standbys
-		 * must not have applied any WAL that got lost on the master.
+		 * primary: if the primary subsequently crashes and restarts, standbys
+		 * must not have applied any WAL that got lost on the primary.
 		 */
 		SendRqstPtr = GetFlushRecPtr();
 	}
@@ -2610,7 +2685,7 @@ XLogSendPhysical(void)
 	 *
 	 * Note: We might already have sent WAL > sendTimeLineValidUpto. The
 	 * startup process will normally replay all WAL that has been received
-	 * from the master, before promoting, but if the WAL streaming is
+	 * from the primary, before promoting, but if the WAL streaming is
 	 * terminated at a WAL page boundary, the valid portion of the timeline
 	 * might end in the middle of a WAL record. We might've already sent the
 	 * first half of that partial WAL record to the cascading standby, so that
@@ -2621,9 +2696,8 @@ XLogSendPhysical(void)
 	if (sendTimeLineIsHistoric && sendTimeLineValidUpto <= sentPtr)
 	{
 		/* close the current file. */
-		if (sendSeg->ws_file >= 0)
-			close(sendSeg->ws_file);
-		sendSeg->ws_file = -1;
+		if (xlogreader->seg.ws_file >= 0)
+			wal_segment_close(xlogreader);
 
 		/* Send CopyDone */
 		pq_putmessage_noblock('c', NULL, 0);
@@ -2696,21 +2770,19 @@ XLogSendPhysical(void)
 	enlargeStringInfo(&output_message, nbytes);
 
 retry:
-	if (!WALRead(&output_message.data[output_message.len],
+	if (!WALRead(xlogreader,
+				 &output_message.data[output_message.len],
 				 startptr,
 				 nbytes,
-				 sendSeg->ws_tli,	/* Pass the current TLI because only
-									 * WalSndSegmentOpen controls whether new
-									 * TLI is needed. */
-				 sendSeg,
-				 sendCxt,
-				 WalSndSegmentOpen,
+				 xlogreader->seg.ws_tli,	/* Pass the current TLI because
+											 * only WalSndSegmentOpen controls
+											 * whether new TLI is needed. */
 				 &errinfo))
 		WALReadRaiseError(&errinfo);
 
 	/* See logical_read_xlog_page(). */
-	XLByteToSeg(startptr, segno, sendCxt->ws_segsize);
-	CheckXLogRemoved(segno, sendSeg->ws_tli);
+	XLByteToSeg(startptr, segno, xlogreader->segcxt.ws_segsize);
+	CheckXLogRemoved(segno, xlogreader->seg.ws_tli);
 
 	/*
 	 * During recovery, the currently-open WAL file might be replaced with the
@@ -2728,10 +2800,9 @@ retry:
 		walsnd->needreload = false;
 		SpinLockRelease(&walsnd->mutex);
 
-		if (reload && sendSeg->ws_file >= 0)
+		if (reload && xlogreader->seg.ws_file >= 0)
 		{
-			close(sendSeg->ws_file);
-			sendSeg->ws_file = -1;
+			wal_segment_close(xlogreader);
 
 			goto retry;
 		}
@@ -2884,10 +2955,7 @@ WalSndDone(WalSndSendDataCallback send_data)
 		proc_exit(0);
 	}
 	if (!waiting_for_ping_response)
-	{
 		WalSndKeepalive(true);
-		waiting_for_ping_response = true;
-	}
 }
 
 /*
@@ -2913,7 +2981,7 @@ GetStandbyFlushRecPtr(void)
 	 * has streamed, but hasn't been replayed yet.
 	 */
 
-	receivePtr = GetWalRcvWriteRecPtr(NULL, &receiveTLI);
+	receivePtr = GetWalRcvFlushRecPtr(NULL, &receiveTLI);
 	replayPtr = GetXLogReplayRecPtr(&replayTLI);
 
 	ThisTimeLineID = replayTLI;
@@ -2992,7 +3060,7 @@ WalSndSignals(void)
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGINT, StatementCancelHandler);	/* query cancel */
 	pqsignal(SIGTERM, die);		/* request shutdown */
-	pqsignal(SIGQUIT, quickdie);	/* hard crash time */
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	InitializeTimeouts();		/* establishes SIGALRM handler */
 	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
@@ -3198,13 +3266,14 @@ offset_to_interval(TimeOffset offset)
 Datum
 pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_WAL_SENDERS_COLS	15
+#define PG_STAT_GET_WAL_SENDERS_COLS	12
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	TupleDesc	tupdesc;
 	Tuplestorestate *tupstore;
 	MemoryContext per_query_ctx;
 	MemoryContext oldcontext;
-	List	   *sync_standbys;
+	SyncRepStandbyData *sync_standbys;
+	int			num_standbys;
 	int			i;
 
 	/* check to see if caller supports us returning a tuplestore */
@@ -3232,11 +3301,10 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 	MemoryContextSwitchTo(oldcontext);
 
 	/*
-	 * Get the currently active synchronous standbys.
+	 * Get the currently active synchronous standbys.  This could be out of
+	 * date before we're done, but we'll use the data anyway.
 	 */
-	LWLockAcquire(SyncRepLock, LW_SHARED);
-	sync_standbys = SyncRepGetSyncStandbys(NULL);
-	LWLockRelease(SyncRepLock);
+	num_standbys = SyncRepGetCandidateStandbys(&sync_standbys);
 
 	for (i = 0; i < max_wal_senders; i++)
 	{
@@ -3252,12 +3320,12 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 		int			pid;
 		WalSndState state;
 		TimestampTz replyTime;
-		int64		spillTxns;
-		int64		spillCount;
-		int64		spillBytes;
+		bool		is_sync_standby;
 		Datum		values[PG_STAT_GET_WAL_SENDERS_COLS];
 		bool		nulls[PG_STAT_GET_WAL_SENDERS_COLS];
+		int			j;
 
+		/* Collect data from shared memory */
 		SpinLockAcquire(&walsnd->mutex);
 		if (walsnd->pid == 0)
 		{
@@ -3275,10 +3343,23 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 		applyLag = walsnd->applyLag;
 		priority = walsnd->sync_standby_priority;
 		replyTime = walsnd->replyTime;
-		spillTxns = walsnd->spillTxns;
-		spillCount = walsnd->spillCount;
-		spillBytes = walsnd->spillBytes;
 		SpinLockRelease(&walsnd->mutex);
+
+		/*
+		 * Detect whether walsender is/was considered synchronous.  We can
+		 * provide some protection against stale data by checking the PID
+		 * along with walsnd_index.
+		 */
+		is_sync_standby = false;
+		for (j = 0; j < num_standbys; j++)
+		{
+			if (sync_standbys[j].walsnd_index == i &&
+				sync_standbys[j].pid == pid)
+			{
+				is_sync_standby = true;
+				break;
+			}
+		}
 
 		memset(nulls, 0, sizeof(nulls));
 		values[0] = Int32GetDatum(pid);
@@ -3349,7 +3430,7 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 			 */
 			if (priority == 0)
 				values[10] = CStringGetTextDatum("async");
-			else if (list_member_int(sync_standbys, i))
+			else if (is_sync_standby)
 				values[10] = SyncRepConfig->syncrep_method == SYNC_REP_PRIORITY ?
 					CStringGetTextDatum("sync") : CStringGetTextDatum("quorum");
 			else
@@ -3359,11 +3440,6 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 				nulls[11] = true;
 			else
 				values[11] = TimestampTzGetDatum(replyTime);
-
-			/* spill to disk */
-			values[12] = Int64GetDatum(spillTxns);
-			values[13] = Int64GetDatum(spillCount);
-			values[14] = Int64GetDatum(spillBytes);
 		}
 
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
@@ -3376,10 +3452,13 @@ pg_stat_get_wal_senders(PG_FUNCTION_ARGS)
 }
 
 /*
-  * This function is used to send a keepalive message to standby.
-  * If requestReply is set, sets a flag in the message requesting the standby
-  * to send a message back to us, for heartbeat purposes.
-  */
+ * Send a keepalive message to standby.
+ *
+ * If requestReply is set, the message requests the other party to send
+ * a message back to us, for heartbeat purposes.  We also set a flag to
+ * let nearby code that we're waiting for that response, to avoid
+ * repeated requests.
+ */
 static void
 WalSndKeepalive(bool requestReply)
 {
@@ -3394,6 +3473,10 @@ WalSndKeepalive(bool requestReply)
 
 	/* ... and send it wrapped in CopyData */
 	pq_putmessage_noblock('d', output_message.data, output_message.len);
+
+	/* Set local flag */
+	if (requestReply)
+		waiting_for_ping_response = true;
 }
 
 /*
@@ -3424,7 +3507,6 @@ WalSndKeepaliveIfNecessary(void)
 	if (last_processing >= ping_time)
 	{
 		WalSndKeepalive(true);
-		waiting_for_ping_response = true;
 
 		/* Try to flush pending output to the client */
 		if (pq_flush_if_writable() != 0)
@@ -3599,24 +3681,4 @@ LagTrackerRead(int head, XLogRecPtr lsn, TimestampTz now)
 	/* Return the elapsed time since local flush time in microseconds. */
 	Assert(time != 0);
 	return now - time;
-}
-
-static void
-UpdateSpillStats(LogicalDecodingContext *ctx)
-{
-	ReorderBuffer *rb = ctx->reorder;
-
-	SpinLockAcquire(&MyWalSnd->mutex);
-
-	MyWalSnd->spillTxns = rb->spillTxns;
-	MyWalSnd->spillCount = rb->spillCount;
-	MyWalSnd->spillBytes = rb->spillBytes;
-
-	elog(DEBUG2, "UpdateSpillStats: updating stats %p %lld %lld %lld",
-		 rb,
-		 (long long) rb->spillTxns,
-		 (long long) rb->spillCount,
-		 (long long) rb->spillBytes);
-
-	SpinLockRelease(&MyWalSnd->mutex);
 }

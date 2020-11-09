@@ -59,6 +59,7 @@ hashhandler(PG_FUNCTION_ARGS)
 
 	amroutine->amstrategies = HTMaxStrategyNumber;
 	amroutine->amsupport = HASHNProcs;
+	amroutine->amoptsprocnum = HASHOPTIONS_PROC;
 	amroutine->amcanorder = false;
 	amroutine->amcanorderbyop = false;
 	amroutine->amcanbackward = true;
@@ -88,6 +89,7 @@ hashhandler(PG_FUNCTION_ARGS)
 	amroutine->amproperty = NULL;
 	amroutine->ambuildphasename = NULL;
 	amroutine->amvalidate = hashvalidate;
+	amroutine->amadjustmembers = hashadjustmembers;
 	amroutine->ambeginscan = hashbeginscan;
 	amroutine->amrescan = hashrescan;
 	amroutine->amgettuple = hashgettuple;

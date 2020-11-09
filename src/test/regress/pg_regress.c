@@ -31,8 +31,10 @@
 
 #include "common/logging.h"
 #include "common/restricted_token.h"
+#include "common/string.h"
 #include "common/username.h"
 #include "getopt_long.h"
+#include "lib/stringinfo.h"
 #include "libpq/pqcomm.h"		/* needed for UNIXSOCK_PATH() */
 #include "pg_config_paths.h"
 #include "pg_regress.h"
@@ -299,7 +301,7 @@ stop_postmaster(void)
  * remove the directory.  Ignore errors; leaking a temporary directory is
  * unimportant.  This can run from a signal handler.  The code is not
  * acceptable in a Windows signal handler (see initdb.c:trapsig()), but
- * Windows is not a HAVE_UNIX_SOCKETS platform.
+ * on Windows, pg_regress does not use Unix sockets by default.
  */
 static void
 remove_temp(void)
@@ -337,7 +339,8 @@ signal_remove_temp(int signum)
 static const char *
 make_temp_sockdir(void)
 {
-	char	   *template = pg_strdup("/tmp/pg_regress-XXXXXX");
+	char	   *template = psprintf("%s/pg_regress-XXXXXX",
+									getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp");
 
 	temp_sockdir = mkdtemp(template);
 	if (temp_sockdir == NULL)
@@ -441,22 +444,32 @@ string_matches_pattern(const char *str, const char *pattern)
 }
 
 /*
- * Replace all occurrences of a string in a string with a different string.
- * NOTE: Assumes there is enough room in the target buffer!
+ * Replace all occurrences of "replace" in "string" with "replacement".
+ * The StringInfo will be suitably enlarged if necessary.
+ *
+ * Note: this is optimized on the assumption that most calls will find
+ * no more than one occurrence of "replace", and quite likely none.
  */
 void
-replace_string(char *string, const char *replace, const char *replacement)
+replace_string(StringInfo string, const char *replace, const char *replacement)
 {
+	int			pos = 0;
 	char	   *ptr;
 
-	while ((ptr = strstr(string, replace)) != NULL)
+	while ((ptr = strstr(string->data + pos, replace)) != NULL)
 	{
-		char	   *dup = pg_strdup(string);
+		/* Must copy the remainder of the string out of the StringInfo */
+		char	   *suffix = pg_strdup(ptr + strlen(replace));
 
-		strlcpy(string, dup, ptr - string + 1);
-		strcat(string, replacement);
-		strcat(string, dup + (ptr - string) + strlen(replace));
-		free(dup);
+		/* Truncate StringInfo at start of found string ... */
+		string->len = ptr - string->data;
+		/* ... and append the replacement (this restores the trailing '\0') */
+		appendStringInfoString(string, replacement);
+		/* Next search should start after the replacement */
+		pos = string->len;
+		/* Put back the remainder of the string */
+		appendStringInfoString(string, suffix);
+		free(suffix);
 	}
 }
 
@@ -471,8 +484,7 @@ convert_sourcefiles_in(const char *source_subdir, const char *dest_dir, const ch
 {
 	char		testtablespace[MAXPGPATH];
 	char		indir[MAXPGPATH];
-	struct stat st;
-	int			ret;
+	char		outdir_sub[MAXPGPATH];
 	char	  **name;
 	char	  **names;
 	int			count = 0;
@@ -480,8 +492,7 @@ convert_sourcefiles_in(const char *source_subdir, const char *dest_dir, const ch
 	snprintf(indir, MAXPGPATH, "%s/%s", inputdir, source_subdir);
 
 	/* Check that indir actually exists and is a directory */
-	ret = stat(indir, &st);
-	if (ret != 0 || !S_ISDIR(st.st_mode))
+	if (!directory_exists(indir))
 	{
 		/*
 		 * No warning, to avoid noise in tests that do not have these
@@ -495,19 +506,21 @@ convert_sourcefiles_in(const char *source_subdir, const char *dest_dir, const ch
 		/* Error logged in pgfnames */
 		exit(2);
 
+	/* Create the "dest" subdirectory if not present */
+	snprintf(outdir_sub, MAXPGPATH, "%s/%s", dest_dir, dest_subdir);
+	if (!directory_exists(outdir_sub))
+		make_directory(outdir_sub);
+
 	snprintf(testtablespace, MAXPGPATH, "%s/testtablespace", outputdir);
 
 #ifdef WIN32
 
 	/*
 	 * On Windows only, clean out the test tablespace dir, or create it if it
-	 * doesn't exist.  On other platforms we expect the Makefile to take care
-	 * of that.  (We don't migrate that functionality in here because it'd be
-	 * harder to cope with platform-specific issues such as SELinux.)
-	 *
-	 * XXX it would be better if pg_regress.c had nothing at all to do with
-	 * testtablespace, and this were handled by a .BAT file or similar on
-	 * Windows.  See pgsql-hackers discussion of 2008-01-18.
+	 * doesn't exist so as it is possible to run the regression tests as a
+	 * Windows administrative user account with the restricted token obtained
+	 * when starting pg_regress.  On other platforms we expect the Makefile to
+	 * take care of that.
 	 */
 	if (directory_exists(testtablespace))
 		if (!rmtree(testtablespace, true))
@@ -527,7 +540,7 @@ convert_sourcefiles_in(const char *source_subdir, const char *dest_dir, const ch
 		char		prefix[MAXPGPATH];
 		FILE	   *infile,
 				   *outfile;
-		char		line[1024];
+		StringInfoData line;
 
 		/* reject filenames not finishing in ".source" */
 		if (strlen(*name) < 8)
@@ -557,15 +570,20 @@ convert_sourcefiles_in(const char *source_subdir, const char *dest_dir, const ch
 					progname, destfile, strerror(errno));
 			exit(2);
 		}
-		while (fgets(line, sizeof(line), infile))
+
+		initStringInfo(&line);
+
+		while (pg_get_line_buf(infile, &line))
 		{
-			replace_string(line, "@abs_srcdir@", inputdir);
-			replace_string(line, "@abs_builddir@", outputdir);
-			replace_string(line, "@testtablespace@", testtablespace);
-			replace_string(line, "@libdir@", dlpath);
-			replace_string(line, "@DLSUFFIX@", DLSUFFIX);
-			fputs(line, outfile);
+			replace_string(&line, "@abs_srcdir@", inputdir);
+			replace_string(&line, "@abs_builddir@", outputdir);
+			replace_string(&line, "@testtablespace@", testtablespace);
+			replace_string(&line, "@libdir@", dlpath);
+			replace_string(&line, "@DLSUFFIX@", DLSUFFIX);
+			fputs(line.data, outfile);
 		}
+
+		pfree(line.data);
 		fclose(infile);
 		fclose(outfile);
 	}
@@ -2160,6 +2178,7 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		{NULL, 0, NULL, 0}
 	};
 
+	bool		use_unix_sockets;
 	_stringlist *sl;
 	int			c;
 	int			i;
@@ -2176,10 +2195,22 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 
 	atexit(stop_postmaster);
 
-#ifndef HAVE_UNIX_SOCKETS
-	/* no unix domain sockets available, so change default */
-	hostname = "localhost";
+#if !defined(HAVE_UNIX_SOCKETS)
+	use_unix_sockets = false;
+#elif defined(WIN32)
+
+	/*
+	 * We don't use Unix-domain sockets on Windows by default, even if the
+	 * build supports them.  (See comment at remove_temp() for a reason.)
+	 * Override at your own risk.
+	 */
+	use_unix_sockets = getenv("PG_TEST_USE_UNIX_SOCKETS") ? true : false;
+#else
+	use_unix_sockets = true;
 #endif
+
+	if (!use_unix_sockets)
+		hostname = "localhost";
 
 	/*
 	 * We call the initialization function here because that way we can set
@@ -2302,7 +2333,8 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 	if (config_auth_datadir)
 	{
 #ifdef ENABLE_SSPI
-		config_sspi_auth(config_auth_datadir, user);
+		if (!use_unix_sockets)
+			config_sspi_auth(config_auth_datadir, user);
 #endif
 		exit(0);
 	}
@@ -2425,13 +2457,15 @@ regression_main(int argc, char *argv[], init_function ifunc, test_function tfunc
 		fclose(pg_conf);
 
 #ifdef ENABLE_SSPI
-
-		/*
-		 * Since we successfully used the same buffer for the much-longer
-		 * "initdb" command, this can't truncate.
-		 */
-		snprintf(buf, sizeof(buf), "%s/data", temp_instance);
-		config_sspi_auth(buf, NULL);
+		if (!use_unix_sockets)
+		{
+			/*
+			 * Since we successfully used the same buffer for the much-longer
+			 * "initdb" command, this can't truncate.
+			 */
+			snprintf(buf, sizeof(buf), "%s/data", temp_instance);
+			config_sspi_auth(buf, NULL);
+		}
 #elif !defined(HAVE_UNIX_SOCKETS)
 #error Platform has no means to secure the test installation.
 #endif

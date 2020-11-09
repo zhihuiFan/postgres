@@ -43,7 +43,7 @@ Oid			binary_upgrade_next_pg_authid_oid = InvalidOid;
 
 
 /* GUC parameter */
-int			Password_encryption = PASSWORD_TYPE_MD5;
+int			Password_encryption = PASSWORD_TYPE_SCRAM_SHA_256;
 
 /* Hook to check passwords in CreateRole() and AlterRole() */
 check_password_hook_type check_password_hook = NULL;
@@ -305,7 +305,7 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 		if (!superuser())
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to change bypassrls attribute")));
+					 errmsg("must be superuser to create bypassrls users")));
 	}
 	else
 	{
@@ -470,20 +470,31 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 	/*
 	 * Add the new role to the specified existing roles.
 	 */
-	foreach(item, addroleto)
+	if (addroleto)
 	{
-		RoleSpec   *oldrole = lfirst(item);
-		HeapTuple	oldroletup = get_rolespec_tuple(oldrole);
-		Form_pg_authid oldroleform = (Form_pg_authid) GETSTRUCT(oldroletup);
-		Oid			oldroleid = oldroleform->oid;
-		char	   *oldrolename = NameStr(oldroleform->rolname);
+		RoleSpec   *thisrole = makeNode(RoleSpec);
+		List	   *thisrole_list = list_make1(thisrole);
+		List	   *thisrole_oidlist = list_make1_oid(roleid);
 
-		AddRoleMems(oldrolename, oldroleid,
-					list_make1(makeString(stmt->role)),
-					list_make1_oid(roleid),
-					GetUserId(), false);
+		thisrole->roletype = ROLESPEC_CSTRING;
+		thisrole->rolename = stmt->role;
+		thisrole->location = -1;
 
-		ReleaseSysCache(oldroletup);
+		foreach(item, addroleto)
+		{
+			RoleSpec   *oldrole = lfirst(item);
+			HeapTuple	oldroletup = get_rolespec_tuple(oldrole);
+			Form_pg_authid oldroleform = (Form_pg_authid) GETSTRUCT(oldroletup);
+			Oid			oldroleid = oldroleform->oid;
+			char	   *oldrolename = NameStr(oldroleform->rolname);
+
+			AddRoleMems(oldrolename, oldroleid,
+						thisrole_list,
+						thisrole_oidlist,
+						GetUserId(), false);
+
+			ReleaseSysCache(oldroletup);
+		}
 	}
 
 	/*
@@ -698,24 +709,26 @@ AlterRole(AlterRoleStmt *stmt)
 	roleid = authform->oid;
 
 	/*
-	 * To mess with a superuser you gotta be superuser; else you need
-	 * createrole, or just want to change your own password
+	 * To mess with a superuser or replication role in any way you gotta be
+	 * superuser.  We also insist on superuser to change the BYPASSRLS
+	 * property.  Otherwise, if you don't have createrole, you're only allowed
+	 * to change your own password.
 	 */
 	if (authform->rolsuper || issuper >= 0)
 	{
 		if (!superuser())
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to alter superusers")));
+					 errmsg("must be superuser to alter superuser roles or change superuser attribute")));
 	}
 	else if (authform->rolreplication || isreplication >= 0)
 	{
 		if (!superuser())
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to alter replication users")));
+					 errmsg("must be superuser to alter replication roles or change replication attribute")));
 	}
-	else if (authform->rolbypassrls || bypassrls >= 0)
+	else if (bypassrls >= 0)
 	{
 		if (!superuser())
 			ereport(ERROR,
@@ -724,11 +737,11 @@ AlterRole(AlterRoleStmt *stmt)
 	}
 	else if (!have_createrole_privilege())
 	{
+		/* We already checked issuper, isreplication, and bypassrls */
 		if (!(inherit < 0 &&
 			  createrole < 0 &&
 			  createdb < 0 &&
 			  canlogin < 0 &&
-			  isreplication < 0 &&
 			  !dconnlimit &&
 			  !rolemembers &&
 			  !validUntil &&
@@ -1503,7 +1516,7 @@ AddRoleMems(const char *rolename, Oid roleid,
 
 	forboth(specitem, memberSpecs, iditem, memberIds)
 	{
-		RoleSpec   *memberRole = lfirst(specitem);
+		RoleSpec   *memberRole = lfirst_node(RoleSpec, specitem);
 		Oid			memberid = lfirst_oid(iditem);
 		HeapTuple	authmem_tuple;
 		HeapTuple	tuple;

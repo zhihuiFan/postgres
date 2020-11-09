@@ -159,6 +159,7 @@ typedef struct Query
 
 	Node	   *limitOffset;	/* # of result tuples to skip (int8 expr) */
 	Node	   *limitCount;		/* # of result tuples to return (int8 expr) */
+	LimitOption limitOption;	/* limit type */
 
 	List	   *rowMarks;		/* a list of RowMarkClause's */
 
@@ -317,6 +318,7 @@ typedef struct CollateClause
 typedef enum RoleSpecType
 {
 	ROLESPEC_CSTRING,			/* role name is stored as a C string */
+	ROLESPEC_CURRENT_ROLE,		/* role spec is CURRENT_ROLE */
 	ROLESPEC_CURRENT_USER,		/* role spec is CURRENT_USER */
 	ROLESPEC_SESSION_USER,		/* role spec is SESSION_USER */
 	ROLESPEC_PUBLIC				/* role name is "public" */
@@ -351,11 +353,12 @@ typedef struct FuncCall
 	List	   *args;			/* the arguments (list of exprs) */
 	List	   *agg_order;		/* ORDER BY (list of SortBy) */
 	Node	   *agg_filter;		/* FILTER clause, if any */
+	struct WindowDef *over;		/* OVER clause, if any */
 	bool		agg_within_group;	/* ORDER BY appeared in WITHIN GROUP */
 	bool		agg_star;		/* argument was really '*' */
 	bool		agg_distinct;	/* arguments were labeled DISTINCT */
 	bool		func_variadic;	/* last argument was labeled VARIADIC */
-	struct WindowDef *over;		/* OVER clause, if any */
+	CoercionForm funcformat;	/* how to display this node */
 	int			location;		/* token location, or -1 if unknown */
 } FuncCall;
 
@@ -701,6 +704,7 @@ typedef struct IndexElem
 	char	   *indexcolname;	/* name for index column; NULL = default */
 	List	   *collation;		/* name of collation; NIL = default */
 	List	   *opclass;		/* name of desired opclass; NIL = default */
+	List	   *opclassopts;	/* opclass-specific options, or NIL */
 	SortByDir	ordering;		/* ASC/DESC/default */
 	SortByNulls nulls_ordering; /* FIRST/LAST/default */
 } IndexElem;
@@ -937,12 +941,16 @@ typedef struct PartitionCmd
  *
  *	  updatedCols is also used in some other places, for example, to determine
  *	  which triggers to fire and in FDWs to know which changed columns they
- *	  need to ship off.  Generated columns that are caused to be updated by an
- *	  update to a base column are collected in extraUpdatedCols.  This is not
- *	  considered for permission checking, but it is useful in those places
- *	  that want to know the full set of columns being updated as opposed to
- *	  only the ones the user explicitly mentioned in the query.  (There is
- *	  currently no need for an extraInsertedCols, but it could exist.)
+ *	  need to ship off.
+ *
+ *	  Generated columns that are caused to be updated by an update to a base
+ *	  column are listed in extraUpdatedCols.  This is not considered for
+ *	  permission checking, but it is useful in those places that want to know
+ *	  the full set of columns being updated as opposed to only the ones the
+ *	  user explicitly mentioned in the query.  (There is currently no need for
+ *	  an extraInsertedCols, but it could exist.)  Note that extraUpdatedCols
+ *	  is populated during query rewrite, NOT in the parser, since generated
+ *	  columns could be added after a rule has been parsed and stored.
  *
  *	  securityQuals is a list of security barrier quals (boolean expressions),
  *	  to be tested in the listed order before returning a row from the
@@ -1630,6 +1638,7 @@ typedef struct SelectStmt
 	List	   *sortClause;		/* sort clause (a list of SortBy's) */
 	Node	   *limitOffset;	/* # of result tuples to skip */
 	Node	   *limitCount;		/* # of result tuples to return */
+	LimitOption limitOption;	/* limit type */
 	List	   *lockingClause;	/* FOR UPDATE (list of LockingClause's) */
 	WithClause *withClause;		/* WITH clause */
 
@@ -1787,7 +1796,7 @@ typedef struct AlterTableStmt
 	NodeTag		type;
 	RangeVar   *relation;		/* table to work on */
 	List	   *cmds;			/* list of subcommands */
-	ObjectType	relkind;		/* type of object */
+	ObjectType	objtype;		/* type of object */
 	bool		missing_ok;		/* skip error if table missing */
 } AlterTableStmt;
 
@@ -1797,6 +1806,7 @@ typedef enum AlterTableType
 	AT_AddColumnRecurse,		/* internal to commands/tablecmds.c */
 	AT_AddColumnToView,			/* implicitly via CREATE OR REPLACE VIEW */
 	AT_ColumnDefault,			/* alter column default */
+	AT_CookedColumnDefault,		/* add a pre-cooked column default */
 	AT_DropNotNull,				/* alter column drop not null */
 	AT_SetNotNull,				/* alter column set not null */
 	AT_DropExpression,			/* alter column drop expression */
@@ -1858,7 +1868,8 @@ typedef enum AlterTableType
 	AT_DetachPartition,			/* DETACH PARTITION */
 	AT_AddIdentity,				/* ADD IDENTITY */
 	AT_SetIdentity,				/* SET identity column options */
-	AT_DropIdentity				/* DROP IDENTITY */
+	AT_DropIdentity,			/* DROP IDENTITY */
+	AT_AlterCollationRefreshVersion /* ALTER COLLATION ... REFRESH VERSION */
 } AlterTableType;
 
 typedef struct ReplicaIdentityStmt
@@ -1874,6 +1885,7 @@ typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
 	AlterTableType subtype;		/* Type of table alteration to apply */
 	char	   *name;			/* column, constraint, or trigger to act on,
 								 * or tablespace */
+	List	   *object;			/* collation to act on if it's a collation */
 	int16		num;			/* attribute number for columns referenced by
 								 * number */
 	RoleSpec   *newowner;
@@ -1882,17 +1894,6 @@ typedef struct AlterTableCmd	/* one subcommand of an ALTER TABLE */
 	DropBehavior behavior;		/* RESTRICT or CASCADE for DROP cases */
 	bool		missing_ok;		/* skip error if missing? */
 } AlterTableCmd;
-
-
-/* ----------------------
- * Alter Collation
- * ----------------------
- */
-typedef struct AlterCollationStmt
-{
-	NodeTag		type;
-	List	   *collname;
-} AlterCollationStmt;
 
 
 /* ----------------------
@@ -2796,6 +2797,9 @@ typedef struct IndexStmt
 	char	   *idxcomment;		/* comment to apply to index, or NULL */
 	Oid			indexOid;		/* OID of an existing index, if any */
 	Oid			oldNode;		/* relfilenode of existing storage, if any */
+	SubTransactionId oldCreateSubid;	/* rd_createSubid of oldNode */
+	SubTransactionId oldFirstRelfilenodeSubid;	/* rd_firstRelfilenodeSubid of
+												 * oldNode */
 	bool		unique;			/* is index unique? */
 	bool		primary;		/* is index a primary key? */
 	bool		isconstraint;	/* is it for a pkey/unique constraint? */
@@ -2944,6 +2948,7 @@ typedef struct AlterObjectDependsStmt
 	RangeVar   *relation;		/* in case a table is involved */
 	Node	   *object;			/* name of the object */
 	Value	   *extname;		/* extension name */
+	bool		remove;			/* set true to remove dep rather than add */
 } AlterObjectDependsStmt;
 
 /* ----------------------
@@ -3282,7 +3287,7 @@ typedef struct CreateTableAsStmt
 	NodeTag		type;
 	Node	   *query;			/* the query (see comments above) */
 	IntoClause *into;			/* destination table */
-	ObjectType	relkind;		/* OBJECT_TABLE or OBJECT_MATVIEW */
+	ObjectType	objtype;		/* OBJECT_TABLE or OBJECT_MATVIEW */
 	bool		is_select_into; /* it was written as SELECT INTO */
 	bool		if_not_exists;	/* just do nothing if it already exists? */
 } CreateTableAsStmt;
@@ -3358,6 +3363,8 @@ typedef struct ConstraintsSetStmt
 /* Reindex options */
 #define REINDEXOPT_VERBOSE (1 << 0) /* print progress info */
 #define REINDEXOPT_REPORT_PROGRESS (1 << 1) /* report pgstat progress */
+#define REINDEXOPT_MISSING_OK (1 << 2)	/* skip missing relations */
+#define REINDEXOPT_CONCURRENTLY (1 << 3)	/* concurrent mode */
 
 typedef enum ReindexObjectType
 {
@@ -3376,7 +3383,6 @@ typedef struct ReindexStmt
 	RangeVar   *relation;		/* Table or index to reindex */
 	const char *name;			/* name of database to reindex */
 	int			options;		/* Reindex options flags */
-	bool		concurrent;		/* reindex concurrently? */
 } ReindexStmt;
 
 /* ----------------------

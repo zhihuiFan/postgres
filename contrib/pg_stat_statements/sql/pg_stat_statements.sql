@@ -4,6 +4,7 @@ CREATE EXTENSION pg_stat_statements;
 -- simple and compound statements
 --
 SET pg_stat_statements.track_utility = FALSE;
+SET pg_stat_statements.track_planning = TRUE;
 SELECT pg_stat_statements_reset();
 
 SELECT 1 AS "int";
@@ -100,6 +101,29 @@ SELECT * FROM test ORDER BY a;
 SELECT * FROM test WHERE a IN (1, 2, 3, 4, 5);
 
 SELECT query, calls, rows FROM pg_stat_statements ORDER BY query COLLATE "C";
+
+--
+-- INSERT, UPDATE, DELETE on test table to validate WAL generation metrics
+--
+SELECT pg_stat_statements_reset();
+
+-- utility "create table" should not be shown
+CREATE TABLE pgss_test (a int, b char(20));
+
+INSERT INTO pgss_test VALUES(generate_series(1, 10), 'aaa');
+UPDATE pgss_test SET b = 'bbb' WHERE a > 7;
+DELETE FROM pgss_test WHERE a > 9;
+-- DROP test table
+SET pg_stat_statements.track_utility = TRUE;
+DROP TABLE pgss_test;
+SET pg_stat_statements.track_utility = FALSE;
+
+-- Check WAL is generated for the above statements
+SELECT query, calls, rows,
+wal_bytes > 0 as wal_bytes_generated,
+wal_records > 0 as wal_records_generated,
+wal_records = rows as wal_records_as_rows
+FROM pg_stat_statements ORDER BY query COLLATE "C";
 
 --
 -- pg_stat_statements.track = none
@@ -227,6 +251,30 @@ DROP FUNCTION PLUS_TWO(INTEGER);
 SELECT query, calls, rows FROM pg_stat_statements ORDER BY query COLLATE "C";
 
 --
+-- Track the total number of rows retrieved or affected by the utility
+-- commands of COPY, FETCH, CREATE TABLE AS, CREATE MATERIALIZED VIEW
+-- and SELECT INTO
+--
+SELECT pg_stat_statements_reset();
+
+CREATE TABLE pgss_ctas AS SELECT a, 'ctas' b FROM generate_series(1, 10) a;
+SELECT generate_series(1, 10) c INTO pgss_select_into;
+COPY pgss_ctas (a, b) FROM STDIN;
+11	copy
+12	copy
+13	copy
+\.
+CREATE MATERIALIZED VIEW pgss_matv AS SELECT * FROM pgss_ctas;
+BEGIN;
+DECLARE pgss_cursor CURSOR FOR SELECT * FROM pgss_matv;
+FETCH NEXT pgss_cursor;
+FETCH FORWARD 5 pgss_cursor;
+FETCH FORWARD ALL pgss_cursor;
+COMMIT;
+
+SELECT query, plans, calls, rows FROM pg_stat_statements ORDER BY query COLLATE "C";
+
+--
 -- Track user activity and reset them
 --
 SELECT pg_stat_statements_reset();
@@ -289,5 +337,24 @@ SELECT query, calls, rows FROM pg_stat_statements ORDER BY query COLLATE "C";
 --
 DROP ROLE regress_stats_user1;
 DROP ROLE regress_stats_user2;
+DROP MATERIALIZED VIEW pgss_matv;
+DROP TABLE pgss_ctas;
+DROP TABLE pgss_select_into;
+
+--
+-- [re]plan counting
+--
+SELECT pg_stat_statements_reset();
+CREATE TABLE test ();
+PREPARE prep1 AS SELECT COUNT(*) FROM test;
+EXECUTE prep1;
+EXECUTE prep1;
+EXECUTE prep1;
+ALTER TABLE test ADD COLUMN x int;
+EXECUTE prep1;
+SELECT 42;
+SELECT 42;
+SELECT 42;
+SELECT query, plans, calls, rows FROM pg_stat_statements ORDER BY query COLLATE "C";
 
 DROP EXTENSION pg_stat_statements;

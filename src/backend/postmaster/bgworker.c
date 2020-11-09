@@ -731,9 +731,9 @@ StartBackgroundWorker(void)
 		pqsignal(SIGFPE, SIG_IGN);
 	}
 	pqsignal(SIGTERM, bgworker_die);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	pqsignal(SIGHUP, SIG_IGN);
 
-	pqsignal(SIGQUIT, SignalHandlerForCrashExit);
 	InitializeTimeouts();		/* establishes SIGALRM handler */
 
 	pqsignal(SIGPIPE, SIG_IGN);
@@ -743,7 +743,7 @@ StartBackgroundWorker(void)
 	/*
 	 * If an exception is encountered, processing resumes here.
 	 *
-	 * See notes in postgres.c about the design of this coding.
+	 * We just need to clean up, report the error, and go away.
 	 */
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0)
 	{
@@ -753,7 +753,14 @@ StartBackgroundWorker(void)
 		/* Prevent interrupts while cleaning up */
 		HOLD_INTERRUPTS();
 
-		/* Report the error to the server log */
+		/*
+		 * sigsetjmp will have blocked all signals, but we may need to accept
+		 * signals while communicating with our parallel leader.  Once we've
+		 * done HOLD_INTERRUPTS() it should be safe to unblock signals.
+		 */
+		BackgroundWorkerUnblockSignals();
+
+		/* Report the error to the parallel leader and the server log */
 		EmitErrorReport();
 
 		/*
@@ -1149,7 +1156,7 @@ WaitForBackgroundWorkerShutdown(BackgroundWorkerHandle *handle)
  * Instruct the postmaster to terminate a background worker.
  *
  * Note that it's safe to do this without regard to whether the worker is
- * still running, or even if the worker may already have existed and been
+ * still running, or even if the worker may already have exited and been
  * unregistered.
  */
 void

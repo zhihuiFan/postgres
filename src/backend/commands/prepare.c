@@ -616,7 +616,11 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 	EState	   *estate = NULL;
 	instr_time	planstart;
 	instr_time	planduration;
+	BufferUsage bufusage_start,
+				bufusage;
 
+	if (es->buffers)
+		bufusage_start = pgBufferUsage;
 	INSTR_TIME_SET_CURRENT(planstart);
 
 	/* Look it up in the hash table */
@@ -654,6 +658,13 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 	INSTR_TIME_SET_CURRENT(planduration);
 	INSTR_TIME_SUBTRACT(planduration, planstart);
 
+	/* calc differences of buffer counters. */
+	if (es->buffers)
+	{
+		memset(&bufusage, 0, sizeof(BufferUsage));
+		BufferUsageAccumDiff(&bufusage, &pgBufferUsage, &bufusage_start);
+	}
+
 	plan_list = cplan->stmt_list;
 
 	/* Explain each query */
@@ -663,7 +674,7 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 
 		if (pstmt->commandType != CMD_UTILITY)
 			ExplainOnePlan(pstmt, into, es, query_string, paramLI, queryEnv,
-						   &planduration);
+						   &planduration, (es->buffers ? &bufusage : NULL));
 		else
 			ExplainOneUtility(pstmt->utilityStmt, into, es, query_string,
 							  paramLI, queryEnv);
@@ -683,7 +694,8 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 
 /*
  * This set returning function reads all the prepared statements and
- * returns a set of (name, statement, prepare_time, param_types, from_sql).
+ * returns a set of (name, statement, prepare_time, param_types, from_sql,
+ * generic_plans, custom_plans).
  */
 Datum
 pg_prepared_statement(PG_FUNCTION_ARGS)
@@ -712,7 +724,7 @@ pg_prepared_statement(PG_FUNCTION_ARGS)
 	 * build tupdesc for result tuples. This must match the definition of the
 	 * pg_prepared_statements view in system_views.sql
 	 */
-	tupdesc = CreateTemplateTupleDesc(5);
+	tupdesc = CreateTemplateTupleDesc(7);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "name",
 					   TEXTOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "statement",
@@ -723,6 +735,10 @@ pg_prepared_statement(PG_FUNCTION_ARGS)
 					   REGTYPEARRAYOID, -1, 0);
 	TupleDescInitEntry(tupdesc, (AttrNumber) 5, "from_sql",
 					   BOOLOID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 6, "generic_plans",
+					   INT8OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 7, "custom_plans",
+					   INT8OID, -1, 0);
 
 	/*
 	 * We put all the tuples into a tuplestore in one scan of the hashtable.
@@ -744,8 +760,8 @@ pg_prepared_statement(PG_FUNCTION_ARGS)
 		hash_seq_init(&hash_seq, prepared_queries);
 		while ((prep_stmt = hash_seq_search(&hash_seq)) != NULL)
 		{
-			Datum		values[5];
-			bool		nulls[5];
+			Datum		values[7];
+			bool		nulls[7];
 
 			MemSet(nulls, 0, sizeof(nulls));
 
@@ -755,6 +771,8 @@ pg_prepared_statement(PG_FUNCTION_ARGS)
 			values[3] = build_regtype_array(prep_stmt->plansource->param_types,
 											prep_stmt->plansource->num_params);
 			values[4] = BoolGetDatum(prep_stmt->from_sql);
+			values[5] = Int64GetDatumFast(prep_stmt->plansource->num_generic_plans);
+			values[6] = Int64GetDatumFast(prep_stmt->plansource->num_custom_plans);
 
 			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 		}

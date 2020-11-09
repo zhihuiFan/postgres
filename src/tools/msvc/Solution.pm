@@ -64,7 +64,8 @@ sub DeterminePlatform
 		# Examine CL help output to determine if we are in 32 or 64-bit mode.
 		my $output = `cl /? 2>&1`;
 		$? >> 8 == 0 or die "cl command not found";
-		$self->{platform} = ($output =~ /^\/favor:<.+AMD64/m) ? 'x64' : 'Win32';
+		$self->{platform} =
+		  ($output =~ /^\/favor:<.+AMD64/m) ? 'x64' : 'Win32';
 	}
 	else
 	{
@@ -143,21 +144,24 @@ sub GetOpenSSLVersion
 
 sub GenerateFiles
 {
-	my $self = shift;
-	my $bits = $self->{platform} eq 'Win32' ? 32 : 64;
+	my $self          = shift;
+	my $bits          = $self->{platform} eq 'Win32' ? 32 : 64;
 	my $ac_init_found = 0;
 	my $package_name;
 	my $package_version;
 	my $package_bugreport;
 	my $package_url;
 	my ($majorver, $minorver);
+	my $ac_define_openssl_api_compat_found = 0;
+	my $openssl_api_compat;
 
-	# Parse configure.in to get version numbers
-	open(my $c, '<', "configure.in")
-	  || confess("Could not open configure.in for reading\n");
+	# Parse configure.ac to get version numbers
+	open(my $c, '<', "configure.ac")
+	  || confess("Could not open configure.ac for reading\n");
 	while (<$c>)
 	{
-		if (/^AC_INIT\(\[([^\]]+)\], \[([^\]]+)\], \[([^\]]+)\], \[([^\]]*)\], \[([^\]]+)\]/)
+		if (/^AC_INIT\(\[([^\]]+)\], \[([^\]]+)\], \[([^\]]+)\], \[([^\]]*)\], \[([^\]]+)\]/
+		  )
 		{
 			$ac_init_found = 1;
 
@@ -165,7 +169,7 @@ sub GenerateFiles
 			$package_version   = $2;
 			$package_bugreport = $3;
 			#$package_tarname   = $4;
-			$package_url       = $5;
+			$package_url = $5;
 
 			if ($package_version !~ /^(\d+)(?:\.(\d+))?/)
 			{
@@ -174,10 +178,15 @@ sub GenerateFiles
 			$majorver = sprintf("%d", $1);
 			$minorver = sprintf("%d", $2 ? $2 : 0);
 		}
+		elsif (/\bAC_DEFINE\(OPENSSL_API_COMPAT, \[([0-9xL]+)\]/)
+		{
+			$ac_define_openssl_api_compat_found = 1;
+			$openssl_api_compat = $1;
+		}
 	}
 	close($c);
-	confess "Unable to parse configure.in for all variables!"
-	  unless $ac_init_found;
+	confess "Unable to parse configure.ac for all variables!"
+	  unless $ac_init_found && $ac_define_openssl_api_compat_found;
 
 	if (IsNewer("src/include/pg_config_os.h", "src/include/port/win32.h"))
 	{
@@ -370,6 +379,7 @@ sub GenerateFiles
 		HAVE_STRUCT_SOCKADDR_STORAGE_SS_LEN      => undef,
 		HAVE_STRUCT_SOCKADDR_STORAGE___SS_FAMILY => undef,
 		HAVE_STRUCT_SOCKADDR_STORAGE___SS_LEN    => undef,
+		HAVE_STRUCT_SOCKADDR_UN                  => undef,
 		HAVE_STRUCT_TM_TM_ZONE                   => undef,
 		HAVE_SYNC_FILE_RANGE                     => undef,
 		HAVE_SYMLINK                             => 1,
@@ -397,7 +407,6 @@ sub GenerateFiles
 		HAVE_UINT8                               => undef,
 		HAVE_UNION_SEMUN                         => undef,
 		HAVE_UNISTD_H                            => 1,
-		HAVE_UNIX_SOCKETS                        => undef,
 		HAVE_UNSETENV                            => undef,
 		HAVE_USELOCALE                           => undef,
 		HAVE_UUID_BSD                            => undef,
@@ -431,6 +440,7 @@ sub GenerateFiles
 		LOCALE_T_IN_XLOCALE                      => undef,
 		MAXIMUM_ALIGNOF                          => 8,
 		MEMSET_LOOP_LIMIT                        => 1024,
+		OPENSSL_API_COMPAT                       => $openssl_api_compat,
 		PACKAGE_BUGREPORT                        => qq{"$package_bugreport"},
 		PACKAGE_NAME                             => qq{"$package_name"},
 		PACKAGE_STRING      => qq{"$package_name $package_version"},
@@ -494,8 +504,8 @@ sub GenerateFiles
 		inline            => '__inline',
 		pg_restrict       => '__restrict',
 		# not defined, because it'd conflict with __declspec(restrict)
-		restrict  => undef,
-		typeof    => undef,);
+		restrict => undef,
+		typeof   => undef,);
 
 	if ($self->{options}->{uuid})
 	{
@@ -528,9 +538,10 @@ sub GenerateFiles
 		}
 	}
 
-	$self->GenerateConfigHeader('src/include/pg_config.h', \%define, 1);
+	$self->GenerateConfigHeader('src/include/pg_config.h',     \%define, 1);
 	$self->GenerateConfigHeader('src/include/pg_config_ext.h', \%define, 0);
-	$self->GenerateConfigHeader('src/interfaces/ecpg/include/ecpg_config.h', \%define, 0);
+	$self->GenerateConfigHeader('src/interfaces/ecpg/include/ecpg_config.h',
+		\%define, 0);
 
 	$self->GenerateDefFile(
 		"src/interfaces/libpq/libpqdll.def",
@@ -823,7 +834,7 @@ EOF
 
 # Read lines from input file and substitute symbols using the same
 # logic that config.status uses.  There should be one call of this for
-# each AC_CONFIG_HEADERS call in configure.in.
+# each AC_CONFIG_HEADERS call in configure.ac.
 #
 # If the "required" argument is true, we also keep track which of our
 # defines have been found and error out if any are left unused at the
@@ -835,8 +846,8 @@ sub GenerateConfigHeader
 
 	my $config_header_in = $config_header . '.in';
 
-	if (IsNewer($config_header, $config_header_in) ||
-		IsNewer($config_header, __FILE__))
+	if (   IsNewer($config_header, $config_header_in)
+		|| IsNewer($config_header, __FILE__))
 	{
 		my %defines_copy = %$defines;
 
@@ -858,7 +869,8 @@ sub GenerateConfigHeader
 				{
 					if (defined $defines->{$macro})
 					{
-						print $o "#${ws}define $macro ", $defines->{$macro}, "\n";
+						print $o "#${ws}define $macro ", $defines->{$macro},
+						  "\n";
 					}
 					else
 					{
@@ -868,7 +880,8 @@ sub GenerateConfigHeader
 				}
 				else
 				{
-					croak "undefined symbol: $macro at $config_header line $.";
+					croak
+					  "undefined symbol: $macro at $config_header line $.";
 				}
 			}
 			else

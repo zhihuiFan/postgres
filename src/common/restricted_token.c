@@ -61,12 +61,12 @@ CreateRestrictedProcess(char *cmd, PROCESS_INFORMATION *processInfo)
 	Advapi32Handle = LoadLibrary("ADVAPI32.DLL");
 	if (Advapi32Handle == NULL)
 	{
-		pg_log_error("could not load advapi32.dll: error code %lu",
-					 GetLastError());
+		pg_log_error("could not load library \"%s\": error code %lu",
+					 "ADVAPI32.DLL", GetLastError());
 		return 0;
 	}
 
-	_CreateRestrictedToken = (__CreateRestrictedToken) GetProcAddress(Advapi32Handle, "CreateRestrictedToken");
+	_CreateRestrictedToken = (__CreateRestrictedToken) (pg_funcptr_t) GetProcAddress(Advapi32Handle, "CreateRestrictedToken");
 
 	if (_CreateRestrictedToken == NULL)
 	{

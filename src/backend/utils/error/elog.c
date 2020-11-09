@@ -403,7 +403,7 @@ matches_backtrace_functions(const char *funcname)
 	p = backtrace_symbol_list;
 	for (;;)
 	{
-		if (*p == '\0')		/* end of backtrace_symbol_list */
+		if (*p == '\0')			/* end of backtrace_symbol_list */
 			break;
 
 		if (strcmp(funcname, p) == 0)
@@ -711,10 +711,7 @@ errcode_for_socket_access(void)
 	switch (edata->saved_errno)
 	{
 			/* Loss of connection */
-		case EPIPE:
-#ifdef ECONNRESET
-		case ECONNRESET:
-#endif
+		case ALL_CONNECTION_FAILURE_ERRNOS:
 			edata->sqlerrcode = ERRCODE_CONNECTION_FAILURE;
 			break;
 
@@ -845,7 +842,7 @@ errmsg(const char *fmt,...)
 int
 errbacktrace(void)
 {
-	ErrorData   *edata = &errordata[errordata_stack_depth];
+	ErrorData  *edata = &errordata[errordata_stack_depth];
 	MemoryContext oldcontext;
 
 	recursion_depth++;
@@ -2448,6 +2445,29 @@ log_line_prefix(StringInfo buf, ErrorData *edata)
 				else
 					appendStringInfo(buf, "%d", MyProcPid);
 				break;
+
+			case 'P':
+				if (MyProc)
+				{
+					PGPROC	   *leader = MyProc->lockGroupLeader;
+
+					/*
+					 * Show the leader only for active parallel workers. This
+					 * leaves out the leader of a parallel group.
+					 */
+					if (leader == NULL || leader->pid == MyProcPid)
+						appendStringInfoSpaces(buf,
+											   padding > 0 ? padding : -padding);
+					else if (padding != 0)
+						appendStringInfo(buf, "%*d", padding, leader->pid);
+					else
+						appendStringInfo(buf, "%d", leader->pid);
+				}
+				else if (padding != 0)
+					appendStringInfoSpaces(buf,
+										   padding > 0 ? padding : -padding);
+				break;
+
 			case 'l':
 				if (padding != 0)
 					appendStringInfo(buf, "%*ld", padding, log_line_number);
@@ -2836,6 +2856,21 @@ write_csvlog(ErrorData *edata)
 	else
 		appendCSVLiteral(&buf, GetBackendTypeDesc(MyBackendType));
 
+	appendStringInfoChar(&buf, ',');
+
+	/* leader PID */
+	if (MyProc)
+	{
+		PGPROC	   *leader = MyProc->lockGroupLeader;
+
+		/*
+		 * Show the leader only for active parallel workers.  This leaves out
+		 * the leader of a parallel group.
+		 */
+		if (leader && leader->pid != MyProcPid)
+			appendStringInfo(&buf, "%d", leader->pid);
+	}
+
 	appendStringInfoChar(&buf, '\n');
 
 	/* If in the syslogger process, try to write messages direct to file */
@@ -2938,13 +2973,6 @@ send_message_to_server_log(ErrorData *edata)
 			append_with_tabs(&buf, edata->context);
 			appendStringInfoChar(&buf, '\n');
 		}
-		if (edata->backtrace)
-		{
-			log_line_prefix(&buf, edata);
-			appendStringInfoString(&buf, _("BACKTRACE:  "));
-			append_with_tabs(&buf, edata->backtrace);
-			appendStringInfoChar(&buf, '\n');
-		}
 		if (Log_error_verbosity >= PGERROR_VERBOSE)
 		{
 			/* assume no newlines in funcname or filename... */
@@ -2961,6 +2989,13 @@ send_message_to_server_log(ErrorData *edata)
 				appendStringInfo(&buf, _("LOCATION:  %s:%d\n"),
 								 edata->filename, edata->lineno);
 			}
+		}
+		if (edata->backtrace)
+		{
+			log_line_prefix(&buf, edata);
+			appendStringInfoString(&buf, _("BACKTRACE:  "));
+			append_with_tabs(&buf, edata->backtrace);
+			appendStringInfoChar(&buf, '\n');
 		}
 	}
 

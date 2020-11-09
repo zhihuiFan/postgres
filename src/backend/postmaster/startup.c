@@ -37,7 +37,6 @@
 /*
  * Flags set by interrupt handlers for later service in the redo loop.
  */
-static volatile sig_atomic_t got_SIGHUP = false;
 static volatile sig_atomic_t shutdown_requested = false;
 static volatile sig_atomic_t promote_signaled = false;
 
@@ -49,7 +48,6 @@ static volatile sig_atomic_t in_restore_command = false;
 
 /* Signal handlers */
 static void StartupProcTriggerHandler(SIGNAL_ARGS);
-static void StartupProcSigHupHandler(SIGNAL_ARGS);
 
 
 /* --------------------------------
@@ -64,19 +62,7 @@ StartupProcTriggerHandler(SIGNAL_ARGS)
 	int			save_errno = errno;
 
 	promote_signaled = true;
-	WakeupRecovery();
-
-	errno = save_errno;
-}
-
-/* SIGHUP: set flag to re-read config file at next convenient time */
-static void
-StartupProcSigHupHandler(SIGNAL_ARGS)
-{
-	int			save_errno = errno;
-
-	got_SIGHUP = true;
-	WakeupRecovery();
+	SetLatch(MyLatch);
 
 	errno = save_errno;
 }
@@ -91,9 +77,43 @@ StartupProcShutdownHandler(SIGNAL_ARGS)
 		proc_exit(1);
 	else
 		shutdown_requested = true;
-	WakeupRecovery();
+	SetLatch(MyLatch);
 
 	errno = save_errno;
+}
+
+/*
+ * Re-read the config file.
+ *
+ * If one of the critical walreceiver options has changed, flag xlog.c
+ * to restart it.
+ */
+static void
+StartupRereadConfig(void)
+{
+	char	   *conninfo = pstrdup(PrimaryConnInfo);
+	char	   *slotname = pstrdup(PrimarySlotName);
+	bool		tempSlot = wal_receiver_create_temp_slot;
+	bool		conninfoChanged;
+	bool		slotnameChanged;
+	bool		tempSlotChanged = false;
+
+	ProcessConfigFile(PGC_SIGHUP);
+
+	conninfoChanged = strcmp(conninfo, PrimaryConnInfo) != 0;
+	slotnameChanged = strcmp(slotname, PrimarySlotName) != 0;
+
+	/*
+	 * wal_receiver_create_temp_slot is used only when we have no slot
+	 * configured.  We do not need to track this change if it has no effect.
+	 */
+	if (!slotnameChanged && strcmp(PrimarySlotName, "") == 0)
+		tempSlotChanged = tempSlot != wal_receiver_create_temp_slot;
+	pfree(conninfo);
+	pfree(slotname);
+
+	if (conninfoChanged || slotnameChanged || tempSlotChanged)
+		StartupRequestWalReceiverRestart();
 }
 
 /* Handle various signals that might be sent to the startup process */
@@ -101,12 +121,12 @@ void
 HandleStartupProcInterrupts(void)
 {
 	/*
-	 * Check if we were requested to re-read config file.
+	 * Process any requests or signals received recently.
 	 */
-	if (got_SIGHUP)
+	if (ConfigReloadPending)
 	{
-		got_SIGHUP = false;
-		ProcessConfigFile(PGC_SIGHUP);
+		ConfigReloadPending = false;
+		StartupRereadConfig();
 	}
 
 	/*
@@ -138,10 +158,10 @@ StartupProcessMain(void)
 	/*
 	 * Properly accept or ignore signals the postmaster might send us.
 	 */
-	pqsignal(SIGHUP, StartupProcSigHupHandler); /* reload config file */
+	pqsignal(SIGHUP, SignalHandlerForConfigReload); /* reload config file */
 	pqsignal(SIGINT, SIG_IGN);	/* ignore query cancel */
 	pqsignal(SIGTERM, StartupProcShutdownHandler);	/* request shutdown */
-	pqsignal(SIGQUIT, SignalHandlerForCrashExit);
+	/* SIGQUIT handler was already set up by InitPostmasterChild */
 	InitializeTimeouts();		/* establishes SIGALRM handler */
 	pqsignal(SIGPIPE, SIG_IGN);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);

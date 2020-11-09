@@ -57,6 +57,7 @@ OBJS = \
 	lockfuncs.o \
 	mac.o \
 	mac8.o \
+	mcxtfuncs.o \
 	misc.o \
 	name.o \
 	network.o \
@@ -101,7 +102,6 @@ OBJS = \
 	tsvector.o \
 	tsvector_op.o \
 	tsvector_parser.o \
-	txid.o \
 	uuid.o \
 	varbit.o \
 	varchar.o \
@@ -109,6 +109,7 @@ OBJS = \
 	version.o \
 	windowfuncs.o \
 	xid.o \
+	xid8funcs.o \
 	xml.o
 
 jsonpath_scan.c: FLEXFLAGS = -CF -p -p
@@ -123,6 +124,9 @@ clean distclean maintainer-clean:
 	rm -f lex.backup
 
 like.o: like.c like_match.c
+
+# Some code in numeric.c benefits from auto-vectorization
+numeric.o: CFLAGS += ${CFLAGS_VECTORIZE}
 
 varlena.o: varlena.c levenshtein.c
 

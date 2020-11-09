@@ -123,6 +123,15 @@ GetForeignRelSize(PlannerInfo *root,
      should be replaced if at all possible.  The function may also choose to
      update <literal>baserel-&gt;width</literal> if it can compute a better estimate
      of the average result row width.
+     (The initial value is based on column data types and on column
+     average-width values measured by the last <command>ANALYZE</command>.)
+     Also, this function may update <literal>baserel-&gt;tuples</literal> if
+     it can compute a better estimate of the foreign table's total row count.
+     (The initial value is
+     from <structname>pg_class</structname>.<structfield>reltuples</structfield>
+     which represents the total row count seen by the
+     last <command>ANALYZE</command>; it will be <literal>-1</literal> if
+     no <command>ANALYZE</command> has been done on this foreign table.)
     </para>
 
     <para>
@@ -442,7 +451,7 @@ AddForeignUpdateTargets(Query *parsetree,
      generate junk columns of these names.
      If the extra expressions are more complex than simple Vars, they
      must be run through <function>eval_const_expressions</function>
-     before adding them to the targetlist.
+     before adding them to the target list.
     </para>
 
     <para>
@@ -852,11 +861,15 @@ PlanDirectModify(PlannerInfo *root,
      To execute the direct modification on the remote server, this function
      must rewrite the target subplan with a <structname>ForeignScan</structname> plan
      node that executes the direct modification on the remote server.  The
-     <structfield>operation</structfield> field of the <structname>ForeignScan</structname> must
-     be set to the <literal>CmdType</literal> enumeration appropriately; that is,
+     <structfield>operation</structfield> and <structfield>resultRelation</structfield> fields
+     of the <structname>ForeignScan</structname> must be set appropriately.
+     <structfield>operation</structfield> must be set to the <literal>CmdType</literal>
+     enumeration corresponding to the statement kind (that is,
      <literal>CMD_UPDATE</literal> for <command>UPDATE</command>,
      <literal>CMD_INSERT</literal> for <command>INSERT</command>, and
-     <literal>CMD_DELETE</literal> for <command>DELETE</command>.
+     <literal>CMD_DELETE</literal> for <command>DELETE</command>), and the
+     <literal>resultRelation</literal> argument must be copied to the
+     <structfield>resultRelation</structfield> field.
     </para>
 
     <para>
@@ -916,9 +929,8 @@ IterateDirectModify(ForeignScanState *node);
      needed for the <literal>RETURNING</literal> calculation, returning it in a
      tuple table slot (the node's <structfield>ScanTupleSlot</structfield> should be
      used for this purpose).  The data that was actually inserted, updated
-     or deleted must be stored in the
-     <literal>es_result_relation_info-&gt;ri_projectReturning-&gt;pi_exprContext-&gt;ecxt_scantuple</literal>
-     of the node's <structname>EState</structname>.
+     or deleted must be stored in
+     <literal>node->resultRelInfo->ri_projectReturning-&gt;pi_exprContext-&gt;ecxt_scantuple</literal>.
      Return NULL if no more rows are available.
      Note that this is called in a short-lived memory context that will be
      reset between invocations.  Create a memory context in

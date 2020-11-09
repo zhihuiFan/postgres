@@ -98,6 +98,7 @@
  *
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Function-Attributes.html
  * GCC: https://gcc.gnu.org/onlinedocs/gcc/Type-Attributes.html
+ * Clang: https://clang.llvm.org/docs/AttributeReference.html
  * Sunpro: https://docs.oracle.com/cd/E18659_01/html/821-1384/gjzke.html
  * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/function_attributes.html
  * XLC: https://www.ibm.com/support/knowledgecenter/SSGH2K_13.1.2/com.ibm.xlc131.aix.doc/language_ref/type_attrib.html
@@ -264,6 +265,13 @@
 #else
 #define dummyret	char
 #endif
+
+/*
+ * Generic function pointer.  This can be used in the rare cases where it's
+ * necessary to cast a function pointer to a seemingly incompatible function
+ * pointer type while avoiding gcc's -Wcast-function-type warnings.
+ */
+typedef void (*pg_funcptr_t) (void);
 
 /*
  * We require C99, hence the compiler should understand flexible array
@@ -925,35 +933,6 @@ extern void ExceptionalCondition(const char *conditionName,
  */
 #define Abs(x)			((x) >= 0 ? (x) : -(x))
 
-/*
- * StrNCpy
- *	Like standard library function strncpy(), except that result string
- *	is guaranteed to be null-terminated --- that is, at most N-1 bytes
- *	of the source string will be kept.
- *	Also, the macro returns no result (too hard to do that without
- *	evaluating the arguments multiple times, which seems worse).
- *
- *	BTW: when you need to copy a non-null-terminated string (like a text
- *	datum) and add a null, do not do it with StrNCpy(..., len+1).  That
- *	might seem to work, but it fetches one byte more than there is in the
- *	text object.  One fine day you'll have a SIGSEGV because there isn't
- *	another byte before the end of memory.  Don't laugh, we've had real
- *	live bug reports from real live users over exactly this mistake.
- *	Do it honestly with "memcpy(dst,src,len); dst[len] = '\0';", instead.
- */
-#define StrNCpy(dst,src,len) \
-	do \
-	{ \
-		char * _dst = (dst); \
-		Size _len = (len); \
-\
-		if (_len > 0) \
-		{ \
-			strncpy(_dst, (src), _len); \
-			_dst[_len-1] = '\0'; \
-		} \
-	} while (0)
-
 
 /* Get a bit mask of the bits set in non-long aligned addresses */
 #define LONG_ALIGN_MASK (sizeof(long) - 1)
@@ -1076,6 +1055,10 @@ extern void ExceptionalCondition(const char *conditionName,
  * ----------------------------------------------------------------
  */
 
+#ifdef HAVE_STRUCT_SOCKADDR_UN
+#define HAVE_UNIX_SOCKETS 1
+#endif
+
 /*
  * Invert the sign of a qsort-style comparison result, ie, exchange negative
  * and positive integer values, being careful not to get the wrong answer
@@ -1129,7 +1112,6 @@ typedef union PGAlignedXLogBlock
 #define STATUS_OK				(0)
 #define STATUS_ERROR			(-1)
 #define STATUS_EOF				(-2)
-#define STATUS_WAITING			(2)
 
 /*
  * gettext support
@@ -1151,7 +1133,8 @@ typedef union PGAlignedXLogBlock
  *	access to the original string and translated string, and for cases where
  *	immediate translation is not possible, like when initializing global
  *	variables.
- *		http://www.gnu.org/software/autoconf/manual/gettext/Special-cases.html
+ *
+ *	https://www.gnu.org/software/gettext/manual/html_node/Special-cases.html
  */
 #define gettext_noop(x) (x)
 

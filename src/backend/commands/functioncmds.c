@@ -194,8 +194,8 @@ interpret_function_parameter_list(ParseState *pstate,
 								  Oid *requiredResultType)
 {
 	int			parameterCount = list_length(parameters);
-	Oid		   *inTypes;
-	int			inCount = 0;
+	Oid		   *sigArgTypes;
+	int			sigArgCount = 0;
 	Datum	   *allTypes;
 	Datum	   *paramModes;
 	Datum	   *paramNames;
@@ -209,7 +209,7 @@ interpret_function_parameter_list(ParseState *pstate,
 	*variadicArgType = InvalidOid;	/* default result */
 	*requiredResultType = InvalidOid;	/* default result */
 
-	inTypes = (Oid *) palloc(parameterCount * sizeof(Oid));
+	sigArgTypes = (Oid *) palloc(parameterCount * sizeof(Oid));
 	allTypes = (Datum *) palloc(parameterCount * sizeof(Datum));
 	paramModes = (Datum *) palloc(parameterCount * sizeof(Datum));
 	paramNames = (Datum *) palloc0(parameterCount * sizeof(Datum));
@@ -281,25 +281,21 @@ interpret_function_parameter_list(ParseState *pstate,
 						 errmsg("functions cannot accept set arguments")));
 		}
 
-		if (objtype == OBJECT_PROCEDURE)
-		{
-			if (fp->mode == FUNC_PARAM_OUT)
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("procedures cannot have OUT arguments"),
-						 errhint("INOUT arguments are permitted.")));
-		}
-
 		/* handle input parameters */
 		if (fp->mode != FUNC_PARAM_OUT && fp->mode != FUNC_PARAM_TABLE)
+			isinput = true;
+
+		/* handle signature parameters */
+		if (fp->mode == FUNC_PARAM_IN || fp->mode == FUNC_PARAM_INOUT ||
+			(objtype == OBJECT_PROCEDURE && fp->mode == FUNC_PARAM_OUT) ||
+			fp->mode == FUNC_PARAM_VARIADIC)
 		{
-			/* other input parameters can't follow a VARIADIC parameter */
+			/* other signature parameters can't follow a VARIADIC parameter */
 			if (varCount > 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("VARIADIC parameter must be the last input parameter")));
-			inTypes[inCount++] = toid;
-			isinput = true;
+						 errmsg("VARIADIC parameter must be the last signature parameter")));
+			sigArgTypes[sigArgCount++] = toid;
 		}
 
 		/* handle output parameters */
@@ -429,7 +425,7 @@ interpret_function_parameter_list(ParseState *pstate,
 	}
 
 	/* Now construct the proper outputs as needed */
-	*parameterTypes = buildoidvector(inTypes, inCount);
+	*parameterTypes = buildoidvector(sigArgTypes, sigArgCount);
 
 	if (outCount > 0 || varCount > 0)
 	{
@@ -1417,7 +1413,7 @@ CreateCast(CreateCastStmt *stmt)
 	char		castmethod;
 	HeapTuple	tuple;
 	AclResult	aclresult;
-	ObjectAddress	myself;
+	ObjectAddress myself;
 
 	sourcetypeid = typenameTypeId(NULL, stmt->sourcetype);
 	targettypeid = typenameTypeId(NULL, stmt->targettype);
@@ -1646,32 +1642,6 @@ CreateCast(CreateCastStmt *stmt)
 	return myself;
 }
 
-void
-DropCastById(Oid castOid)
-{
-	Relation	relation;
-	ScanKeyData scankey;
-	SysScanDesc scan;
-	HeapTuple	tuple;
-
-	relation = table_open(CastRelationId, RowExclusiveLock);
-
-	ScanKeyInit(&scankey,
-				Anum_pg_cast_oid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(castOid));
-	scan = systable_beginscan(relation, CastOidIndexId, true,
-							  NULL, 1, &scankey);
-
-	tuple = systable_getnext(scan);
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "could not find tuple for cast %u", castOid);
-	CatalogTupleDelete(relation, &tuple->t_self);
-
-	systable_endscan(scan);
-	table_close(relation, RowExclusiveLock);
-}
-
 
 static void
 check_transform_function(Form_pg_proc procstruct)
@@ -1722,6 +1692,7 @@ CreateTransform(CreateTransformStmt *stmt)
 	Relation	relation;
 	ObjectAddress myself,
 				referenced;
+	ObjectAddresses *addrs;
 	bool		is_replace;
 
 	/*
@@ -1862,38 +1833,33 @@ CreateTransform(CreateTransformStmt *stmt)
 	if (is_replace)
 		deleteDependencyRecordsFor(TransformRelationId, transformid, true);
 
+	addrs = new_object_addresses();
+
 	/* make dependency entries */
-	myself.classId = TransformRelationId;
-	myself.objectId = transformid;
-	myself.objectSubId = 0;
+	ObjectAddressSet(myself, TransformRelationId, transformid);
 
 	/* dependency on language */
-	referenced.classId = LanguageRelationId;
-	referenced.objectId = langid;
-	referenced.objectSubId = 0;
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, LanguageRelationId, langid);
+	add_exact_object_address(&referenced, addrs);
 
 	/* dependency on type */
-	referenced.classId = TypeRelationId;
-	referenced.objectId = typeid;
-	referenced.objectSubId = 0;
-	recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+	ObjectAddressSet(referenced, TypeRelationId, typeid);
+	add_exact_object_address(&referenced, addrs);
 
 	/* dependencies on functions */
 	if (OidIsValid(fromsqlfuncid))
 	{
-		referenced.classId = ProcedureRelationId;
-		referenced.objectId = fromsqlfuncid;
-		referenced.objectSubId = 0;
-		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+		ObjectAddressSet(referenced, ProcedureRelationId, fromsqlfuncid);
+		add_exact_object_address(&referenced, addrs);
 	}
 	if (OidIsValid(tosqlfuncid))
 	{
-		referenced.classId = ProcedureRelationId;
-		referenced.objectId = tosqlfuncid;
-		referenced.objectSubId = 0;
-		recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+		ObjectAddressSet(referenced, ProcedureRelationId, tosqlfuncid);
+		add_exact_object_address(&referenced, addrs);
 	}
+
+	record_object_address_dependencies(&myself, addrs, DEPENDENCY_NORMAL);
+	free_object_addresses(addrs);
 
 	/* dependency on extension */
 	recordDependencyOnCurrentExtension(&myself, is_replace);
@@ -1930,33 +1896,6 @@ get_transform_oid(Oid type_id, Oid lang_id, bool missing_ok)
 						format_type_be(type_id),
 						get_language_name(lang_id, false))));
 	return oid;
-}
-
-
-void
-DropTransformById(Oid transformOid)
-{
-	Relation	relation;
-	ScanKeyData scankey;
-	SysScanDesc scan;
-	HeapTuple	tuple;
-
-	relation = table_open(TransformRelationId, RowExclusiveLock);
-
-	ScanKeyInit(&scankey,
-				Anum_pg_transform_oid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(transformOid));
-	scan = systable_beginscan(relation, TransformOidIndexId, true,
-							  NULL, 1, &scankey);
-
-	tuple = systable_getnext(scan);
-	if (!HeapTupleIsValid(tuple))
-		elog(ERROR, "could not find tuple for transform %u", transformOid);
-	CatalogTupleDelete(relation, &tuple->t_self);
-
-	systable_endscan(scan);
-	table_close(relation, RowExclusiveLock);
 }
 
 
@@ -2124,6 +2063,9 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 	int			nargs;
 	int			i;
 	AclResult	aclresult;
+	Oid		   *argtypes;
+	char	  **argnames;
+	char	   *argmodes;
 	FmgrInfo	flinfo;
 	CallContext *callcontext;
 	EState	   *estate;
@@ -2184,6 +2126,8 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 											tp);
 	nargs = list_length(fexpr->args);
 
+	get_func_arg_info(tp, &argtypes, &argnames, &argmodes);
+
 	ReleaseSysCache(tp);
 
 	/* safety check; see ExecInitFunc() */
@@ -2213,16 +2157,24 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 	i = 0;
 	foreach(lc, fexpr->args)
 	{
-		ExprState  *exprstate;
-		Datum		val;
-		bool		isnull;
+		if (argmodes && argmodes[i] == PROARGMODE_OUT)
+		{
+			fcinfo->args[i].value = 0;
+			fcinfo->args[i].isnull = true;
+		}
+		else
+		{
+			ExprState  *exprstate;
+			Datum		val;
+			bool		isnull;
 
-		exprstate = ExecPrepareExpr(lfirst(lc), estate);
+			exprstate = ExecPrepareExpr(lfirst(lc), estate);
 
-		val = ExecEvalExprSwitchContext(exprstate, econtext, &isnull);
+			val = ExecEvalExprSwitchContext(exprstate, econtext, &isnull);
 
-		fcinfo->args[i].value = val;
-		fcinfo->args[i].isnull = isnull;
+			fcinfo->args[i].value = val;
+			fcinfo->args[i].isnull = isnull;
+		}
 
 		i++;
 	}

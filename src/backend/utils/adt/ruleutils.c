@@ -443,6 +443,7 @@ static void get_agg_expr(Aggref *aggref, deparse_context *context,
 static void get_agg_combine_expr(Node *node, deparse_context *context,
 								 void *callback_arg);
 static void get_windowfunc_expr(WindowFunc *wfunc, deparse_context *context);
+static bool get_func_sql_syntax(FuncExpr *expr, deparse_context *context);
 static void get_coercion_expr(Node *arg, deparse_context *context,
 							  Oid resulttype, int32 resulttypmod,
 							  Node *parentNode);
@@ -480,6 +481,7 @@ static void add_cast_to(StringInfo buf, Oid typid);
 static char *generate_qualified_type_name(Oid typid);
 static text *string_to_text(char *str);
 static char *flatten_reloptions(Oid relid);
+static void get_reloptions(StringInfo buf, Datum reloptions);
 
 #define only_marker(rte)  ((rte)->inh ? "" : "ONLY ")
 
@@ -1384,6 +1386,8 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 		{
 			int16		opt = indoption->values[keyno];
 			Oid			indcoll = indcollation->values[keyno];
+			Datum		attoptions = get_attoptions(indexrelid, keyno + 1);
+			bool		has_options = attoptions != (Datum) 0;
 
 			/* Add collation, if not default for column */
 			if (OidIsValid(indcoll) && indcoll != keycolcollation)
@@ -1391,7 +1395,15 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 								 generate_collation_name((indcoll)));
 
 			/* Add the operator class name, if not default */
-			get_opclass_name(indclass->values[keyno], keycoltype, &buf);
+			get_opclass_name(indclass->values[keyno],
+							 has_options ? InvalidOid : keycoltype, &buf);
+
+			if (has_options)
+			{
+				appendStringInfoString(&buf, " (");
+				get_reloptions(&buf, attoptions);
+				appendStringInfoChar(&buf, ')');
+			}
 
 			/* Add options if relevant */
 			if (amroutine->amcanorder)
@@ -2478,7 +2490,7 @@ pg_get_userbyid(PG_FUNCTION_ARGS)
 	if (HeapTupleIsValid(roletup))
 	{
 		role_rec = (Form_pg_authid) GETSTRUCT(roletup);
-		StrNCpy(NameStr(*result), NameStr(role_rec->rolname), NAMEDATALEN);
+		*result = role_rec->rolname;
 		ReleaseSysCache(roletup);
 	}
 	else
@@ -3543,11 +3555,6 @@ set_rtable_names(deparse_namespace *dpns, List *parent_namespaces,
 					hentry->counter++;
 					for (;;)
 					{
-						/*
-						 * We avoid using %.*s here because it can misbehave
-						 * if the data is not valid in what libc thinks is the
-						 * prevailing encoding.
-						 */
 						memcpy(modname, refname, refnamelen);
 						sprintf(modname + refnamelen, "_%d", hentry->counter);
 						if (strlen(modname) < NAMEDATALEN)
@@ -4427,11 +4434,6 @@ make_colname_unique(char *colname, deparse_namespace *dpns,
 			i++;
 			for (;;)
 			{
-				/*
-				 * We avoid using %.*s here because it can misbehave if the
-				 * data is not valid in what libc thinks is the prevailing
-				 * encoding.
-				 */
 				memcpy(modname, colname, colnamelen);
 				sprintf(modname + colnamelen, "_%d", i);
 				if (strlen(modname) < NAMEDATALEN)
@@ -4732,7 +4734,7 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	bool		is_instead;
 	char	   *ev_qual;
 	char	   *ev_action;
-	List	   *actions = NIL;
+	List	   *actions;
 	Relation	ev_relation;
 	TupleDesc	viewResultDesc = NULL;
 	int			fno;
@@ -4762,14 +4764,16 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	Assert(!isnull);
 	is_instead = DatumGetBool(dat);
 
-	/* these could be nulls */
 	fno = SPI_fnumber(rulettc, "ev_qual");
 	ev_qual = SPI_getvalue(ruletup, rulettc, fno);
+	Assert(ev_qual != NULL);
 
 	fno = SPI_fnumber(rulettc, "ev_action");
 	ev_action = SPI_getvalue(ruletup, rulettc, fno);
-	if (ev_action != NULL)
-		actions = (List *) stringToNode(ev_action);
+	Assert(ev_action != NULL);
+	actions = (List *) stringToNode(ev_action);
+	if (actions == NIL)
+		elog(ERROR, "invalid empty ev_action list");
 
 	ev_relation = table_open(ev_class, AccessShareLock);
 
@@ -4819,9 +4823,7 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 					 generate_qualified_relation_name(ev_class));
 
 	/* If the rule has an event qualification, add it */
-	if (ev_qual == NULL)
-		ev_qual = "";
-	if (strlen(ev_qual) > 0 && strcmp(ev_qual, "<>") != 0)
+	if (strcmp(ev_qual, "<>") != 0)
 	{
 		Node	   *qual;
 		Query	   *query;
@@ -4892,10 +4894,6 @@ make_ruledef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 		}
 		appendStringInfoString(buf, ");");
 	}
-	else if (list_length(actions) == 0)
-	{
-		appendStringInfoString(buf, "NOTHING;");
-	}
 	else
 	{
 		Query	   *query;
@@ -4925,7 +4923,7 @@ make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	bool		is_instead;
 	char	   *ev_qual;
 	char	   *ev_action;
-	List	   *actions = NIL;
+	List	   *actions;
 	Relation	ev_relation;
 	int			fno;
 	Datum		dat;
@@ -4949,14 +4947,14 @@ make_viewdef(StringInfo buf, HeapTuple ruletup, TupleDesc rulettc,
 	Assert(!isnull);
 	is_instead = DatumGetBool(dat);
 
-	/* these could be nulls */
 	fno = SPI_fnumber(rulettc, "ev_qual");
 	ev_qual = SPI_getvalue(ruletup, rulettc, fno);
+	Assert(ev_qual != NULL);
 
 	fno = SPI_fnumber(rulettc, "ev_action");
 	ev_action = SPI_getvalue(ruletup, rulettc, fno);
-	if (ev_action != NULL)
-		actions = (List *) stringToNode(ev_action);
+	Assert(ev_action != NULL);
+	actions = (List *) stringToNode(ev_action);
 
 	if (list_length(actions) != 1)
 	{
@@ -5232,7 +5230,10 @@ get_select_query_def(Query *query, deparse_context *context,
 						 force_colno, context);
 	}
 
-	/* Add the LIMIT clause if given */
+	/*
+	 * Add the LIMIT/OFFSET clauses if given. If non-default options, use the
+	 * standard spelling of LIMIT.
+	 */
 	if (query->limitOffset != NULL)
 	{
 		appendContextKeyword(context, " OFFSET ",
@@ -5241,13 +5242,23 @@ get_select_query_def(Query *query, deparse_context *context,
 	}
 	if (query->limitCount != NULL)
 	{
-		appendContextKeyword(context, " LIMIT ",
-							 -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
-		if (IsA(query->limitCount, Const) &&
-			((Const *) query->limitCount)->constisnull)
-			appendStringInfoString(buf, "ALL");
-		else
+		if (query->limitOption == LIMIT_OPTION_WITH_TIES)
+		{
+			appendContextKeyword(context, " FETCH FIRST ",
+								 -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
 			get_rule_expr(query->limitCount, context, false);
+			appendStringInfoString(buf, " ROWS WITH TIES");
+		}
+		else
+		{
+			appendContextKeyword(context, " LIMIT ",
+								 -PRETTYINDENT_STD, PRETTYINDENT_STD, 0);
+			if (IsA(query->limitCount, Const) &&
+				((Const *) query->limitCount)->constisnull)
+				appendStringInfoString(buf, "ALL");
+			else
+				get_rule_expr(query->limitCount, context, false);
+		}
 	}
 
 	/* Add FOR [KEY] UPDATE/SHARE clauses if present */
@@ -5805,8 +5816,8 @@ get_rule_sortgroupclause(Index ref, List *tlist, bool force_colno,
 		 */
 		bool		need_paren = (PRETTY_PAREN(context)
 								  || IsA(expr, FuncExpr)
-								  ||IsA(expr, Aggref)
-								  ||IsA(expr, WindowFunc));
+								  || IsA(expr, Aggref)
+								  || IsA(expr, WindowFunc));
 
 		if (need_paren)
 			appendStringInfoChar(context->buf, '(');
@@ -8099,7 +8110,7 @@ get_rule_expr(Node *node, deparse_context *context,
 			{
 				BoolExpr   *expr = (BoolExpr *) node;
 				Node	   *first_arg = linitial(expr->args);
-				ListCell   *arg = list_second_cell(expr->args);
+				ListCell   *arg;
 
 				switch (expr->boolop)
 				{
@@ -8108,12 +8119,11 @@ get_rule_expr(Node *node, deparse_context *context,
 							appendStringInfoChar(buf, '(');
 						get_rule_expr_paren(first_arg, context,
 											false, node);
-						while (arg)
+						for_each_from(arg, expr->args, 1)
 						{
 							appendStringInfoString(buf, " AND ");
 							get_rule_expr_paren((Node *) lfirst(arg), context,
 												false, node);
-							arg = lnext(expr->args, arg);
 						}
 						if (!PRETTY_PAREN(context))
 							appendStringInfoChar(buf, ')');
@@ -8124,12 +8134,11 @@ get_rule_expr(Node *node, deparse_context *context,
 							appendStringInfoChar(buf, '(');
 						get_rule_expr_paren(first_arg, context,
 											false, node);
-						while (arg)
+						for_each_from(arg, expr->args, 1)
 						{
 							appendStringInfoString(buf, " OR ");
 							get_rule_expr_paren((Node *) lfirst(arg), context,
 												false, node);
-							arg = lnext(expr->args, arg);
 						}
 						if (!PRETTY_PAREN(context))
 							appendStringInfoChar(buf, ')');
@@ -8178,7 +8187,12 @@ get_rule_expr(Node *node, deparse_context *context,
 				AlternativeSubPlan *asplan = (AlternativeSubPlan *) node;
 				ListCell   *lc;
 
-				/* As above, this can only happen during EXPLAIN */
+				/*
+				 * This case cannot be reached in normal usage, since no
+				 * AlternativeSubPlan can appear either in parsetrees or
+				 * finished plan trees.  We keep it just in case somebody
+				 * wants to use this code to print planner data structures.
+				 */
 				appendStringInfoString(buf, "(alternatives: ");
 				foreach(lc, asplan->subplans)
 				{
@@ -9142,7 +9156,8 @@ looks_like_function(Node *node)
 	{
 		case T_FuncExpr:
 			/* OK, unless it's going to deparse as a cast */
-			return (((FuncExpr *) node)->funcformat == COERCE_EXPLICIT_CALL);
+			return (((FuncExpr *) node)->funcformat == COERCE_EXPLICIT_CALL ||
+					((FuncExpr *) node)->funcformat == COERCE_SQL_SYNTAX);
 		case T_NullIfExpr:
 		case T_CoalesceExpr:
 		case T_MinMaxExpr:
@@ -9184,35 +9199,14 @@ get_oper_expr(OpExpr *expr, deparse_context *context)
 	}
 	else
 	{
-		/* unary operator --- but which side? */
+		/* prefix operator */
 		Node	   *arg = (Node *) linitial(args);
-		HeapTuple	tp;
-		Form_pg_operator optup;
 
-		tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
-		if (!HeapTupleIsValid(tp))
-			elog(ERROR, "cache lookup failed for operator %u", opno);
-		optup = (Form_pg_operator) GETSTRUCT(tp);
-		switch (optup->oprkind)
-		{
-			case 'l':
-				appendStringInfo(buf, "%s ",
-								 generate_operator_name(opno,
-														InvalidOid,
-														exprType(arg)));
-				get_rule_expr_paren(arg, context, true, (Node *) expr);
-				break;
-			case 'r':
-				get_rule_expr_paren(arg, context, true, (Node *) expr);
-				appendStringInfo(buf, " %s",
-								 generate_operator_name(opno,
-														exprType(arg),
-														InvalidOid));
-				break;
-			default:
-				elog(ERROR, "bogus oprkind: %d", optup->oprkind);
-		}
-		ReleaseSysCache(tp);
+		appendStringInfo(buf, "%s ",
+						 generate_operator_name(opno,
+												InvalidOid,
+												exprType(arg)));
+		get_rule_expr_paren(arg, context, true, (Node *) expr);
 	}
 	if (!PRETTY_PAREN(context))
 		appendStringInfoChar(buf, ')');
@@ -9263,6 +9257,17 @@ get_func_expr(FuncExpr *expr, deparse_context *context,
 						  (Node *) expr);
 
 		return;
+	}
+
+	/*
+	 * If the function was called using one of the SQL spec's random special
+	 * syntaxes, try to reproduce that.  If we don't recognize the function,
+	 * fall through.
+	 */
+	if (expr->funcformat == COERCE_SQL_SYNTAX)
+	{
+		if (get_func_sql_syntax(expr, context))
+			return;
 	}
 
 	/*
@@ -9498,6 +9503,223 @@ get_windowfunc_expr(WindowFunc *wfunc, deparse_context *context)
 		 */
 		appendStringInfoString(buf, "(?)");
 	}
+}
+
+/*
+ * get_func_sql_syntax		- Parse back a SQL-syntax function call
+ *
+ * Returns true if we successfully deparsed, false if we did not
+ * recognize the function.
+ */
+static bool
+get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
+{
+	StringInfo	buf = context->buf;
+	Oid			funcoid = expr->funcid;
+
+	switch (funcoid)
+	{
+		case F_TIMEZONE_INTERVAL_TIMESTAMP:
+		case F_TIMEZONE_INTERVAL_TIMESTAMPTZ:
+		case F_TIMEZONE_INTERVAL_TIMETZ:
+		case F_TIMEZONE_TEXT_TIMESTAMP:
+		case F_TIMEZONE_TEXT_TIMESTAMPTZ:
+		case F_TIMEZONE_TEXT_TIMETZ:
+			/* AT TIME ZONE ... note reversed argument order */
+			appendStringInfoChar(buf, '(');
+			get_rule_expr((Node *) lsecond(expr->args), context, false);
+			appendStringInfoString(buf, " AT TIME ZONE ");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoChar(buf, ')');
+			return true;
+
+		case F_OVERLAPS_TIMESTAMPTZ_INTERVAL_TIMESTAMPTZ_INTERVAL:
+		case F_OVERLAPS_TIMESTAMPTZ_INTERVAL_TIMESTAMPTZ_TIMESTAMPTZ:
+		case F_OVERLAPS_TIMESTAMPTZ_TIMESTAMPTZ_TIMESTAMPTZ_INTERVAL:
+		case F_OVERLAPS_TIMESTAMPTZ_TIMESTAMPTZ_TIMESTAMPTZ_TIMESTAMPTZ:
+		case F_OVERLAPS_TIMESTAMP_INTERVAL_TIMESTAMP_INTERVAL:
+		case F_OVERLAPS_TIMESTAMP_INTERVAL_TIMESTAMP_TIMESTAMP:
+		case F_OVERLAPS_TIMESTAMP_TIMESTAMP_TIMESTAMP_INTERVAL:
+		case F_OVERLAPS_TIMESTAMP_TIMESTAMP_TIMESTAMP_TIMESTAMP:
+		case F_OVERLAPS_TIMETZ_TIMETZ_TIMETZ_TIMETZ:
+		case F_OVERLAPS_TIME_INTERVAL_TIME_INTERVAL:
+		case F_OVERLAPS_TIME_INTERVAL_TIME_TIME:
+		case F_OVERLAPS_TIME_TIME_TIME_INTERVAL:
+		case F_OVERLAPS_TIME_TIME_TIME_TIME:
+			/* (x1, x2) OVERLAPS (y1, y2) */
+			appendStringInfoString(buf, "((");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoString(buf, ", ");
+			get_rule_expr((Node *) lsecond(expr->args), context, false);
+			appendStringInfoString(buf, ") OVERLAPS (");
+			get_rule_expr((Node *) lthird(expr->args), context, false);
+			appendStringInfoString(buf, ", ");
+			get_rule_expr((Node *) lfourth(expr->args), context, false);
+			appendStringInfoString(buf, "))");
+			return true;
+
+		case F_IS_NORMALIZED:
+			/* IS xxx NORMALIZED */
+			appendStringInfoString(buf, "((");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoString(buf, ") IS");
+			if (list_length(expr->args) == 2)
+			{
+				Const	   *con = (Const *) lsecond(expr->args);
+
+				Assert(IsA(con, Const) &&
+					   con->consttype == TEXTOID &&
+					   !con->constisnull);
+				appendStringInfo(buf, " %s",
+								 TextDatumGetCString(con->constvalue));
+			}
+			appendStringInfoString(buf, " NORMALIZED)");
+			return true;
+
+		case F_PG_COLLATION_FOR:
+			/* COLLATION FOR */
+			appendStringInfoString(buf, "COLLATION FOR (");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoChar(buf, ')');
+			return true;
+
+			/*
+			 * XXX EXTRACT, a/k/a date_part(), is intentionally not covered
+			 * yet.  Add it after we change the return type to numeric.
+			 */
+
+		case F_NORMALIZE:
+			/* NORMALIZE() */
+			appendStringInfoString(buf, "NORMALIZE(");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			if (list_length(expr->args) == 2)
+			{
+				Const	   *con = (Const *) lsecond(expr->args);
+
+				Assert(IsA(con, Const) &&
+					   con->consttype == TEXTOID &&
+					   !con->constisnull);
+				appendStringInfo(buf, ", %s",
+								 TextDatumGetCString(con->constvalue));
+			}
+			appendStringInfoChar(buf, ')');
+			return true;
+
+		case F_OVERLAY_BIT_BIT_INT4:
+		case F_OVERLAY_BIT_BIT_INT4_INT4:
+		case F_OVERLAY_BYTEA_BYTEA_INT4:
+		case F_OVERLAY_BYTEA_BYTEA_INT4_INT4:
+		case F_OVERLAY_TEXT_TEXT_INT4:
+		case F_OVERLAY_TEXT_TEXT_INT4_INT4:
+			/* OVERLAY() */
+			appendStringInfoString(buf, "OVERLAY(");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoString(buf, " PLACING ");
+			get_rule_expr((Node *) lsecond(expr->args), context, false);
+			appendStringInfoString(buf, " FROM ");
+			get_rule_expr((Node *) lthird(expr->args), context, false);
+			if (list_length(expr->args) == 4)
+			{
+				appendStringInfoString(buf, " FOR ");
+				get_rule_expr((Node *) lfourth(expr->args), context, false);
+			}
+			appendStringInfoChar(buf, ')');
+			return true;
+
+		case F_POSITION_BIT_BIT:
+		case F_POSITION_BYTEA_BYTEA:
+		case F_POSITION_TEXT_TEXT:
+			/* POSITION() ... extra parens since args are b_expr not a_expr */
+			appendStringInfoString(buf, "POSITION((");
+			get_rule_expr((Node *) lsecond(expr->args), context, false);
+			appendStringInfoString(buf, ") IN (");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoString(buf, "))");
+			return true;
+
+		case F_SUBSTRING_BIT_INT4:
+		case F_SUBSTRING_BIT_INT4_INT4:
+		case F_SUBSTRING_BYTEA_INT4:
+		case F_SUBSTRING_BYTEA_INT4_INT4:
+		case F_SUBSTRING_TEXT_INT4:
+		case F_SUBSTRING_TEXT_INT4_INT4:
+			/* SUBSTRING FROM/FOR (i.e., integer-position variants) */
+			appendStringInfoString(buf, "SUBSTRING(");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoString(buf, " FROM ");
+			get_rule_expr((Node *) lsecond(expr->args), context, false);
+			if (list_length(expr->args) == 3)
+			{
+				appendStringInfoString(buf, " FOR ");
+				get_rule_expr((Node *) lthird(expr->args), context, false);
+			}
+			appendStringInfoChar(buf, ')');
+			return true;
+
+		case F_SUBSTRING_TEXT_TEXT_TEXT:
+			/* SUBSTRING SIMILAR/ESCAPE */
+			appendStringInfoString(buf, "SUBSTRING(");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoString(buf, " SIMILAR ");
+			get_rule_expr((Node *) lsecond(expr->args), context, false);
+			appendStringInfoString(buf, " ESCAPE ");
+			get_rule_expr((Node *) lthird(expr->args), context, false);
+			appendStringInfoChar(buf, ')');
+			return true;
+
+		case F_BTRIM_BYTEA_BYTEA:
+		case F_BTRIM_TEXT:
+		case F_BTRIM_TEXT_TEXT:
+			/* TRIM() */
+			appendStringInfoString(buf, "TRIM(BOTH");
+			if (list_length(expr->args) == 2)
+			{
+				appendStringInfoChar(buf, ' ');
+				get_rule_expr((Node *) lsecond(expr->args), context, false);
+			}
+			appendStringInfoString(buf, " FROM ");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoChar(buf, ')');
+			return true;
+
+		case F_LTRIM_TEXT:
+		case F_LTRIM_TEXT_TEXT:
+			/* TRIM() */
+			appendStringInfoString(buf, "TRIM(LEADING");
+			if (list_length(expr->args) == 2)
+			{
+				appendStringInfoChar(buf, ' ');
+				get_rule_expr((Node *) lsecond(expr->args), context, false);
+			}
+			appendStringInfoString(buf, " FROM ");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoChar(buf, ')');
+			return true;
+
+		case F_RTRIM_TEXT:
+		case F_RTRIM_TEXT_TEXT:
+			/* TRIM() */
+			appendStringInfoString(buf, "TRIM(TRAILING");
+			if (list_length(expr->args) == 2)
+			{
+				appendStringInfoChar(buf, ' ');
+				get_rule_expr((Node *) lsecond(expr->args), context, false);
+			}
+			appendStringInfoString(buf, " FROM ");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoChar(buf, ')');
+			return true;
+
+		case F_XMLEXISTS:
+			/* XMLEXISTS ... extra parens because args are c_expr */
+			appendStringInfoString(buf, "XMLEXISTS((");
+			get_rule_expr((Node *) linitial(expr->args), context, false);
+			appendStringInfoString(buf, ") PASSING (");
+			get_rule_expr((Node *) lsecond(expr->args), context, false);
+			appendStringInfoString(buf, "))");
+			return true;
+	}
+	return false;
 }
 
 /* ----------
@@ -10148,7 +10370,7 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 						RangeTblFunction *rtfunc = (RangeTblFunction *) lfirst(lc);
 
 						if (!IsA(rtfunc->funcexpr, FuncExpr) ||
-							((FuncExpr *) rtfunc->funcexpr)->funcid != F_ARRAY_UNNEST ||
+							((FuncExpr *) rtfunc->funcexpr)->funcid != F_UNNEST_ANYARRAY ||
 							rtfunc->funccolnames != NIL)
 						{
 							all_unnest = false;
@@ -10293,7 +10515,7 @@ get_from_clause_item(Node *jtnode, Query *query, deparse_context *context)
 
 		need_paren_on_right = PRETTY_PAREN(context) &&
 			!IsA(j->rarg, RangeTblRef) &&
-			!(IsA(j->rarg, JoinExpr) &&((JoinExpr *) j->rarg)->alias != NULL);
+			!(IsA(j->rarg, JoinExpr) && ((JoinExpr *) j->rarg)->alias != NULL);
 
 		if (!PRETTY_PAREN(context) || j->alias != NULL)
 			appendStringInfoChar(buf, '(');
@@ -10571,6 +10793,23 @@ get_opclass_name(Oid opclass, Oid actual_datatype,
 		}
 	}
 	ReleaseSysCache(ht_opc);
+}
+
+/*
+ * generate_opclass_name
+ *		Compute the name to display for a opclass specified by OID
+ *
+ * The result includes all necessary quoting and schema-prefixing.
+ */
+char *
+generate_opclass_name(Oid opclass)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	get_opclass_name(opclass, InvalidOid, &buf);
+
+	return &buf.data[1];		/* get_opclass_name() prepends space */
 }
 
 /*
@@ -11056,10 +11295,6 @@ generate_operator_name(Oid operid, Oid arg1, Oid arg2)
 			p_result = left_oper(NULL, list_make1(makeString(oprname)), arg2,
 								 true, -1);
 			break;
-		case 'r':
-			p_result = right_oper(NULL, list_make1(makeString(oprname)), arg1,
-								  true, -1);
-			break;
 		default:
 			elog(ERROR, "unrecognized oprkind: %d", operform->oprkind);
 			p_result = NULL;	/* keep compiler quiet */
@@ -11251,6 +11486,62 @@ string_to_text(char *str)
 }
 
 /*
+ * Generate a C string representing a relation options from text[] datum.
+ */
+static void
+get_reloptions(StringInfo buf, Datum reloptions)
+{
+	Datum	   *options;
+	int			noptions;
+	int			i;
+
+	deconstruct_array(DatumGetArrayTypeP(reloptions),
+					  TEXTOID, -1, false, TYPALIGN_INT,
+					  &options, NULL, &noptions);
+
+	for (i = 0; i < noptions; i++)
+	{
+		char	   *option = TextDatumGetCString(options[i]);
+		char	   *name;
+		char	   *separator;
+		char	   *value;
+
+		/*
+		 * Each array element should have the form name=value.  If the "=" is
+		 * missing for some reason, treat it like an empty value.
+		 */
+		name = option;
+		separator = strchr(option, '=');
+		if (separator)
+		{
+			*separator = '\0';
+			value = separator + 1;
+		}
+		else
+			value = "";
+
+		if (i > 0)
+			appendStringInfoString(buf, ", ");
+		appendStringInfo(buf, "%s=", quote_identifier(name));
+
+		/*
+		 * In general we need to quote the value; but to avoid unnecessary
+		 * clutter, do not quote if it is an identifier that would not need
+		 * quoting.  (We could also allow numbers, but that is a bit trickier
+		 * than it looks --- for example, are leading zeroes significant?  We
+		 * don't want to assume very much here about what custom reloptions
+		 * might mean.)
+		 */
+		if (quote_identifier(value) == value)
+			appendStringInfoString(buf, value);
+		else
+			simple_quote_literal(buf, value);
+
+		pfree(option);
+	}
+}
+
+/*
  * Generate a C string representing a relation's reloptions, or NULL if none.
  */
 static char *
@@ -11270,56 +11561,9 @@ flatten_reloptions(Oid relid)
 	if (!isnull)
 	{
 		StringInfoData buf;
-		Datum	   *options;
-		int			noptions;
-		int			i;
 
 		initStringInfo(&buf);
-
-		deconstruct_array(DatumGetArrayTypeP(reloptions),
-						  TEXTOID, -1, false, TYPALIGN_INT,
-						  &options, NULL, &noptions);
-
-		for (i = 0; i < noptions; i++)
-		{
-			char	   *option = TextDatumGetCString(options[i]);
-			char	   *name;
-			char	   *separator;
-			char	   *value;
-
-			/*
-			 * Each array element should have the form name=value.  If the "="
-			 * is missing for some reason, treat it like an empty value.
-			 */
-			name = option;
-			separator = strchr(option, '=');
-			if (separator)
-			{
-				*separator = '\0';
-				value = separator + 1;
-			}
-			else
-				value = "";
-
-			if (i > 0)
-				appendStringInfoString(&buf, ", ");
-			appendStringInfo(&buf, "%s=", quote_identifier(name));
-
-			/*
-			 * In general we need to quote the value; but to avoid unnecessary
-			 * clutter, do not quote if it is an identifier that would not
-			 * need quoting.  (We could also allow numbers, but that is a bit
-			 * trickier than it looks --- for example, are leading zeroes
-			 * significant?  We don't want to assume very much here about what
-			 * custom reloptions might mean.)
-			 */
-			if (quote_identifier(value) == value)
-				appendStringInfoString(&buf, value);
-			else
-				simple_quote_literal(&buf, value);
-
-			pfree(option);
-		}
+		get_reloptions(&buf, reloptions);
 
 		result = buf.data;
 	}
@@ -11344,7 +11588,7 @@ get_range_partbound_string(List *bound_datums)
 	memset(&context, 0, sizeof(deparse_context));
 	context.buf = buf;
 
-	appendStringInfoString(buf, "(");
+	appendStringInfoChar(buf, '(');
 	sep = "";
 	foreach(cell, bound_datums)
 	{

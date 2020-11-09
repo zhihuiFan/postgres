@@ -223,9 +223,10 @@ right to make this happen --- a scan moving in the opposite direction
 might miss the items if so.)  Also, we *never* delete the rightmost page
 on a tree level (this restriction simplifies the traversal algorithms, as
 explained below).  Page deletion always begins from an empty leaf page.  An
-internal page can only be deleted as part of a branch leading to a leaf
-page, where each internal page has only one child and that child is also to
-be deleted.
+internal page can only be deleted as part of deleting an entire subtree.
+This is always a "skinny" subtree consisting of a "chain" of internal pages
+plus a single leaf page.  There is one page on each level of the subtree,
+and each level/page covers the same key space.
 
 Deleting a leaf page is a two-stage process.  In the first stage, the page
 is unlinked from its parent, and marked as half-dead.  The parent page must
@@ -243,7 +244,12 @@ it, but it's still linked to its siblings.
 
 (Note: Lanin and Shasha prefer to make the key space move left, but their
 argument for doing so hinges on not having left-links, which we have
-anyway.  So we simplify the algorithm by moving the key space right.)
+anyway.  So we simplify the algorithm by moving the key space right.  This
+is only possible because we don't match on a separator key when ascending
+the tree during a page split, unlike Lehman and Yao/Lanin and Shasha -- it
+doesn't matter if the downlink is re-found in a pivot tuple whose separator
+key does not match the one encountered when inserter initially descended
+the tree.)
 
 To preserve consistency on the parent level, we cannot merge the key space
 of a page into its right sibling unless the right sibling is a child of
@@ -336,9 +342,9 @@ snapshots and registered snapshots as of the deletion are gone; which is
 overly strong, but is simple to implement within Postgres.  When marked
 dead, a deleted page is labeled with the next-transaction counter value.
 VACUUM can reclaim the page for re-use when this transaction number is
-older than RecentGlobalXmin.  As collateral damage, this implementation
-also waits for running XIDs with no snapshots and for snapshots taken
-until the next transaction to allocate an XID commits.
+guaranteed to be "visible to everyone".  As collateral damage, this
+implementation also waits for running XIDs with no snapshots and for
+snapshots taken until the next transaction to allocate an XID commits.
 
 Reclaiming a page doesn't actually change its state on disk --- we simply
 record it in the shared-memory free space map, from which it will be
@@ -405,8 +411,8 @@ page and also the correct place to hold the current value. We can avoid
 the cost of walking down the tree in such common cases.
 
 The optimization works on the assumption that there can only be one
-non-ignorable leaf rightmost page, and so even a RecentGlobalXmin style
-interlock isn't required.  We cannot fail to detect that our hint was
+non-ignorable leaf rightmost page, and so not even a visible-to-everyone
+style interlock is required.  We cannot fail to detect that our hint was
 invalidated, because there can only be one such page in the B-Tree at
 any time. It's possible that the page will be deleted and recycled
 without a backend's cached page also being detected as invalidated, but
@@ -566,9 +572,16 @@ replay of page deletion records does not hold a write lock on the target
 leaf page throughout; only the primary needs to block out concurrent
 writers that insert on to the page being deleted.)
 
+WAL replay holds same-level locks in a way that matches the approach
+taken during original execution, though. This prevent readers from
+observing same-level inconsistencies. It's probably possible to be more
+lax about how same-level locks are acquired during recovery (most kinds
+of readers could still move right to recover if we didn't couple
+same-level locks), but we prefer to be conservative here.
+
 During recovery all index scans start with ignore_killed_tuples = false
 and we never set kill_prior_tuple. We do this because the oldest xmin
-on the standby server can be older than the oldest xmin on the master
+on the standby server can be older than the oldest xmin on the primary
 server, which means tuples can be marked LP_DEAD even when they are
 still visible on the standby. We don't WAL log tuple LP_DEAD bits, but
 they can still appear in the standby because of full page writes. So

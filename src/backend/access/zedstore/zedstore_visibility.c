@@ -750,11 +750,8 @@ zs_SatisfiesNonVacuumable(ZSTidTreeScan *scan,
 						  ZSUndoSlotVisibility *visi_info)
 {
 	Relation	rel = scan->rel;
-	TransactionId OldestXmin = scan->snapshot->xmin;
 	ZSUndoRecPtr undo_ptr;
 	ZSUndoRec  *undorec;
-
-	Assert(TransactionIdIsValid(OldestXmin));
 
 	undo_ptr = visi_info->undoptr;
 
@@ -808,7 +805,7 @@ fetch_undo_record:
 			 * Deleter committed. But perhaps it was recent enough that some open
 			 * transactions could still see the tuple.
 			 */
-			if (!TransactionIdPrecedes(undorec->xid, OldestXmin))
+			if (!GlobalVisTestIsRemovableXid(scan->snapshot->vistest, undorec->xid))
 			{
 				visi_info->nonvacuumable_status = ZSNV_RECENTLY_DEAD;
 				return true;

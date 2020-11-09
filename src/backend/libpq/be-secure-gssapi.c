@@ -209,12 +209,15 @@ be_gssapi_write(Port *port, void *ptr, size_t len)
 		PqGSSSendConsumed += input.length;
 
 		/* 4 network-order bytes of length, then payload */
-		netlen = htonl(output.length);
+		netlen = pg_hton32(output.length);
 		memcpy(PqGSSSendBuffer + PqGSSSendLength, &netlen, sizeof(uint32));
 		PqGSSSendLength += sizeof(uint32);
 
 		memcpy(PqGSSSendBuffer + PqGSSSendLength, output.value, output.length);
 		PqGSSSendLength += output.length;
+
+		/* Release buffer storage allocated by GSSAPI */
+		gss_release_buffer(&minor, &output);
 	}
 
 	/* If we get here, our counters should all match up. */
@@ -320,7 +323,7 @@ be_gssapi_read(Port *port, void *ptr, size_t len)
 		}
 
 		/* Decode the packet length and check for overlength packet */
-		input.length = ntohl(*(uint32 *) PqGSSRecvBuffer);
+		input.length = pg_ntoh32(*(uint32 *) PqGSSRecvBuffer);
 
 		if (input.length > PQ_GSS_RECV_BUFFER_SIZE - sizeof(uint32))
 			ereport(FATAL,
@@ -371,6 +374,7 @@ be_gssapi_read(Port *port, void *ptr, size_t len)
 		/* Our receive buffer is now empty, reset it */
 		PqGSSRecvLength = 0;
 
+		/* Release buffer storage allocated by GSSAPI */
 		gss_release_buffer(&minor, &output);
 	}
 
@@ -505,7 +509,7 @@ secure_open_gssapi(Port *port)
 		/*
 		 * Get the length for this packet from the length header.
 		 */
-		input.length = ntohl(*(uint32 *) PqGSSRecvBuffer);
+		input.length = pg_ntoh32(*(uint32 *) PqGSSRecvBuffer);
 
 		/* Done with the length, reset our buffer */
 		PqGSSRecvLength = 0;
@@ -563,7 +567,7 @@ secure_open_gssapi(Port *port)
 		 */
 		if (output.length > 0)
 		{
-			uint32		netlen = htonl(output.length);
+			uint32		netlen = pg_hton32(output.length);
 
 			if (output.length > PQ_GSS_SEND_BUFFER_SIZE - sizeof(uint32))
 				ereport(FATAL,
@@ -590,7 +594,10 @@ secure_open_gssapi(Port *port)
 				 */
 				if (ret < 0 &&
 					!(errno == EWOULDBLOCK || errno == EAGAIN || errno == EINTR))
+				{
+					gss_release_buffer(&minor, &output);
 					return -1;
+				}
 
 				/* Wait and retry if we couldn't write yet */
 				if (ret <= 0)

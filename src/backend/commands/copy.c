@@ -187,12 +187,15 @@ typedef struct CopyStateData
 	TransitionCaptureState *transition_capture;
 
 	/*
-	 * These variables are used to reduce overhead in textual COPY FROM.
+	 * These variables are used to reduce overhead in COPY FROM.
 	 *
 	 * attribute_buf holds the separated, de-escaped text for each field of
 	 * the current line.  The CopyReadAttributes functions return arrays of
 	 * pointers into this buffer.  We avoid palloc/pfree overhead by re-using
 	 * the buffer on each cycle.
+	 *
+	 * In binary COPY FROM, attribute_buf holds the binary data for the
+	 * current field, but the usage is otherwise similar.
 	 */
 	StringInfoData attribute_buf;
 
@@ -206,7 +209,8 @@ typedef struct CopyStateData
 	 * input cycle is first to read the whole line into line_buf, convert it
 	 * to server encoding there, and then extract the individual attribute
 	 * fields into attribute_buf.  line_buf is preserved unmodified so that we
-	 * can display it in error messages if appropriate.
+	 * can display it in error messages if appropriate.  (In binary mode,
+	 * line_buf is not used.)
 	 */
 	StringInfoData line_buf;
 	bool		line_buf_converted; /* converted to server encoding? */
@@ -214,15 +218,18 @@ typedef struct CopyStateData
 
 	/*
 	 * Finally, raw_buf holds raw data read from the data source (file or
-	 * client connection).  CopyReadLine parses this data sufficiently to
-	 * locate line boundaries, then transfers the data to line_buf and
-	 * converts it.  Note: we guarantee that there is a \0 at
-	 * raw_buf[raw_buf_len].
+	 * client connection).  In text mode, CopyReadLine parses this data
+	 * sufficiently to locate line boundaries, then transfers the data to
+	 * line_buf and converts it.  In binary mode, CopyReadBinaryData fetches
+	 * appropriate amounts of data from this buffer.  In both modes, we
+	 * guarantee that there is a \0 at raw_buf[raw_buf_len].
 	 */
 #define RAW_BUF_SIZE 65536		/* we palloc RAW_BUF_SIZE+1 bytes */
 	char	   *raw_buf;
 	int			raw_buf_index;	/* next byte to process */
 	int			raw_buf_len;	/* total # of bytes stored */
+	/* Shorthand for number of unconsumed bytes available in raw_buf */
+#define RAW_BUF_BYTES(cstate) ((cstate)->raw_buf_len - (cstate)->raw_buf_index)
 } CopyStateData;
 
 /* DestReceiver for COPY (query) TO */
@@ -367,8 +374,7 @@ static bool CopyReadLine(CopyState cstate);
 static bool CopyReadLineText(CopyState cstate);
 static int	CopyReadAttributesText(CopyState cstate);
 static int	CopyReadAttributesCSV(CopyState cstate);
-static Datum CopyReadBinaryAttribute(CopyState cstate,
-									 int column_no, FmgrInfo *flinfo,
+static Datum CopyReadBinaryAttribute(CopyState cstate, FmgrInfo *flinfo,
 									 Oid typioparam, int32 typmod,
 									 bool *isnull);
 static void CopyAttributeOutText(CopyState cstate, char *string);
@@ -392,6 +398,8 @@ static void CopySendInt32(CopyState cstate, int32 val);
 static bool CopyGetInt32(CopyState cstate, int32 *val);
 static void CopySendInt16(CopyState cstate, int16 val);
 static bool CopyGetInt16(CopyState cstate, int16 *val);
+static bool CopyLoadRawBuf(CopyState cstate);
+static int	CopyReadBinaryData(CopyState cstate, char *dest, int nbytes);
 
 
 /*
@@ -721,7 +729,7 @@ CopyGetData(CopyState cstate, void *databuf, int minread, int maxread)
 /*
  * CopySendInt32 sends an int32 in network byte order
  */
-static void
+static inline void
 CopySendInt32(CopyState cstate, int32 val)
 {
 	uint32		buf;
@@ -735,12 +743,12 @@ CopySendInt32(CopyState cstate, int32 val)
  *
  * Returns true if OK, false if EOF
  */
-static bool
+static inline bool
 CopyGetInt32(CopyState cstate, int32 *val)
 {
 	uint32		buf;
 
-	if (CopyGetData(cstate, &buf, sizeof(buf), sizeof(buf)) != sizeof(buf))
+	if (CopyReadBinaryData(cstate, (char *) &buf, sizeof(buf)) != sizeof(buf))
 	{
 		*val = 0;				/* suppress compiler warning */
 		return false;
@@ -752,7 +760,7 @@ CopyGetInt32(CopyState cstate, int32 *val)
 /*
  * CopySendInt16 sends an int16 in network byte order
  */
-static void
+static inline void
 CopySendInt16(CopyState cstate, int16 val)
 {
 	uint16		buf;
@@ -764,12 +772,12 @@ CopySendInt16(CopyState cstate, int16 val)
 /*
  * CopyGetInt16 reads an int16 that appears in network byte order
  */
-static bool
+static inline bool
 CopyGetInt16(CopyState cstate, int16 *val)
 {
 	uint16		buf;
 
-	if (CopyGetData(cstate, &buf, sizeof(buf), sizeof(buf)) != sizeof(buf))
+	if (CopyReadBinaryData(cstate, (char *) &buf, sizeof(buf)) != sizeof(buf))
 	{
 		*val = 0;				/* suppress compiler warning */
 		return false;
@@ -784,26 +792,20 @@ CopyGetInt16(CopyState cstate, int16 *val)
  *
  * Returns true if able to obtain at least one more byte, else false.
  *
- * If raw_buf_index < raw_buf_len, the unprocessed bytes are transferred
- * down to the start of the buffer and then we load more data after that.
- * This case is used only when a frontend multibyte character crosses a
- * bufferload boundary.
+ * If RAW_BUF_BYTES(cstate) > 0, the unprocessed bytes are moved to the start
+ * of the buffer and then we load more data after that.  This case occurs only
+ * when a multibyte character crosses a bufferload boundary.
  */
 static bool
 CopyLoadRawBuf(CopyState cstate)
 {
-	int			nbytes;
+	int			nbytes = RAW_BUF_BYTES(cstate);
 	int			inbytes;
 
-	if (cstate->raw_buf_index < cstate->raw_buf_len)
-	{
-		/* Copy down the unprocessed data */
-		nbytes = cstate->raw_buf_len - cstate->raw_buf_index;
+	/* Copy down the unprocessed data if any. */
+	if (nbytes > 0)
 		memmove(cstate->raw_buf, cstate->raw_buf + cstate->raw_buf_index,
 				nbytes);
-	}
-	else
-		nbytes = 0;				/* no data need be saved */
 
 	inbytes = CopyGetData(cstate, cstate->raw_buf + nbytes,
 						  1, RAW_BUF_SIZE - nbytes);
@@ -812,6 +814,54 @@ CopyLoadRawBuf(CopyState cstate)
 	cstate->raw_buf_index = 0;
 	cstate->raw_buf_len = nbytes;
 	return (inbytes > 0);
+}
+
+/*
+ * CopyReadBinaryData
+ *
+ * Reads up to 'nbytes' bytes from cstate->copy_file via cstate->raw_buf
+ * and writes them to 'dest'.  Returns the number of bytes read (which
+ * would be less than 'nbytes' only if we reach EOF).
+ */
+static int
+CopyReadBinaryData(CopyState cstate, char *dest, int nbytes)
+{
+	int			copied_bytes = 0;
+
+	if (RAW_BUF_BYTES(cstate) >= nbytes)
+	{
+		/* Enough bytes are present in the buffer. */
+		memcpy(dest, cstate->raw_buf + cstate->raw_buf_index, nbytes);
+		cstate->raw_buf_index += nbytes;
+		copied_bytes = nbytes;
+	}
+	else
+	{
+		/*
+		 * Not enough bytes in the buffer, so must read from the file.  Need
+		 * to loop since 'nbytes' could be larger than the buffer size.
+		 */
+		do
+		{
+			int			copy_bytes;
+
+			/* Load more data if buffer is empty. */
+			if (RAW_BUF_BYTES(cstate) == 0)
+			{
+				if (!CopyLoadRawBuf(cstate))
+					break;		/* EOF */
+			}
+
+			/* Transfer some bytes. */
+			copy_bytes = Min(nbytes - copied_bytes, RAW_BUF_BYTES(cstate));
+			memcpy(dest, cstate->raw_buf + cstate->raw_buf_index, copy_bytes);
+			cstate->raw_buf_index += copy_bytes;
+			dest += copy_bytes;
+			copied_bytes += copy_bytes;
+		} while (copied_bytes < nbytes);
+	}
+
+	return copied_bytes;
 }
 
 
@@ -1081,13 +1131,8 @@ DoCopy(ParseState *pstate, const CopyStmt *stmt,
 		EndCopyTo(cstate);
 	}
 
-	/*
-	 * Close the relation. If reading, we can release the AccessShareLock we
-	 * got; if writing, we should hold the lock until end of transaction to
-	 * ensure that updates will be committed before lock is released.
-	 */
 	if (rel != NULL)
-		table_close(rel, (is_from ? NoLock : AccessShareLock));
+		table_close(rel, NoLock);
 }
 
 /*
@@ -1114,6 +1159,8 @@ ProcessCopyOptions(ParseState *pstate,
 				   List *options)
 {
 	bool		format_specified = false;
+	bool		freeze_specified = false;
+	bool		header_specified = false;
 	ListCell   *option;
 
 	/* Support external use for option sanity checking */
@@ -1153,11 +1200,12 @@ ProcessCopyOptions(ParseState *pstate,
 		}
 		else if (strcmp(defel->defname, "freeze") == 0)
 		{
-			if (cstate->freeze)
+			if (freeze_specified)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("conflicting or redundant options"),
 						 parser_errposition(pstate, defel->location)));
+			freeze_specified = true;
 			cstate->freeze = defGetBoolean(defel);
 		}
 		else if (strcmp(defel->defname, "delimiter") == 0)
@@ -1180,11 +1228,12 @@ ProcessCopyOptions(ParseState *pstate,
 		}
 		else if (strcmp(defel->defname, "header") == 0)
 		{
-			if (cstate->header_line)
+			if (header_specified)
 				ereport(ERROR,
 						(errcode(ERRCODE_SYNTAX_ERROR),
 						 errmsg("conflicting or redundant options"),
 						 parser_errposition(pstate, defel->location)));
+			header_specified = true;
 			cstate->header_line = defGetBoolean(defel);
 		}
 		else if (strcmp(defel->defname, "quote") == 0)
@@ -1580,7 +1629,8 @@ BeginCopy(ParseState *pstate,
 		}
 
 		/* plan the query */
-		plan = pg_plan_query(query, CURSOR_OPT_PARALLEL_OK, NULL);
+		plan = pg_plan_query(query, pstate->p_sourcetext,
+							 CURSOR_OPT_PARALLEL_OK, NULL);
 
 		/*
 		 * With row level security and a user using "COPY relation TO", we
@@ -2327,11 +2377,7 @@ CopyFromErrorCallback(void *arg)
 /*
  * Make sure we don't print an unreasonable amount of COPY data in a message.
  *
- * It would seem a lot easier to just use the sprintf "precision" limit to
- * truncate the string.  However, some versions of glibc have a bug/misfeature
- * that vsnprintf will always fail (return -1) if it is asked to truncate
- * a string that contains invalid byte sequences for the current encoding.
- * So, do our own truncation.  We return a pstrdup'd copy of the input.
+ * Returns a pstrdup'd copy of the input.
  */
 static char *
 limit_printout_length(const char *str)
@@ -2462,9 +2508,6 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 	ResultRelInfo *resultRelInfo = buffer->resultRelInfo;
 	TupleTableSlot **slots = buffer->slots;
 
-	/* Set es_result_relation_info to the ResultRelInfo we're flushing. */
-	estate->es_result_relation_info = resultRelInfo;
-
 	/*
 	 * Print error context information correctly, if one of the operations
 	 * below fail.
@@ -2497,7 +2540,8 @@ CopyMultiInsertBufferFlush(CopyMultiInsertInfo *miinfo,
 
 			cstate->cur_lineno = buffer->linenos[i];
 			recheckIndexes =
-				ExecInsertIndexTuples(buffer->slots[i], estate, false, NULL,
+				ExecInsertIndexTuples(resultRelInfo,
+									  buffer->slots[i], estate, false, NULL,
 									  NIL);
 			ExecARInsertTriggers(estate, resultRelInfo,
 								 slots[i], recheckIndexes,
@@ -2585,9 +2629,9 @@ CopyMultiInsertInfoFlush(CopyMultiInsertInfo *miinfo, ResultRelInfo *curr_rri)
 
 	/*
 	 * Trim the list of tracked buffers down if it exceeds the limit.  Here we
-	 * remove buffers starting with the ones we created first.  It seems more
-	 * likely that these older ones are less likely to be needed than ones
-	 * that were just created.
+	 * remove buffers starting with the ones we created first.  It seems less
+	 * likely that these older ones will be needed than the ones that were
+	 * just created.
 	 */
 	while (list_length(miinfo->multiInsertBuffers) > MAX_PARTITION_BUFFERS)
 	{
@@ -2629,6 +2673,9 @@ CopyMultiInsertInfoCleanup(CopyMultiInsertInfo *miinfo)
  * Get the next TupleTableSlot that the next tuple should be stored in.
  *
  * Callers must ensure that the buffer is not full.
+ *
+ * Note: 'miinfo' is unused but has been included for consistency with the
+ * other functions in this area.
  */
 static inline TupleTableSlot *
 CopyMultiInsertInfoNextFreeSlot(CopyMultiInsertInfo *miinfo,
@@ -2697,6 +2744,7 @@ CopyFrom(CopyState cstate)
 	bool		leafpart_use_multi_insert = false;
 
 	Assert(cstate->rel);
+	Assert(list_length(cstate->range_table) == 1);
 
 	/*
 	 * The target must be a plain, foreign, or partitioned relation, or have
@@ -2732,63 +2780,15 @@ CopyFrom(CopyState cstate)
 							RelationGetRelationName(cstate->rel))));
 	}
 
-	/*----------
-	 * Check to see if we can avoid writing WAL
-	 *
-	 * If archive logging/streaming is not enabled *and* either
-	 *	- table was created in same transaction as this COPY
-	 *	- data is being written to relfilenode created in this transaction
-	 * then we can skip writing WAL.  It's safe because if the transaction
-	 * doesn't commit, we'll discard the table (or the new relfilenode file).
-	 * If it does commit, we'll have done the table_finish_bulk_insert() at
-	 * the bottom of this routine first.
-	 *
-	 * As mentioned in comments in utils/rel.h, the in-same-transaction test
-	 * is not always set correctly, since in rare cases rd_newRelfilenodeSubid
-	 * can be cleared before the end of the transaction. The exact case is
-	 * when a relation sets a new relfilenode twice in same transaction, yet
-	 * the second one fails in an aborted subtransaction, e.g.
-	 *
-	 * BEGIN;
-	 * TRUNCATE t;
-	 * SAVEPOINT save;
-	 * TRUNCATE t;
-	 * ROLLBACK TO save;
-	 * COPY ...
-	 *
-	 * Also, if the target file is new-in-transaction, we assume that checking
-	 * FSM for free space is a waste of time, even if we must use WAL because
-	 * of archiving.  This could possibly be wrong, but it's unlikely.
-	 *
-	 * The comments for table_tuple_insert and RelationGetBufferForTuple
-	 * specify that skipping WAL logging is only safe if we ensure that our
-	 * tuples do not go into pages containing tuples from any other
-	 * transactions --- but this must be the case if we have a new table or
-	 * new relfilenode, so we need no additional work to enforce that.
-	 *
-	 * We currently don't support this optimization if the COPY target is a
-	 * partitioned table as we currently only lazily initialize partition
-	 * information when routing the first tuple to the partition.  We cannot
-	 * know at this stage if we can perform this optimization.  It should be
-	 * possible to improve on this, but it does mean maintaining heap insert
-	 * option flags per partition and setting them when we first open the
-	 * partition.
-	 *
-	 * This optimization is not supported for relation types which do not
-	 * have any physical storage, with foreign tables and views using
-	 * INSTEAD OF triggers entering in this category.  Partitioned tables
-	 * are not supported as per the description above.
-	 *----------
+	/*
+	 * If the target file is new-in-transaction, we assume that checking FSM
+	 * for free space is a waste of time.  This could possibly be wrong, but
+	 * it's unlikely.
 	 */
-	/* createSubid is creation check, newRelfilenodeSubid is truncation check */
 	if (RELKIND_HAS_STORAGE(cstate->rel->rd_rel->relkind) &&
 		(cstate->rel->rd_createSubid != InvalidSubTransactionId ||
-		 cstate->rel->rd_newRelfilenodeSubid != InvalidSubTransactionId))
-	{
+		 cstate->rel->rd_firstRelfilenodeSubid != InvalidSubTransactionId))
 		ti_options |= TABLE_INSERT_SKIP_FSM;
-		if (!XLogIsNeeded())
-			ti_options |= TABLE_INSERT_SKIP_WAL;
-	}
 
 	/*
 	 * Optimize if new relfilenode was created in this subxact or one of its
@@ -2847,24 +2847,14 @@ CopyFrom(CopyState cstate)
 	 * index-entry-making machinery.  (There used to be a huge amount of code
 	 * here that basically duplicated execUtils.c ...)
 	 */
-	resultRelInfo = makeNode(ResultRelInfo);
-	InitResultRelInfo(resultRelInfo,
-					  cstate->rel,
-					  1,		/* must match rel's position in range_table */
-					  NULL,
-					  0);
-	target_resultRelInfo = resultRelInfo;
+	ExecInitRangeTable(estate, cstate->range_table);
+	resultRelInfo = target_resultRelInfo = makeNode(ResultRelInfo);
+	ExecInitResultRelation(estate, resultRelInfo, 1);
 
 	/* Verify the named relation is a valid target for INSERT */
 	CheckValidResultRel(resultRelInfo, CMD_INSERT);
 
 	ExecOpenIndices(resultRelInfo, false);
-
-	estate->es_result_relations = resultRelInfo;
-	estate->es_num_result_relations = 1;
-	estate->es_result_relation_info = resultRelInfo;
-
-	ExecInitRangeTable(estate, cstate->range_table);
 
 	/*
 	 * Set up a ModifyTableState so we can let FDW(s) init themselves for
@@ -2874,7 +2864,7 @@ CopyFrom(CopyState cstate)
 	mtstate->ps.plan = NULL;
 	mtstate->ps.state = estate;
 	mtstate->operation = CMD_INSERT;
-	mtstate->resultRelInfo = estate->es_result_relations;
+	mtstate->resultRelInfo = resultRelInfo;
 
 	if (resultRelInfo->ri_FdwRoutine != NULL &&
 		resultRelInfo->ri_FdwRoutine->BeginForeignInsert != NULL)
@@ -3134,43 +3124,21 @@ CopyFrom(CopyState cstate)
 			}
 
 			/*
-			 * For ExecInsertIndexTuples() to work on the partition's indexes
-			 */
-			estate->es_result_relation_info = resultRelInfo;
-
-			/*
 			 * If we're capturing transition tuples, we might need to convert
-			 * from the partition rowtype to root rowtype.
+			 * from the partition rowtype to root rowtype. But if there are no
+			 * BEFORE triggers on the partition that could change the tuple,
+			 * we can just remember the original unconverted tuple to avoid a
+			 * needless round trip conversion.
 			 */
 			if (cstate->transition_capture != NULL)
-			{
-				if (has_before_insert_row_trig)
-				{
-					/*
-					 * If there are any BEFORE triggers on the partition,
-					 * we'll have to be ready to convert their result back to
-					 * tuplestore format.
-					 */
-					cstate->transition_capture->tcs_original_insert_tuple = NULL;
-					cstate->transition_capture->tcs_map =
-						resultRelInfo->ri_PartitionInfo->pi_PartitionToRootMap;
-				}
-				else
-				{
-					/*
-					 * Otherwise, just remember the original unconverted
-					 * tuple, to avoid a needless round trip conversion.
-					 */
-					cstate->transition_capture->tcs_original_insert_tuple = myslot;
-					cstate->transition_capture->tcs_map = NULL;
-				}
-			}
+				cstate->transition_capture->tcs_original_insert_tuple =
+					!has_before_insert_row_trig ? myslot : NULL;
 
 			/*
 			 * We might need to convert from the root rowtype to the partition
 			 * rowtype.
 			 */
-			map = resultRelInfo->ri_PartitionInfo->pi_RootToPartitionMap;
+			map = resultRelInfo->ri_RootToPartitionMap;
 			if (insertMethod == CIM_SINGLE || !leafpart_use_multi_insert)
 			{
 				/* non batch insert */
@@ -3178,7 +3146,7 @@ CopyFrom(CopyState cstate)
 				{
 					TupleTableSlot *new_slot;
 
-					new_slot = resultRelInfo->ri_PartitionInfo->pi_PartitionTupleSlot;
+					new_slot = resultRelInfo->ri_PartitionTupleSlot;
 					myslot = execute_attr_map_slot(map->attrMap, myslot, new_slot);
 				}
 			}
@@ -3242,7 +3210,8 @@ CopyFrom(CopyState cstate)
 				/* Compute stored generated columns */
 				if (resultRelInfo->ri_RelationDesc->rd_att->constr &&
 					resultRelInfo->ri_RelationDesc->rd_att->constr->has_generated_stored)
-					ExecComputeStoredGenerated(estate, myslot, CMD_INSERT);
+					ExecComputeStoredGenerated(resultRelInfo, estate, myslot,
+											   CMD_INSERT);
 
 				/*
 				 * If the target is a plain table, check the constraints of
@@ -3258,7 +3227,7 @@ CopyFrom(CopyState cstate)
 				 * we don't need to if there's no BR trigger defined on the
 				 * partition.
 				 */
-				if (resultRelInfo->ri_PartitionCheck &&
+				if (resultRelInfo->ri_RelationDesc->rd_rel->relispartition &&
 					(proute == NULL || has_before_insert_row_trig))
 					ExecPartitionCheck(resultRelInfo, myslot, estate, true);
 
@@ -3313,7 +3282,8 @@ CopyFrom(CopyState cstate)
 										   myslot, mycid, ti_options, bistate);
 
 						if (resultRelInfo->ri_NumIndices > 0)
-							recheckIndexes = ExecInsertIndexTuples(myslot,
+							recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
+																   myslot,
 																   estate,
 																   false,
 																   NULL,
@@ -3377,14 +3347,13 @@ CopyFrom(CopyState cstate)
 	if (insertMethod != CIM_SINGLE)
 		CopyMultiInsertInfoCleanup(&multiInsertInfo);
 
-	ExecCloseIndices(target_resultRelInfo);
-
 	/* Close all the partitioned tables, leaf partitions, and their indices */
 	if (proute)
 		ExecCleanupTupleRouting(mtstate, proute);
 
-	/* Close any trigger target relations */
-	ExecCleanUpTriggerState(estate);
+	/* Close the result relations, including any trigger target relations */
+	ExecCloseResultRelations(estate);
+	ExecCloseRangeTableRelations(estate);
 
 	FreeExecutorState(estate);
 
@@ -3435,12 +3404,19 @@ BeginCopyFrom(ParseState *pstate,
 	cstate->cur_attname = NULL;
 	cstate->cur_attval = NULL;
 
-	/* Set up variables to avoid per-attribute overhead. */
+	/*
+	 * Set up variables to avoid per-attribute overhead.  attribute_buf and
+	 * raw_buf are used in both text and binary modes, but we use line_buf
+	 * only in text mode.
+	 */
 	initStringInfo(&cstate->attribute_buf);
-	initStringInfo(&cstate->line_buf);
-	cstate->line_buf_converted = false;
 	cstate->raw_buf = (char *) palloc(RAW_BUF_SIZE + 1);
 	cstate->raw_buf_index = cstate->raw_buf_len = 0;
+	if (!cstate->binary)
+	{
+		initStringInfo(&cstate->line_buf);
+		cstate->line_buf_converted = false;
+	}
 
 	/* Assign range table, we'll need it in CopyFrom. */
 	if (pstate)
@@ -3590,7 +3566,7 @@ BeginCopyFrom(ParseState *pstate,
 		int32		tmp;
 
 		/* Signature */
-		if (CopyGetData(cstate, readSig, 11, 11) != 11 ||
+		if (CopyReadBinaryData(cstate, readSig, 11) != 11 ||
 			memcmp(readSig, BinarySignature, 11) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
@@ -3618,7 +3594,7 @@ BeginCopyFrom(ParseState *pstate,
 		/* Skip extension header, if present */
 		while (tmp-- > 0)
 		{
-			if (CopyGetData(cstate, readSig, 1, 1) != 1)
+			if (CopyReadBinaryData(cstate, readSig, 1) != 1)
 				ereport(ERROR,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 						 errmsg("invalid COPY file header (wrong length)")));
@@ -3834,7 +3810,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 			char		dummy;
 
 			if (cstate->copy_dest != COPY_OLD_FE &&
-				CopyGetData(cstate, &dummy, 1, 1) > 0)
+				CopyReadBinaryData(cstate, &dummy, 1) > 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 						 errmsg("received copy data after EOF marker")));
@@ -3847,7 +3823,6 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 					 errmsg("row field count is %d, expected %d",
 							(int) fld_count, attr_count)));
 
-		i = 0;
 		foreach(cur, cstate->attnumlist)
 		{
 			int			attnum = lfirst_int(cur);
@@ -3855,9 +3830,7 @@ NextCopyFrom(CopyState cstate, ExprContext *econtext,
 			Form_pg_attribute att = TupleDescAttr(tupDesc, m);
 
 			cstate->cur_attname = NameStr(att->attname);
-			i++;
 			values[m] = CopyReadBinaryAttribute(cstate,
-												i,
 												&in_functions[m],
 												typioparams[m],
 												att->atttypmod,
@@ -4785,8 +4758,7 @@ endfield:
  * Read a binary attribute
  */
 static Datum
-CopyReadBinaryAttribute(CopyState cstate,
-						int column_no, FmgrInfo *flinfo,
+CopyReadBinaryAttribute(CopyState cstate, FmgrInfo *flinfo,
 						Oid typioparam, int32 typmod,
 						bool *isnull)
 {
@@ -4811,8 +4783,8 @@ CopyReadBinaryAttribute(CopyState cstate,
 	resetStringInfo(&cstate->attribute_buf);
 
 	enlargeStringInfo(&cstate->attribute_buf, fld_size);
-	if (CopyGetData(cstate, cstate->attribute_buf.data,
-					fld_size, fld_size) != fld_size)
+	if (CopyReadBinaryData(cstate, cstate->attribute_buf.data,
+						   fld_size) != fld_size)
 		ereport(ERROR,
 				(errcode(ERRCODE_BAD_COPY_FILE_FORMAT),
 				 errmsg("unexpected EOF in COPY data")));

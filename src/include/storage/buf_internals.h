@@ -203,7 +203,7 @@ typedef struct BufferDesc
  * Note that local buffer descriptors aren't forced to be aligned - as there's
  * no concurrent access to those it's unlikely to be beneficial.
  *
- * We use 64bit as the cache line size here, because that's the most common
+ * We use a 64-byte cache line size here, because that's the most common
  * size. Making it bigger would be a waste of memory. Even if running on a
  * platform with either 32 or 128 byte line sizes, it's good to align to
  * boundaries and avoid false sharing.
@@ -327,8 +327,9 @@ extern int	BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id);
 extern void BufTableDelete(BufferTag *tagPtr, uint32 hashcode);
 
 /* localbuf.c */
-extern void LocalPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum,
-								BlockNumber blockNum);
+extern PrefetchBufferResult PrefetchLocalBuffer(SMgrRelation smgr,
+												ForkNumber forkNum,
+												BlockNumber blockNum);
 extern BufferDesc *LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum,
 									BlockNumber blockNum, bool *foundPtr);
 extern void MarkLocalBufferDirty(Buffer buffer);

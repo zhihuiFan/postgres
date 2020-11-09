@@ -120,8 +120,6 @@ typedef struct PlannerGlobal
 
 	List	   *resultRelations;	/* "flat" list of integer RT indexes */
 
-	List	   *rootResultRelations;	/* "flat" list of integer RT indexes */
-
 	List	   *appendRelations;	/* "flat" list of AppendRelInfos */
 
 	List	   *relationOids;	/* OIDs of relations the plan depends on */
@@ -347,6 +345,7 @@ struct PlannerInfo
 	bool		hasHavingQual;	/* true if havingQual was non-null */
 	bool		hasPseudoConstantQuals; /* true if any RestrictInfo has
 										 * pseudoconstant = true */
+	bool		hasAlternativeSubPlans; /* true if we've made any of those */
 	bool		hasRecursion;	/* true if planning a recursive WITH item */
 
 	/* These fields are used only when hasRecursion is true: */
@@ -574,28 +573,47 @@ typedef struct PartitionSchemeData *PartitionScheme;
  * we know we will need it at least once (to price the sequential scan)
  * and may need it multiple times to price index scans.
  *
+ * A join relation is considered to be partitioned if it is formed from a
+ * join of two relations that are partitioned, have matching partitioning
+ * schemes, and are joined on an equijoin of the partitioning columns.
+ * Under those conditions we can consider the join relation to be partitioned
+ * by either relation's partitioning keys, though some care is needed if
+ * either relation can be forced to null by outer-joining.  For example, an
+ * outer join like (A LEFT JOIN B ON A.a = B.b) may produce rows with B.b
+ * NULL.  These rows may not fit the partitioning conditions imposed on B.
+ * Hence, strictly speaking, the join is not partitioned by B.b and thus
+ * partition keys of an outer join should include partition key expressions
+ * from the non-nullable side only.  However, if a subsequent join uses
+ * strict comparison operators (and all commonly-used equijoin operators are
+ * strict), the presence of nulls doesn't cause a problem: such rows couldn't
+ * match anything on the other side and thus they don't create a need to do
+ * any cross-partition sub-joins.  Hence we can treat such values as still
+ * partitioning the join output for the purpose of additional partitionwise
+ * joining, so long as a strict join operator is used by the next join.
+ *
  * If the relation is partitioned, these fields will be set:
  *
  *		part_scheme - Partitioning scheme of the relation
  *		nparts - Number of partitions
  *		boundinfo - Partition bounds
+ *		partbounds_merged - true if partition bounds are merged ones
  *		partition_qual - Partition constraint if not the root
  *		part_rels - RelOptInfos for each partition
+ *		all_partrels - Relids set of all partition relids
  *		partexprs, nullable_partexprs - Partition key expressions
- *		partitioned_child_rels - RT indexes of unpruned partitions of
- *								 this relation that are partitioned tables
- *								 themselves, in hierarchical order
  *
- * Note: A base relation always has only one set of partition keys, but a join
- * relation may have as many sets of partition keys as the number of relations
- * being joined. partexprs and nullable_partexprs are arrays containing
- * part_scheme->partnatts elements each. Each of these elements is a list of
- * partition key expressions.  For a base relation each list in partexprs
- * contains only one expression and nullable_partexprs is not populated. For a
- * join relation, partexprs and nullable_partexprs contain partition key
- * expressions from non-nullable and nullable relations resp. Lists at any
- * given position in those arrays together contain as many elements as the
- * number of joining relations.
+ * The partexprs and nullable_partexprs arrays each contain
+ * part_scheme->partnatts elements.  Each of the elements is a list of
+ * partition key expressions.  For partitioned base relations, there is one
+ * expression in each partexprs element, and nullable_partexprs is empty.
+ * For partitioned join relations, each base relation within the join
+ * contributes one partition key expression per partitioning column;
+ * that expression goes in the partexprs[i] list if the base relation
+ * is not nullable by this join or any lower outer join, or in the
+ * nullable_partexprs[i] list if the base relation is nullable.
+ * Furthermore, FULL JOINs add extra nullable_partexprs expressions
+ * corresponding to COALESCE expressions of the left and right join columns,
+ * to simplify matching join clauses to those lists.
  *----------
  */
 typedef enum RelOptKind
@@ -717,16 +735,20 @@ typedef struct RelOptInfo
 	Relids		top_parent_relids;	/* Relids of topmost parents (if "other"
 									 * rel) */
 
-	/* used for partitioned relations */
-	PartitionScheme part_scheme;	/* Partitioning scheme. */
-	int			nparts;			/* number of partitions */
+	/* used for partitioned relations: */
+	PartitionScheme part_scheme;	/* Partitioning scheme */
+	int			nparts;			/* Number of partitions; -1 if not yet set; in
+								 * case of a join relation 0 means it's
+								 * considered unpartitioned */
 	struct PartitionBoundInfoData *boundinfo;	/* Partition bounds */
-	List	   *partition_qual; /* partition constraint */
+	bool		partbounds_merged;	/* True if partition bounds were created
+									 * by partition_bounds_merge() */
+	List	   *partition_qual; /* Partition constraint, if not the root */
 	struct RelOptInfo **part_rels;	/* Array of RelOptInfos of partitions,
-									 * stored in the same order of bounds */
-	List	  **partexprs;		/* Non-nullable partition key expressions. */
-	List	  **nullable_partexprs; /* Nullable partition key expressions. */
-	List	   *partitioned_child_rels; /* List of RT indexes. */
+									 * stored in the same order as bounds */
+	Relids		all_partrels;	/* Relids set of all partition relids */
+	List	  **partexprs;		/* Non-nullable partition key expressions */
+	List	  **nullable_partexprs; /* Nullable partition key expressions */
 } RelOptInfo;
 
 /*
@@ -809,6 +831,7 @@ struct IndexOptInfo
 	Oid		   *sortopfamily;	/* OIDs of btree opfamilies, if orderable */
 	bool	   *reverse_sort;	/* is sort order descending? */
 	bool	   *nulls_first;	/* do NULLs come first in the sort order? */
+	bytea	  **opclassoptions; /* opclass-specific options for columns */
 	bool	   *canreturn;		/* which index cols can be returned in an
 								 * index-only scan? */
 	Oid			relam;			/* OID of the access method (in pg_am) */
@@ -863,10 +886,13 @@ typedef struct ForeignKeyOptInfo
 
 	/* Derived info about whether FK's equality conditions match the query: */
 	int			nmatched_ec;	/* # of FK cols matched by ECs */
+	int			nconst_ec;		/* # of these ECs that are ec_has_const */
 	int			nmatched_rcols; /* # of FK cols matched by non-EC rinfos */
 	int			nmatched_ri;	/* total # of non-EC rinfos matched to FK */
 	/* Pointer to eclass matching each column's condition, if there is one */
 	struct EquivalenceClass *eclass[INDEX_MAX_KEYS];
+	/* Pointer to eclass member for the referencing Var, if there is one */
+	struct EquivalenceMember *fk_eclass_member[INDEX_MAX_KEYS];
 	/* List of non-EC RestrictInfos matching each column's condition */
 	List	   *rinfos[INDEX_MAX_KEYS];
 } ForeignKeyOptInfo;
@@ -1372,8 +1398,9 @@ typedef struct CustomPath
 typedef struct AppendPath
 {
 	Path		path;
-	/* RT indexes of non-leaf tables in a partition tree */
-	List	   *partitioned_rels;
+	List	   *partitioned_rels;	/* List of Relids containing RT indexes of
+									 * non-leaf tables for each partition
+									 * hierarchy whose paths are in 'subpaths' */
 	List	   *subpaths;		/* list of component Paths */
 	/* Index of first partial path in subpaths; list_length(subpaths) if none */
 	int			first_partial_path;
@@ -1398,8 +1425,9 @@ extern bool is_dummy_rel(RelOptInfo *rel);
 typedef struct MergeAppendPath
 {
 	Path		path;
-	/* RT indexes of non-leaf tables in a partition tree */
-	List	   *partitioned_rels;
+	List	   *partitioned_rels;	/* List of Relids containing RT indexes of
+									 * non-leaf tables for each partition
+									 * hierarchy whose paths are in 'subpaths' */
 	List	   *subpaths;		/* list of component Paths */
 	double		limit_tuples;	/* hard limit on output tuples, or -1 */
 } MergeAppendPath;
@@ -1622,6 +1650,15 @@ typedef struct SortPath
 } SortPath;
 
 /*
+ * IncrementalSortPath
+ */
+typedef struct IncrementalSortPath
+{
+	SortPath	spath;
+	int			nPresortedCols; /* number of presorted columns */
+} IncrementalSortPath;
+
+/*
  * GroupPath represents grouping (of presorted input)
  *
  * groupClause represents the columns to be grouped on; the input path
@@ -1798,6 +1835,7 @@ typedef struct LimitPath
 	Path	   *subpath;		/* path representing input source */
 	Node	   *limitOffset;	/* OFFSET parameter, or NULL if none */
 	Node	   *limitCount;		/* COUNT parameter, or NULL if none */
+	LimitOption limitOption;	/* FETCH FIRST with ties or exact number */
 } LimitPath;
 
 

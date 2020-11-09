@@ -40,6 +40,15 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { IN
    <itemizedlist>
     <listitem>
      <para>
+      The index depends on the sort order of a collation, and the definition
+      of the collation has changed.  This can cause index scans to fail to
+      find keys that are present.  See <xref linkend="collation-versions"/> for
+      more information.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
       An index has become corrupted, and no longer contains valid
       data. Although in theory this should never happen, in
       practice indexes can become corrupted due to software bugs or
@@ -88,7 +97,9 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { IN
     <term><literal>INDEX</literal></term>
     <listitem>
      <para>
-      Recreate the specified index.
+      Recreate the specified index. This form of <command>REINDEX</command>
+      cannot be executed inside a transaction block when used with a
+      partitioned index.
      </para>
     </listitem>
    </varlistentry>
@@ -99,6 +110,8 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { IN
      <para>
       Recreate all indexes of the specified table.  If the table has a
       secondary <quote>TOAST</quote> table, that is reindexed as well.
+      This form of <command>REINDEX</command> cannot be executed inside a
+      transaction block when used with a partitioned table.
      </para>
     </listitem>
    </varlistentry>
@@ -163,8 +176,7 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { IN
       updates, or deletes on the table; whereas a standard index rebuild
       locks out writes (but not reads) on the table until it's done.
       There are several caveats to be aware of when using this option
-      &mdash; see <xref linkend="sql-reindex-concurrently"
-      endterm="sql-reindex-concurrently-title"/>.
+      &mdash; see <xref linkend="sql-reindex-concurrently"/> below.
      </para>
      <para>
       For temporary tables, <command>REINDEX</command> is always
@@ -249,7 +261,7 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { IN
   <para>
    Reindexing a single index or table requires being the owner of that
    index or table.  Reindexing a schema or database requires being the
-   owner of that schema or database.  Note that is therefore sometimes
+   owner of that schema or database.  Note specifically that it's thus
    possible for non-superusers to rebuild indexes of tables owned by
    other users.  However, as a special exception, when
    <command>REINDEX DATABASE</command>, <command>REINDEX SCHEMA</command>
@@ -260,12 +272,15 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { IN
   </para>
 
   <para>
-   Reindexing partitioned tables or partitioned indexes is not supported.
-   Each individual partition can be reindexed separately instead.
+   Reindexing partitioned indexes or partitioned tables is supported
+   with <command>REINDEX INDEX</command> or <command>REINDEX TABLE</command>,
+   respectively. Each partition of the specified partitioned relation is
+   reindexed in a separate transaction. Those commands cannot be used inside
+   a transaction block when working on a partitioned table or index.
   </para>
 
-  <refsect2 id="sql-reindex-concurrently">
-   <title id="sql-reindex-concurrently-title">Rebuilding Indexes Concurrently</title>
+  <refsect2 id="sql-reindex-concurrently" xreflabel="Rebuilding Indexes Concurrently">
+   <title>Rebuilding Indexes Concurrently</title>
 
    <indexterm zone="sql-reindex-concurrently">
     <primary>index</primary>
@@ -308,7 +323,7 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { IN
     <orderedlist>
      <listitem>
       <para>
-       A new temporary index definition is added to the catalog
+       A new transient index definition is added to the catalog
        <literal>pg_index</literal>.  This definition will be used to replace
        the old index.  A <literal>SHARE UPDATE EXCLUSIVE</literal> lock at
        session level is taken on the indexes being reindexed as well as their
@@ -384,13 +399,15 @@ Indexes:
     "idx_ccnew" btree (col) INVALID
 </programlisting>
 
-    The recommended recovery method in such cases is to drop the invalid index
-    and try again to perform <command>REINDEX CONCURRENTLY</command>.  The
-    concurrent index created during the processing has a name ending in the
-    suffix <literal>ccnew</literal>, or <literal>ccold</literal> if it is an
-    old index definition which we failed to drop. Invalid indexes can be
-    dropped using <literal>DROP INDEX</literal>, including invalid toast
-    indexes.
+    If the index marked <literal>INVALID</literal> is suffixed
+    <literal>ccnew</literal>, then it corresponds to the transient
+    index created during the concurrent operation, and the recommended
+    recovery method is to drop it using <literal>DROP INDEX</literal>,
+    then attempt <command>REINDEX CONCURRENTLY</command> again.
+    If the invalid index is instead suffixed <literal>ccold</literal>,
+    it corresponds to the original index which could not be dropped;
+    the recommended recovery method is to just drop said index, since the
+    rebuild proper has been successful.
    </para>
 
    <para>

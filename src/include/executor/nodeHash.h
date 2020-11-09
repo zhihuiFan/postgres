@@ -61,7 +61,7 @@ extern bool ExecScanHashTableForUnmatched(HashJoinState *hjstate,
 extern void ExecHashTableReset(HashJoinTable hashtable);
 extern void ExecHashTableResetMatchFlags(HashJoinTable hashtable);
 extern void ExecChooseHashTableSize(double ntuples, int tupwidth, bool useskew,
-									bool try_combined_work_mem,
+									bool try_combined_hash_mem,
 									int parallel_workers,
 									size_t *space_allowed,
 									int *numbuckets,
@@ -73,7 +73,7 @@ extern void ExecHashInitializeDSM(HashState *node, ParallelContext *pcxt);
 extern void ExecHashInitializeWorker(HashState *node, ParallelWorkerContext *pwcxt);
 extern void ExecHashRetrieveInstrumentation(HashState *node);
 extern void ExecShutdownHash(HashState *node);
-extern void ExecHashGetInstrumentation(HashInstrumentation *instrument,
-									   HashJoinTable hashtable);
+extern void ExecHashAccumInstrumentation(HashInstrumentation *instrument,
+										 HashJoinTable hashtable);
 
 #endif							/* NODEHASH_H */
