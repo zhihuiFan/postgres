@@ -357,7 +357,7 @@ retry_fetch:
 		return TM_Updated;
 	}
 	else
-		elog(ERROR, "unexpected UNDO record type: %d", undorec->type);
+		elog(ERROR, "unexpected UNDO record type: %u", undorec->type);
 }
 
 
@@ -407,7 +407,7 @@ fetch_undo_record:
 			goto fetch_undo_record;
 	}
 	else
-		elog(ERROR, "unexpected UNDO record type: %d", undorec->type);
+		elog(ERROR, "unexpected UNDO record type: %u", undorec->type);
 
 	return true;
 }
@@ -525,7 +525,7 @@ fetch_undo_record:
 		}
 	}
 	else
-		elog(ERROR, "unexpected UNDO record type: %d", undorec->type);
+		elog(ERROR, "unexpected UNDO record type: %u", undorec->type);
 }
 
 /*
@@ -618,7 +618,7 @@ fetch_undo_record:
 		return false;
 	}
 	else
-		elog(ERROR, "unexpected UNDO record type: %d", undorec->type);
+		elog(ERROR, "unexpected UNDO record type: %u", undorec->type);
 }
 
 /*
@@ -738,7 +738,7 @@ fetch_undo_record:
 		return false;
 	}
 	else
-		elog(ERROR, "unexpected UNDO record type: %d", undorec->type);
+		elog(ERROR, "unexpected UNDO record type: %u", undorec->type);
 }
 
 /*
@@ -852,7 +852,7 @@ fetch_undo_record:
 		goto fetch_undo_record;
 	}
 	else
-		elog(ERROR, "unexpected UNDO record type: %d", undorec->type);
+		elog(ERROR, "unexpected UNDO record type: %u", undorec->type);
 }
 
 /*

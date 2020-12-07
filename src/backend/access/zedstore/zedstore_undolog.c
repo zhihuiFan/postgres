@@ -439,7 +439,7 @@ zsundo_discard(Relation rel, ZSUndoRecPtr oldest_undorecptr)
 			elog(ERROR, "corrupted zedstore table; oldest page in UNDO log is not an UNDO page");
 		opaque = (ZSUndoPageOpaque *) PageGetSpecialPointer(page);
 		if (opaque->zs_page_id != ZS_UNDO_PAGE_ID)
-			elog(ERROR, "corrupted zedstore table; oldest page in UNDO log has unexpected page id %d",
+			elog(ERROR, "corrupted zedstore table; oldest page in UNDO log has unexpected page id %u",
 				 opaque->zs_page_id);
 		/* FIXME: Also check here that the max UndoRecPtr on the page is less
 		 * than the new 'oldest_undorecptr'

@@ -134,7 +134,7 @@ zsundo_create_for_delete(Relation rel, TransactionId xid, CommandId cid, zstid t
 														 &buf, BUFFER_LOCK_EXCLUSIVE, false);
 
 		if (orig_undorec->rec.type != ZSUNDO_TYPE_DELETE)
-			elog(ERROR, "unexpected undo record type %d, expected DELETE", orig_undorec->rec.type);
+			elog(ERROR, "unexpected undo record type %u, expected DELETE", orig_undorec->rec.type);
 
 		/* Is there space for a new TID in the record? */
 		if (orig_undorec->num_tids < ZSUNDO_NUM_TIDS_PER_DELETE)
@@ -523,7 +523,7 @@ zsundo_clear_speculative_token(Relation rel, ZSUndoRecPtr undoptr)
 	undorec = (ZSUndoRec_Insert *) zsundo_fetch(rel, undoptr, &buf, BUFFER_LOCK_EXCLUSIVE, false);
 
 	if (undorec->rec.type != ZSUNDO_TYPE_INSERT)
-		elog(ERROR, "unexpected undo record type %d on speculatively inserted row",
+		elog(ERROR, "unexpected undo record type %u on speculatively inserted row",
 			 undorec->rec.type);
 
 	START_CRIT_SECTION();

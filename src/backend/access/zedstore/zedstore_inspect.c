@@ -1048,7 +1048,7 @@ pg_zs_meta_page(PG_FUNCTION_ARGS)
 	if (opaque->zs_page_id != ZS_META_PAGE_ID)
 	{
 		UnlockReleaseBuffer(buf);
-		elog(ERROR, "The zs_page_id does not match ZS_META_PAGE_ID. Got: %d",
+		elog(ERROR, "The zs_page_id does not match ZS_META_PAGE_ID. Got: %u",
 			 opaque->zs_page_id);
 	}
 

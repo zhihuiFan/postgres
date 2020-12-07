@@ -1210,8 +1210,7 @@ zedstoream_getnextslot(TableScanDesc sscan, ScanDirection direction,
 	 * columns are NULL.
 	 */
 	ExecClearTuple(slot);
-	for (int i = 0; i < slot_natts; i++)
-		slot_isnull[i] = true;
+	memset(slot_isnull, true, slot_natts * sizeof(bool));
 
 	/*
 	 * Find the next visible TID.
@@ -1498,8 +1497,8 @@ zedstoream_fetch_row(ZedStoreIndexFetchData *fetch,
 	 * code below will overwrite them for the columns that are projected)
 	 */
 	ExecClearTuple(slot);
-	for (int i = 0; i < slot->tts_tupleDescriptor->natts; i++)
-		slot->tts_isnull[i] = true;
+	memset(slot->tts_isnull, true,
+		   slot->tts_tupleDescriptor->natts * sizeof(bool));
 
 	found = zsbt_tid_scan_next(&fetch_proj->tid_scan, ForwardScanDirection) != InvalidZSTid;
 	if (found)
@@ -2497,9 +2496,8 @@ zedstoream_scan_analyze_next_tuple(TransactionId OldestXmin, AnalyzeSampleContex
 			slot = AnalyzeGetSampleSlot(context, scan->rs_rd, ANALYZE_SAMPLE_DISKSIZE);
 
 			ExecClearTuple(slot);
-
-			for (i = 0; i < scan->rs_rd->rd_att->natts; i++)
-				slot->tts_isnull[i] = true;
+			memset(slot->tts_isnull, true,
+				   scan->rs_rd->rd_att->natts * sizeof(bool));
 
 			for (i = 1; i < sscan->proj_data.num_proj_atts; i++)
 			{
@@ -2825,8 +2823,8 @@ zs_blkscan_next_tuple(TableScanDesc sscan, TupleTableSlot *slot)
 	 * columns are NULL.
 	 */
 	ExecClearTuple(slot);
-	for (int i = 0; i < sscan->rs_rd->rd_att->natts; i++)
-		slot->tts_isnull[i] = true;
+	memset(slot->tts_isnull, true,
+		   sscan->rs_rd->rd_att->natts * sizeof(bool));
 
 	/*
 	 * projection attributes were created based on Relation tuple descriptor

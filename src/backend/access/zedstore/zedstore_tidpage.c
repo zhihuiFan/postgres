@@ -1484,7 +1484,7 @@ zsbt_tid_replace_item(Relation rel, Buffer buf, OffsetNumber targetoff, List *ne
 	 * Find the item that covers the given tid.
 	 */
 	if (targetoff < FirstOffsetNumber || targetoff > PageGetMaxOffsetNumber(page))
-		elog(ERROR, "could not find item at off %d to replace", targetoff);
+		elog(ERROR, "could not find item at off %u to replace", targetoff);
 	iid = PageGetItemId(page, targetoff);
 	olditem = (ZSTidArrayItem *) PageGetItem(page, iid);
 
@@ -1516,7 +1516,7 @@ zsbt_tid_replace_item(Relation rel, Buffer buf, OffsetNumber targetoff, List *ne
 			lc = list_head(newitems);
 			newitem = (ZSTidArrayItem *) lfirst(lc);
 			if (!PageIndexTupleOverwrite(page, targetoff, (Item) newitem, newitem->t_size))
-				elog(ERROR, "could not replace item in TID tree page at off %d", targetoff);
+				elog(ERROR, "could not replace item in TID tree page at off %u", targetoff);
 			lc = lnext(newitems, lc);
 
 			off = targetoff + 1;
@@ -1524,7 +1524,7 @@ zsbt_tid_replace_item(Relation rel, Buffer buf, OffsetNumber targetoff, List *ne
 			{
 				newitem = (ZSTidArrayItem *) lfirst(lc);
 				if (!PageAddItem(page, (Item) newitem, newitem->t_size, off, false, false))
-					elog(ERROR, "could not add item in TID tree page at off %d", off);
+					elog(ERROR, "could not add item in TID tree page at off %u", off);
 				off++;
 			}
 		}
@@ -2036,7 +2036,7 @@ zsbt_tidleaf_items_redo(XLogReaderState *record, bool replace)
 				if (replace && i == 0)
 				{
 					if (!PageIndexTupleOverwrite(page, off, (Item) itembuf, itemsz))
-						elog(ERROR, "could not replace item on zedstore btree page at off %d", off);
+						elog(ERROR, "could not replace item on zedstore btree page at off %u", off);
 				}
 				else if (PageAddItem(page, (Item) itembufp, itemsz, off, false, false)
 						 == InvalidOffsetNumber)
