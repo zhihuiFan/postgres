@@ -187,7 +187,7 @@ ZSBtreeInternalPageIsFull(Page page)
  * parts are different from the normal usage.
  *
  * The upper and lower parts of the page contain one "attribute stream"
- * each. An attibute stream contains attribute data for a range of rows.
+ * each. An attribute stream contains attribute data for a range of rows.
  * Logically, it contains a list of TIDs, and their Datums and isnull
  * flags. The ranges of TIDs stored in the streams never overlap, but
  * there can be gaps, if rows have been deleted or updated.
@@ -1073,7 +1073,7 @@ typedef struct ZedstoreTupleTableSlot
 	/*
 	 * Normally, when a tuple is retrieved from a table, 'visi_info' points to
 	 * TID tree scan's data structures. But sometimes it's useful to keep the
-	 * information together with the slot, e.g. whe a slot is copied, so that
+	 * information together with the slot, e.g. when a slot is copied, so that
 	 * it doesn't depend on any data outside the slot. In that case, you can
 	 * fill in 'visi_info_buf', and set visi_info = &visi_info_buf.
 	 */

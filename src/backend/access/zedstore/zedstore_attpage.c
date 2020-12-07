@@ -132,7 +132,7 @@ zsbt_attr_scan_fetch_array(ZSAttrTreeScan *scan, zstid nexttid)
 
 	/*
 	 * If the TID we're looking for is in the current attstream, we just
-	 * need to decoder more of it.
+	 * need to decode more of it.
 	 *
 	 * TODO: We could restart the decoder, if the current attstream
 	 * covers the target TID, but we already decoded past it.
@@ -169,7 +169,7 @@ zsbt_attr_scan_fetch_array(ZSAttrTreeScan *scan, zstid nexttid)
 	scan->decoder.prevtid = 0;
 
 	/*
-	 * Descend the tree, tind and lock the leaf page containing 'nexttid'.
+	 * Descend the tree, find and lock the leaf page containing 'nexttid'.
 	 */
 	buf = zsbt_find_and_lock_leaf_containing_tid(scan->rel, scan->attno,
 												 scan->lastbuf, nexttid,
@@ -544,7 +544,7 @@ zsbt_attr_add(Relation rel, AttrNumber attno, attstream_buffer *attbuf)
 			/*
 			 * NOTE: in theory, if append_attstream_inplace() was smarter, it might
 			 * modify the existing data. The new combined stream might even be smaller
-			 * than the old stream, if the last codewords are packed more tighthly.
+			 * than the old stream, if the last codewords are packed more tightly.
 			 * But at the moment, append_attstreams_inplace() doesn't do anything
 			 * that smart. So we assume that the existing data didn't change, and we
 			 * only need to WAL log the new data at the end of the stream.
@@ -689,7 +689,7 @@ zsbt_attr_add(Relation rel, AttrNumber attno, attstream_buffer *attbuf)
  * Usage:
  *
  * 1. Call zsbt_attr_repack_init() to start a repacking operation.
- * 2. Call zsbt_attr_pack_attstream() to compress and chop a page-sied slice
+ * 2. Call zsbt_attr_pack_attstream() to compress and chop a page-sized slice
  *    of incoming data, and store it on the current page copy.
  * 3. Call zsbt_attr_repack_newpage() to allocate a new page, if you want
  *    to compress and write more data, and goto 2.
@@ -1050,7 +1050,7 @@ zsbt_attstream_change_redo(XLogReaderState *record)
 		/*
 		 * Finally, adjust the size in the attstream header to match.
 		 * (if the replacement data in the WAL record covered the attstream
-		 * header, this is unnecessarily but harmless)
+		 * header, this is unnecessary but harmless)
 		 */
 		attstream = (ZSAttStream *) (
 			xlrec->is_upper ? (page + ((PageHeader) page)->pd_upper) :

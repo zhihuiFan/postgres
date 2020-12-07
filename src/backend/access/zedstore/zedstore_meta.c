@@ -164,7 +164,7 @@ zsmeta_initmetapage_internal(int natts)
 
 	/*
 	 * It's possible that we error out when building the metapage, if there
-	 * are too many attribute, so work on a temporary copy first, before actually
+	 * are too many attributes, so work on a temporary copy first, before actually
 	 * allocating the buffer.
 	 */
 	page = palloc(BLCKSZ);
@@ -386,8 +386,8 @@ zsmeta_get_root_for_attribute(Relation rel, AttrNumber attno, bool readonly)
 	}
 
 	/*
-	 * file has less number of attributes stored compared to catalog. This
-	 * happens due to add column default value storing value in catalog and
+	 * file has fewer attributes stored than catalog. This
+	 * happens due to add column default value stored in catalog but
 	 * absent in table. This attribute must be marked with atthasmissing.
 	 */
 	if (attno >= metacache->cache_nattributes)

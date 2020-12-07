@@ -759,7 +759,7 @@ remap_slots(uint8 *slotnos, int num_tids,
 
 	/*
 	 * Have to remap the UNDO slots.
--	 *
+	 *
 	 * We start with empty UNDO slots, and walk through the items,
 	 * filling a slot whenever we encounter an UNDO pointer that we
 	 * haven't assigned a slot for yet. If we run out of slots, stop.
@@ -835,7 +835,7 @@ remap_slots(uint8 *slotnos, int num_tids,
  * 'tids' is the list of TIDs to be packed in the item.
  *
  * 'deltas' contain the difference between each TID. They could be computed
- * from the 'tids', but since the caller has them lready, we can save some
+ * from the 'tids', but since the caller has them already, we can save some
  * effort by passing them down.
  *
  * 'slots' contains the UNDO slots to be stored. NOTE: it contains the

@@ -1042,7 +1042,7 @@ ldelete:;
 				/*
 				 * XXX returningCols should never be empty if we have a RETURNING
 				 * clause. Right now, if we have a view, we fail to populate the
-				 * returningCols of it's base table's RTE.
+				 * returningCols of its base table's RTE.
 				 * If we encounter such a situation now, for correctness, ensure
 				 * that we fetch all the columns.
 				 */

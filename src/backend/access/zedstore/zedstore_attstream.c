@@ -21,7 +21,7 @@
  * variable-width attributes, the length of each datum in the chunk.
  * Therefore, fixed- and variable-length attributes use different "modes".
  *
- * This chunked format has a few desireable properties:
+ * This chunked format has a few desirable properties:
  *
  * - It is compact for the common case of no or few gaps between TIDs.
  *   In the best case, one codeword can pack 60 consecutive TIDs in
@@ -985,7 +985,7 @@ merge_attstream_guts(Form_pg_attribute attr, attstream_buffer *buf, char *chunks
 	 *
 	 * FIXME: we don't actually pay attention to the compression anymore.
 	 * We never repack.
-	 * FIXME: this is backwords, the normal fast path is if (firsttid1 > lasttid2)
+	 * FIXME: this is backwards, the normal fast path is if (firsttid1 > lasttid2)
 	 */
 	if (firsttid2 > lasttid1)
 	{
@@ -1008,7 +1008,7 @@ merge_attstream_guts(Form_pg_attribute attr, attstream_buffer *buf, char *chunks
 
 	/*
 	 * naive implementation: decode everything, merge arrays, and re-encode.
-	 * FIXME: becuase this is naive, this could be costly when we have a large number of tids in the attbuffer
+	 * FIXME: because this is naive, this could be costly when we have a large number of tids in the attbuffer
 	 */
 	init_attstream_decoder(&decoder1, attr->attbyval, attr->attlen);
 	decode_chunks_begin(&decoder1, buf->data + buf->cursor, buf->len - buf->cursor, buf->lasttid);
@@ -1027,7 +1027,7 @@ merge_attstream_guts(Form_pg_attribute attr, attstream_buffer *buf, char *chunks
 
 	/*
 	 * Reallocate a new buffer, in the same memory context as the old one, to
-	 * write the result to. (We can't write diretly to the old buffer, because
+	 * write the result to. (We can't write directly to the old buffer, because
 	 * we'll read it simultaneously.
 	 */
 	newmaxlen = (buf->len - buf->cursor) + chunks2len + 100; /* 100 is gives some headroom, to avoid

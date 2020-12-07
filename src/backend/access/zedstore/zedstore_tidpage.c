@@ -1710,7 +1710,7 @@ zsbt_tid_recompress_add_to_page(zsbt_tid_recompress_context *cxt, ZSTidArrayItem
 /*
  * Subroutine of zsbt_tid_recompress_replace.  Compute how much space the
  * items will take, and compute how many pages will be needed for them, and
- * decide how to distribute any free space thats's left over among the
+ * decide how to distribute any free space that's left over among the
  * pages.
  *
  * Like in B-tree indexes, we aim for 50/50 splits, except for the

@@ -193,7 +193,7 @@ preprocess_targetlist(PlannerInfo *root)
 	 *
 	 * XXX: Avoid adding cols from the returningList to avoid overestimation
 	 * of scanCols from RelOptInfo->reltarget exprs. This is done to avoid
-	 * additional cols from the RETURNING clause making its way into scanCols
+	 * additional cols from the RETURNING clause making their way into scanCols
 	 * for queries such as:
 	 * delete from base_tbl using other_tbl t where base_tbl.col1 = t.col1 returning *;
 	 * where base_tbl is the root table of an inheritance hierarchy

@@ -816,7 +816,7 @@ DestroyAnalyzeSampleContext(AnalyzeSampleContext *context)
 /* 
  * To acquire sample rows from an inherited table, all child
  * relations use the same analyze sample context, this function
- * must be called before starting analyze a new child relation.
+ * must be called before starting to analyze a new child relation.
  */
 void
 InitAnalyzeSampleContextForChild(AnalyzeSampleContext *context,
@@ -919,7 +919,7 @@ AnalyzeGetSampleRows(AnalyzeSampleContext *context,
  * Record a sample tuple into sample_rows[type].
  * 
  * sample_tuple:
- * 		Input sample tuple. Sometimes, callers has already
+ * 		Input sample tuple. If caller has already
  * 		formed sample tuple in its memory context, we can
  * 		record it directly. 
  * sample_slot: 

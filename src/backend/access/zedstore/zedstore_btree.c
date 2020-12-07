@@ -1,6 +1,6 @@
 /*
  * zedstore_btree.c
- *		Common routines for handling TID and attibute B-tree structures
+ *		Common routines for handling TID and attribute B-tree structures
  *
  * A Zedstore table consists of multiple B-trees, one to store TIDs and
  * visibility information of the rows, and one tree for each attribute,
@@ -126,7 +126,7 @@ zsbt_descend(Relation rel, AttrNumber attno, zstid key, int level, bool readonly
 			 * If the root was split after we cached the metadata, it's
 			 * possible that the page we thought was the root page no longer
 			 * is, but as we descend from the new root page, we'll end up on
-			 * the same page again anyway. Don't treat thatas an error. To
+			 * the same page again anyway. Don't treat that as an error. To
 			 * avoid it, check for the root case here, and if reset 'failblk'.
 			 */
 			if (faillevel == -1)
@@ -186,7 +186,7 @@ zsbt_descend(Relation rel, AttrNumber attno, zstid key, int level, bool readonly
  * Returns InvalidBuffer, if the attribute tree doesn't exist at all.
  * That should only happen after ALTER TABLE ADD COLUMN. Or on a newly
  * created table, but none of the current callers would even try to
- * fetch attribute data, without scanning the TID tree first.)
+ * fetch attribute data, without scanning the TID tree first.
  */
 Buffer
 zsbt_find_and_lock_leaf_containing_tid(Relation rel, AttrNumber attno,

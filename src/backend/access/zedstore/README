@@ -185,7 +185,7 @@ MVCC
 ----
 
 Undo record pointers are used to implement MVCC, like in zheap. Hence,
-transaction information if not directly stored with the data. In
+transaction information is not directly stored with the data. In
 zheap, there's a small, fixed, number of "transaction slots" on each
 page, but zedstore has undo pointer with each item directly; in normal
 cases, the compression squeezes this down to almost nothing. In case

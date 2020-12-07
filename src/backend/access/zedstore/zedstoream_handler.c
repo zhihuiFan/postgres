@@ -325,7 +325,7 @@ retry:
 			if (!TransactionIdIsCurrentTransactionId(xwait))
 			{
 				/*
-				 * Acquire tuple lock to establish our priosity for the tuple
+				 * Acquire tuple lock to establish our priority for the tuple
 				 * See zedstoream_lock_tuple().
 				 */
 				if (!this_xact_has_lock)
@@ -884,7 +884,7 @@ retry:
 			if (!TransactionIdIsCurrentTransactionId(xwait))
 			{
 				/*
-				 * Acquire tuple lock to establish our priosity for the tuple
+				 * Acquire tuple lock to establish our priority for the tuple
 				 * See zedstoream_lock_tuple().
 				 */
 				if (!this_xact_has_lock)
@@ -3084,7 +3084,7 @@ zedstore_tableam_handler(PG_FUNCTION_ARGS)
  * Number of TIDs to assign to a parallel worker in a parallel Seq Scan in
  * one batch.
  *
- * Not sure what the optimimum would be. If the chunk size is too small,
+ * Not sure what the optimum would be. If the chunk size is too small,
  * the parallel workers will waste effort, when two parallel workers both
  * need to decompress and process the pages at the boundary. But on the
  * other hand, if the chunk size is too large, we might not be able to make

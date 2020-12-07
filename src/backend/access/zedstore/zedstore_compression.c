@@ -56,7 +56,7 @@ zs_compress_destSize(const char *src, char *dst, int *srcSizePtr, int targetDstS
 	 * FIXME: pglz doesn't have an interface like LZ4 does, to compress up to a certain
 	 * target compressed output size. We take a conservative approach and compress
 	 * 'targetDstSize' bytes, and return that. Alternatively, we could guess the
-	 * compression ratio, and try compressing a larget chunk hoping that it will fit
+	 * compression ratio, and try compressing a target chunk hoping that it will fit
 	 * in the target size, and try again if it didn't fit. Or we could enhance pglz
 	 * code to do this cleverly. But it doesn't seem worth the effort, LZ4 (or something
 	 * else, but not pglz) is the future.

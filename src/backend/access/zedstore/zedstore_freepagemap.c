@@ -301,7 +301,7 @@ zspage_extendrel_newbuf(Relation rel)
 }
 
 /*
- * Explictly mark a page as deleted and recyclable, and add it to the FPM.
+ * Explicitly mark a page as deleted and recyclable, and add it to the FPM.
  *
  * The caller must hold an exclusive-lock on the page.
  *

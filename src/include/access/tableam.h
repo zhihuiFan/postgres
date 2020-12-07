@@ -60,9 +60,9 @@ typedef struct AnalyzeSampleContext
 	TableScanDesc scan;
 
 	/* 
-	 * Acquiring sample rows from a inherited table will invoke
+	 * Acquiring sample rows from an inherited table will invoke
 	 * multiple sampling iterations for each child relation, so
-	 * bellow filed is the statistic for each iteration.
+	 * below is repopulated with the statistic for each iteration.
 	 */
 	int		targrows;	/* target number of sample rows */
 	double 	liverows;
@@ -70,16 +70,16 @@ typedef struct AnalyzeSampleContext
 	bool	ordered;	/* are sample rows ordered physically */
 
 	/*
-	 * Statistics filed by all sampling iterations.
+	 * Statistics filled by all sampling iterations.
 	 */
 	int		totalsampledrows; /* total number of sample rows stored */
 	double	totalrows;
 	double	totaldeadrows;
 
 	/* 
-	 * If childrel has different rowtype with parent, we
+	 * If childrel has different rowtype than parent, we
 	 * need to convert sample tuple to the same rowtype
-	 * with parent
+	 * as parent
 	 */
 	struct TupleConversionMap *tup_convert_map;
 
@@ -279,7 +279,7 @@ typedef struct TableAmRoutine
 	 *
 	 * Please note: Due to the limitations of the slot_get***() APIs, the
 	 * scan_getnextslot() tableAM call must return a TupleTableSlot that is densely
-	 * populated (missing cols indicated with isnull = true upto the largest
+	 * populated (missing cols indicated with isnull = true up to the largest
 	 * attno in the projection list)
 	 */
 	TableScanDesc (*scan_begin_with_column_projection)(Relation relation,
@@ -378,7 +378,7 @@ typedef struct TableAmRoutine
 	 *
 	 * Please note: Due to the limitations of the slot_get***() APIs,
 	 * index_fetch_tuple() must return a TupleTableSlot that is densely
-	 * populated (missing cols indicated with isnull = true upto the largest
+	 * populated (missing cols indicated with isnull = true up to the largest
 	 * attno in the projection list)
 	 */
 	void (*index_fetch_set_column_projection) (struct IndexFetchTableData *data,
@@ -433,7 +433,7 @@ typedef struct TableAmRoutine
 	 *
 	 * Please note: Due to the limitations of the slot_get***() APIs,
 	 * tuple_fetch_row_version() must return a TupleTableSlot that is densely
-	 * populated (missing cols indicated with isnull = true upto the largest
+	 * populated (missing cols indicated with isnull = true up to the largest
 	 * attno in the projection list)
 	 */
 	bool		(*tuple_fetch_row_version) (Relation rel,
@@ -1500,7 +1500,7 @@ table_tuple_update(Relation rel, ItemPointer otid, TupleTableSlot *slot,
  *
  *	 Please note: Due to the limitations of the slot_get***() APIs,
  *	 tuple_lock() must return a TupleTableSlot that is densely
- *	 populated (missing cols indicated with isnull = true upto the largest
+ *	 populated (missing cols indicated with isnull = true up to the largest
  *	 attno in the projection list)
  *
  * Output parameters:
