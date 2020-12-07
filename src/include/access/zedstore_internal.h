@@ -284,8 +284,8 @@ typedef struct
  *
  * Leaf pages are packed with ZSTidArrayItems. Each ZSTidArrayItem represents
  * a range of tuples, starting at 't_firsttid', up to 't_endtid' - 1. For each
- * tuple, we its TID and the UNDO pointer. The TIDs and UNDO pointers are specially
- * encoded, so that they take less space.
+ * tuple, we store its TID and the UNDO pointer. The TIDs and UNDO pointers are
+ * specially encoded, so that they take less space.
  *
  * Item format:
  *

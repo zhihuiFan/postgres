@@ -31,8 +31,8 @@ struct ZSUndoRec
 
 	/*
 	 * UNDO-record of the inserter. This is needed if a row is inserted, and
-	 * deleted, and there are some snapshots active don't don't consider even
-	 * the insertion as visible.
+	 * deleted, and there are some snapshots active which don't consider the
+	 * insertion visible either.
 	 *
 	 * This is also used in Insert records, if the record represents the
 	 * new tuple version of an UPDATE, rather than an INSERT. It's needed to
