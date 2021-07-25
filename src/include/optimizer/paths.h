@@ -143,6 +143,8 @@ extern EquivalenceMember *find_computable_ec_member(PlannerInfo *root,
 													List *exprs,
 													Relids relids,
 													bool require_parallel_safe);
+extern bool ec_useful_for_merging(PlannerInfo *root, RelOptInfo *rel,
+								  EquivalenceClass *ec);
 extern Expr *find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel);
 extern bool relation_can_be_sorted_early(PlannerInfo *root, RelOptInfo *rel,
 										 EquivalenceClass *ec,
