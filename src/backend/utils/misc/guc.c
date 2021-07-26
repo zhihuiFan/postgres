@@ -928,6 +928,16 @@ static const unit_conversion time_unit_conversion_table[] =
 static struct config_bool ConfigureNamesBool[] =
 {
 	{
+		{"enable_column_scan", PGC_USERSET, QUERY_TUNING_METHOD,
+		    gettext_noop("Enables executor for column scan, deubg only"),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&enable_column_scan,
+		false,
+		NULL, NULL, NULL
+	},
+	{
 		{"enable_seqscan", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Enables the planner's use of sequential-scan plans."),
 			NULL,

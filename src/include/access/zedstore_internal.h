@@ -1080,4 +1080,6 @@ typedef struct ZedstoreTupleTableSlot
 	ZSUndoSlotVisibility visi_info_buf;
 } ZedstoreTupleTableSlot;
 
+
+void zsbt_fill_missing_attribute_value(TupleDesc tupleDesc, int attno, Datum *datum, bool *isnull);
 #endif							/* ZEDSTORE_INTERNAL_H */

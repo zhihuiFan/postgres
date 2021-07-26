@@ -108,7 +108,7 @@ static Size zs_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan
 static void zs_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan);
 static bool zs_parallelscan_nextrange(Relation rel, ParallelZSScanDesc pzscan,
 									  zstid *start, zstid *end);
-static void zsbt_fill_missing_attribute_value(TupleDesc tupleDesc, int attno, Datum *datum, bool *isnull);
+
 
 /* ----------------------------------------------------------------
  *				storage AM support routines for zedstoream
@@ -3169,7 +3169,7 @@ zs_parallelscan_nextrange(Relation rel, ParallelZSScanDesc pzscan,
  * NULLs, but you could specify a different value in the ALTER TABLE command,
  * too, with DEFAULT.
  */
-static void
+void
 zsbt_fill_missing_attribute_value(TupleDesc tupleDesc, int attno, Datum *datum, bool *isnull)
 {
 	Form_pg_attribute attr = TupleDescAttr(tupleDesc, attno - 1);

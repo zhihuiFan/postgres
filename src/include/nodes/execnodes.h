@@ -15,6 +15,7 @@
 #define EXECNODES_H
 
 #include "access/tupconvert.h"
+#include "access/zedstore_internal.h"
 #include "executor/instrument.h"
 #include "fmgr.h"
 #include "lib/pairingheap.h"
@@ -1330,6 +1331,9 @@ typedef struct ScanState
 	Relation	ss_currentRelation;
 	struct TableScanDescData *ss_currentScanDesc;
 	TupleTableSlot *ss_ScanTupleSlot;
+
+	ZSTidTreeScan  tid_scan;
+	ZSAttrTreeScan *attr_scans;
 } ScanState;
 
 /* ----------------

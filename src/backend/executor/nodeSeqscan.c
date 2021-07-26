@@ -35,6 +35,7 @@
 #include "utils/rel.h"
 
 static TupleTableSlot *SeqNext(SeqScanState *node);
+bool enable_column_scan = false;
 
 /* ----------------------------------------------------------------
  *						Scan Support
@@ -78,6 +79,23 @@ SeqNext(SeqScanState *node)
 															  estate->es_snapshot,
 															  0, NULL,
 															  rte->scanCols);
+			if (enable_column_scan)
+			{
+				TupleDesc tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
+				int i;
+				zsbt_tid_begin_scan(node->ss.ss_currentRelation, MinZSTid,
+									MaxPlusOneZSTid,
+									estate->es_snapshot, &node->ss.tid_scan);
+			    node->ss.tid_scan.serializable = true;
+				node->ss.attr_scans = palloc0(
+					sizeof(ZSAttrTreeScan *) * (tupdesc->natts));
+				for(i = 0; i < tupdesc->natts; i++)
+				{
+					zsbt_attr_begin_scan(node->ss.ss_currentRelation, tupdesc, i+1, &node->ss.attr_scans[i]);
+				}
+			}
+
+
 		}
 		else
 		{
@@ -88,6 +106,50 @@ SeqNext(SeqScanState *node)
 		node->ss.ss_currentScanDesc = scandesc;
 	}
 
+	if (node->ss.attr_scans != NULL)
+	{
+		/* Test APIs */
+		zstid curtid =  zsbt_tid_scan_next(&node->ss.tid_scan, direction);
+		TupleDesc tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
+		int i;
+		// elog(INFO, "Fetch data for zstid %lu", curtid);
+		if (curtid != 0)
+		{
+			for(i = 0; i < tupdesc->natts; i++)
+			{
+				Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+				if (att->atttypid == INT4OID)
+				{
+					Datum datum;
+					bool isnull;
+					Form_pg_attribute attr = node->ss.attr_scans[i].attdesc;
+					ZSAttrTreeScan *btscan = &node->ss.attr_scans[i];
+
+					if (!zsbt_attr_fetch(&node->ss.attr_scans[i], &datum, &isnull, curtid))
+						zsbt_fill_missing_attribute_value(tupdesc, node->ss.attr_scans[i].attno, &datum, &isnull);
+					if (!isnull && attr->attlen == -1 &&
+						VARATT_IS_EXTERNAL(datum) && VARTAG_EXTERNAL(datum) == VARTAG_ZEDSTORE)
+					{
+						MemoryContext oldcxt = CurrentMemoryContext;
+
+						if (btscan->decoder.tmpcxt)
+							MemoryContextSwitchTo(btscan->decoder.tmpcxt);
+						datum = zedstore_toast_flatten(node->ss.ss_currentRelation, attr->attnum, curtid, datum);
+						MemoryContextSwitchTo(oldcxt);
+					}
+
+					/* Check that the values coming out of the b-tree are aligned properly */
+					if (!isnull && attr->attlen == -1)
+					{
+						Assert (VARATT_IS_1B(datum) || INTALIGN(datum) == datum);
+					}
+
+					//	elog(INFO, "idx: %d col name: %s, colno: %d value = %d", i,
+					// att->attname.data, att->attnum, DatumGetInt(datum));
+				}
+			}
+		}
+	}
 	/*
 	 * get the next tuple from the table
 	 */
@@ -219,6 +281,14 @@ ExecEndSeqScan(SeqScanState *node)
 	/*
 	 * close heap scan
 	 */
+	if (node->ss.attr_scans != NULL)
+	{
+		TupleDesc tupdesc = node->ss.ss_currentRelation->rd_att;
+		int i;
+		zsbt_tid_end_scan(&node->ss.tid_scan);
+		for(i = 0; i < tupdesc->natts; i++)
+			zsbt_attr_end_scan(&node->ss.attr_scans[i]);
+	}
 	if (scanDesc != NULL)
 		table_endscan(scanDesc);
 }

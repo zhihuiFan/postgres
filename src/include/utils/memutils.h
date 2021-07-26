@@ -113,6 +113,7 @@ static inline MemoryContext
 GetMemoryChunkContext(void *pointer)
 {
 	MemoryContext context;
+	void *p;
 
 	/*
 	 * Try to detect bogus pointers handed to us, poorly though we can.
@@ -125,7 +126,8 @@ GetMemoryChunkContext(void *pointer)
 	/*
 	 * OK, it's probably safe to look at the context.
 	 */
-	context = *(MemoryContext *) (((char *) pointer) - sizeof(void *));
+	p =  (((char *) pointer) - sizeof(void *));
+	context = *(MemoryContext *) p;
 
 	AssertArg(MemoryContextIsValid(context));
 

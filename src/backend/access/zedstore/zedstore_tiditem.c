@@ -12,6 +12,7 @@
 
 #include "access/zedstore_internal.h"
 #include "access/zedstore_simple8b.h"
+#include "utils/memutils.h"
 
 static int remap_slots(uint8 *slotnos, int num_tids,
 					   ZSUndoRecPtr *orig_slots, int num_orig_slots,
@@ -46,6 +47,9 @@ zsbt_tid_item_unpack(ZSTidArrayItem *item, ZSTidItemIterator *iter)
 			pfree(iter->tid_undoslotnos);
 		iter->tids = MemoryContextAlloc(iter->context, item->t_num_tids * sizeof(zstid));
 		iter->tid_undoslotnos = MemoryContextAlloc(iter->context, item->t_num_tids * sizeof(uint8));
+		/* elog(INFO, "tid_undoslotnos %x, name %s", */
+		/* 	 iter->tid_undoslotnos, */
+		/* 	 GetMemoryChunkContext(iter->tid_undoslotnos)->name); */
 		iter->tids_allocated_size = item->t_num_tids;
 	}
 
