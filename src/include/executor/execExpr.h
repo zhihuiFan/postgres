@@ -280,6 +280,7 @@ typedef struct ExprEvalStep
 			/* but it's just the normal (negative) attr number for SYSVAR */
 			int			attnum;
 			Oid			vartype;	/* type OID of variable */
+			int			scanid;
 		}			var;
 
 		/* for EEOP_WHOLEROW */
@@ -299,6 +300,7 @@ typedef struct ExprEvalStep
 			int			resultnum;
 			/* source attribute number - 1 */
 			int			attnum;
+			int			scanrelid;
 		}			assign_var;
 
 		/* for EEOP_ASSIGN_TMP[_MAKE_RO] */
@@ -730,6 +732,10 @@ extern void ExecEvalWholeRowVar(ExprState *state, ExprEvalStep *op,
 								ExprContext *econtext);
 extern void ExecEvalSysVar(ExprState *state, ExprEvalStep *op,
 						   ExprContext *econtext, TupleTableSlot *slot);
+extern void ExecEvalCStoreVar(ExprState *estate, ExprEvalStep *op,
+							  ExprContext *econtxt, TupleTableSlot *slot);
+extern void ExecEvalCStoreAssignVar(ExprState *estate, ExprEvalStep *op,
+									ExprContext *econtext, TupleTableSlot *slot);
 
 extern void ExecAggInitGroup(AggState *aggstate, AggStatePerTrans pertrans, AggStatePerGroup pergroup,
 							 ExprContext *aggcontext);

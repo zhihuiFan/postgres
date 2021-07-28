@@ -441,6 +441,7 @@ ExecBuildProjectionInfo(List *targetList,
 
 			scratch.d.assign_var.attnum = attnum - 1;
 			scratch.d.assign_var.resultnum = tle->resno - 1;
+			scratch.d.assign_var.scanrelid = state->parent->state->es_cur_scanid;
 			ExprEvalPushStep(state, &scratch);
 		}
 		else
@@ -694,6 +695,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 					/* regular user column */
 					scratch.d.var.attnum = variable->varattno - 1;
 					scratch.d.var.vartype = variable->vartype;
+					scratch.d.var.scanid = state->parent->state->es_cur_scanid;
 					switch (variable->varno)
 					{
 						case INNER_VAR:

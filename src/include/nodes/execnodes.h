@@ -15,6 +15,7 @@
 #define EXECNODES_H
 
 #include "access/tupconvert.h"
+#include "access/zedstore_internal.h"
 #include "executor/instrument.h"
 #include "fmgr.h"
 #include "lib/pairingheap.h"
@@ -262,6 +263,8 @@ typedef struct ExprContext
 
 	/* Functions to call back when ExprContext is shut down or rescanned */
 	ExprContext_CB *ecxt_callbacks;
+
+	zstid ecxt_cur_tid;
 } ExprContext;
 
 /*
@@ -519,8 +522,10 @@ typedef struct EState
 	Snapshot	es_crosscheck_snapshot; /* crosscheck time qual for RI */
 	List	   *es_range_table; /* List of RangeTblEntry */
 	Index		es_range_table_size;	/* size of the range table arrays */
+	Index		es_cur_scanid;
 	Relation   *es_relations;	/* Array of per-range-table-entry Relation
 								 * pointers, or NULL if not yet opened */
+	struct ScanState  **es_scanstate;
 	struct ExecRowMark **es_rowmarks;	/* Array of per-range-table-entry
 										 * ExecRowMarks, or NULL if none */
 	PlannedStmt *es_plannedstmt;	/* link to top of plan tree */
@@ -1330,6 +1335,9 @@ typedef struct ScanState
 	Relation	ss_currentRelation;
 	struct TableScanDescData *ss_currentScanDesc;
 	TupleTableSlot *ss_ScanTupleSlot;
+
+	ZSTidTreeScan  *tid_scan;
+	ZSAttrTreeScan **attr_scans;
 } ScanState;
 
 /* ----------------

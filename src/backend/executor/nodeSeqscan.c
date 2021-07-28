@@ -29,12 +29,14 @@
 
 #include "access/relscan.h"
 #include "access/tableam.h"
+#include "access/cstore_api.h"
 #include "executor/execdebug.h"
 #include "executor/nodeSeqscan.h"
 #include "nodes/nodeFuncs.h"
 #include "utils/rel.h"
 
 static TupleTableSlot *SeqNext(SeqScanState *node);
+bool enable_column_scan = false;
 
 /* ----------------------------------------------------------------
  *						Scan Support
@@ -63,13 +65,30 @@ SeqNext(SeqScanState *node)
 	direction = estate->es_direction;
 	slot = node->ss.ss_ScanTupleSlot;
 
-	if (scandesc == NULL)
+	if (enable_column_scan)
 	{
 		/*
 		 * We reach here if the scan is not parallel, or if we're serially
 		 * executing a scan that was planned to be parallel.
 		 */
-		if (table_scans_leverage_column_projection(node->ss.ss_currentRelation))
+		if (node->ss.tid_scan == NULL)
+		{
+			TupleDesc tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
+			int i;
+			node->ss.tid_scan = column_table_begin_scan(node->ss.ss_currentRelation, estate->es_snapshot);
+			node->ss.attr_scans = palloc0(
+				sizeof(ZSAttrTreeScan *) * (tupdesc->natts));
+			for(i = 0; i < tupdesc->natts; i++)
+			{
+				node->ss.attr_scans[i] = column_table_column_begin_scan(node->ss.ss_currentRelation,
+																		tupdesc,
+																		i + 1);
+			}
+		}
+	}
+	else if (table_scans_leverage_column_projection(node->ss.ss_currentRelation))
+	{
+		if (scandesc == NULL)
 		{
 			Scan *planNode = (Scan *)node->ss.ps.plan;
 			int rti = planNode->scanrelid;
@@ -78,21 +97,41 @@ SeqNext(SeqScanState *node)
 															  estate->es_snapshot,
 															  0, NULL,
 															  rte->scanCols);
+			node->ss.ss_currentScanDesc = scandesc;
 		}
-		else
-		{
-			scandesc = table_beginscan(node->ss.ss_currentRelation,
-									   estate->es_snapshot,
-									   0, NULL);
-		}
+	}
+	else if (scandesc == NULL) 
+	{
+		scandesc = table_beginscan(node->ss.ss_currentRelation,
+								   estate->es_snapshot,
+								   0, NULL);
 		node->ss.ss_currentScanDesc = scandesc;
 	}
 
 	/*
 	 * get the next tuple from the table
 	 */
-	if (table_scan_getnextslot(scandesc, direction, slot))
-		return slot;
+	if (enable_column_scan)
+	{
+		zstid curtid =  column_table_next_row(node->ss.tid_scan, direction);
+		node->ss.ps.ps_ExprContext->ecxt_cur_tid = curtid;
+
+		if (curtid != 0)
+		{
+			slot->tts_tid = *((ItemPointerData*) &curtid);
+			return slot;
+		}
+			
+		else
+			return NULL;
+	}
+	else
+	{
+		if (table_scan_getnextslot(scandesc, direction, slot))
+			return slot;
+		else
+			return NULL;
+	}
 	return NULL;
 }
 
@@ -173,6 +212,9 @@ ExecInitSeqScan(SeqScan *node, EState *estate, int eflags)
 						  RelationGetDescr(scanstate->ss.ss_currentRelation),
 						  table_slot_callbacks(scanstate->ss.ss_currentRelation));
 
+	estate->es_scanstate[node->scanrelid] = &scanstate->ss;
+	estate->es_cur_scanid = node->scanrelid;
+
 	/*
 	 * Initialize result type and projection.
 	 */
@@ -219,6 +261,14 @@ ExecEndSeqScan(SeqScanState *node)
 	/*
 	 * close heap scan
 	 */
+	if (node->ss.attr_scans != NULL)
+	{
+		TupleDesc tupdesc = node->ss.ss_currentRelation->rd_att;
+		int i;
+		zsbt_tid_end_scan(node->ss.tid_scan);
+		for(i = 0; i < tupdesc->natts; i++)
+			zsbt_attr_end_scan(node->ss.attr_scans[i]);
+	}
 	if (scanDesc != NULL)
 		table_endscan(scanDesc);
 }

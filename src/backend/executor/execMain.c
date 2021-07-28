@@ -825,6 +825,9 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	 */
 	ExecInitRangeTable(estate, rangeTable);
 
+	estate->es_scanstate = (ScanState **)
+		palloc0(estate->es_range_table_size * sizeof(ScanState *));
+
 	estate->es_plannedstmt = plannedstmt;
 
 	/*

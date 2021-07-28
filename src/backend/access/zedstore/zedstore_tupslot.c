@@ -60,6 +60,7 @@ tts_zedstore_clear(TupleTableSlot *slot)
 static void
 tts_zedstore_getsomeattrs(TupleTableSlot *slot, int natts)
 {
+	if (!enable_column_scan)
 	elog(ERROR, "getsomeattrs is not required to be called on a zedstore tuple table slot");
 }
 

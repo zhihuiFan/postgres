@@ -57,6 +57,7 @@
 #include "postgres.h"
 
 #include "access/heaptoast.h"
+#include "access/cstore_api.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "executor/execExpr.h"
@@ -496,6 +497,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			CheckOpSlotCompatibility(op, scanslot);
 
+			if (!enable_column_scan)
 			slot_getsomeattrs(scanslot, op->d.fetch.last_var);
 
 			EEO_NEXT();
@@ -537,9 +539,16 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 
 			/* See EEOP_INNER_VAR comments */
 
+			if (enable_column_scan)
+			{
+				ExecEvalCStoreVar(state, op, econtext, scanslot);
+			}
+			else
+			{
 			Assert(attnum >= 0 && attnum < scanslot->tts_nvalid);
 			*op->resvalue = scanslot->tts_values[attnum];
 			*op->resnull = scanslot->tts_isnull[attnum];
+			}
 
 			EEO_NEXT();
 		}
@@ -611,10 +620,16 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * We do not need CheckVarSlotCompatibility here; that was taken
 			 * care of at compilation time.  But see EEOP_INNER_VAR comments.
 			 */
+			if (enable_column_scan)
+			{
+				ExecEvalCStoreAssignVar(state, op, econtext, resultslot);
+			}
+			else
+			{
 			Assert(attnum >= 0 && attnum < scanslot->tts_nvalid);
 			resultslot->tts_values[resultnum] = scanslot->tts_values[attnum];
 			resultslot->tts_isnull[resultnum] = scanslot->tts_isnull[attnum];
-
+			}
 			EEO_NEXT();
 		}
 
@@ -4092,6 +4107,32 @@ ExecEvalWholeRowVar(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 
 	*op->resvalue = PointerGetDatum(dtuple);
 	*op->resnull = false;
+}
+
+
+void ExecEvalCStoreVar(ExprState *estate, ExprEvalStep *op,
+					   ExprContext *econtext, TupleTableSlot *slot)
+{
+	int scanrelid = op->d.var.scanid;
+	int attno = op->d.var.attnum;
+	ScanState *ss = estate->parent->state->es_scanstate[scanrelid];
+	ZSAttrTreeScan *attr_scan = ss->attr_scans[attno];
+	zstid this_tid = econtext->ecxt_cur_tid;
+	column_table_fetch_column_value(attr_scan, this_tid, op->resvalue, op->resnull);
+}
+
+void ExecEvalCStoreAssignVar(ExprState *estate, ExprEvalStep *op,
+							 ExprContext *econtext, TupleTableSlot *slot)
+{
+	int			resultnum = op->d.assign_var.resultnum;
+	int			attnum = op->d.assign_var.attnum;
+	int			scanrelid = op->d.assign_var.scanrelid;
+	ScanState *ss = estate->parent->state->es_scanstate[scanrelid];
+	ZSAttrTreeScan *attr_scan = ss->attr_scans[attnum];
+	zstid this_tid = econtext->ecxt_cur_tid;
+	column_table_fetch_column_value(attr_scan, this_tid,
+									&slot->tts_values[resultnum],
+									&slot->tts_isnull[resultnum]);
 }
 
 void

@@ -178,7 +178,7 @@ ExecScan(ScanState *node,
 	 * If we have neither a qual to check nor a projection to do, just skip
 	 * all the overhead and return the raw scan tuple.
 	 */
-	if (!qual && !projInfo)
+	if (!qual && !projInfo & !enable_column_scan)
 	{
 		ResetExprContext(econtext);
 		return ExecScanFetch(node, accessMtd, recheckMtd);
@@ -197,6 +197,7 @@ ExecScan(ScanState *node,
 	for (;;)
 	{
 		TupleTableSlot *slot;
+		bool is_null;
 
 		slot = ExecScanFetch(node, accessMtd, recheckMtd);
 
@@ -206,7 +207,8 @@ ExecScan(ScanState *node,
 		 * being careful to use the projection result slot so it has correct
 		 * tupleDesc.
 		 */
-		if (TupIsNull(slot))
+		is_null = enable_column_scan ? slot == NULL : TupIsNull(slot);
+		if (is_null)
 		{
 			if (projInfo)
 				return ExecClearTuple(projInfo->pi_state.resultslot);

@@ -664,4 +664,5 @@ get_ordinal_attnos(Relation rel)
 extern void RelationIncrementReferenceCount(Relation rel);
 extern void RelationDecrementReferenceCount(Relation rel);
 
+extern bool enable_column_scan;
 #endif							/* REL_H */
