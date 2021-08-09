@@ -1650,7 +1650,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 	 * Now we are prepared to build the final-output upperrel.
 	 */
 	final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
-
+	simple_copy_uniquekeys(final_rel, current_rel);
 	/*
 	 * If the input rel is marked consider_parallel and there's nothing that's
 	 * not parallel-safe in the LIMIT clause, then the final_rel can be marked
@@ -3622,6 +3622,19 @@ create_ordinary_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 									  gd,
 									  extra->targetList);
 
+	if (root->parse->groupingSets)
+	{
+		/* nothing to do */
+	}
+	else if (root->parse->groupClause && root->group_pathkeys != NIL)
+	{
+		populate_uniquekeys_from_pathkeys(root, grouped_rel, root->group_pathkeys);
+	}
+	else
+	{
+		/* SingleRow Case */
+	}
+
 	/* Build final grouping paths */
 	add_paths_to_grouping_rel(root, input_rel, grouped_rel,
 							  partially_grouped_rel, agg_costs, gd,
@@ -4250,6 +4263,8 @@ create_distinct_paths(PlannerInfo *root,
 
 	/* For now, do all work in the (DISTINCT, NULL) upperrel */
 	distinct_rel = fetch_upper_rel(root, UPPERREL_DISTINCT, NULL);
+
+	populate_uniquekeys_from_pathkeys(root, distinct_rel, root->distinct_pathkeys);
 
 	/*
 	 * We don't compute anything at this level, so distinct_rel will be

@@ -47,6 +47,13 @@ static void populate_joinrel_composited_uniquekey(PlannerInfo *root,
 												  bool outeruk_still_valid,
 												  bool inneruk_still_valid);
 
+static void convert_subquery_uniquekey(PlannerInfo *root, RelOptInfo *rel, UniqueKey *sub_ukey);
+static EquivalenceClass * find_outer_ec_with_subquery_em(PlannerInfo *root, RelOptInfo *rel,
+														 EquivalenceClass *sub_ec,
+														 EquivalenceMember *sub_em);
+static List *convert_subquery_eclass_list(PlannerInfo *root, RelOptInfo *rel,
+										  List *sub_eclass_list);
+
 /* UniqueKey is subset of .. */
 static bool uniquekey_contains_in(PlannerInfo *root, UniqueKey *ukey,
 								  List *ecs, Relids relids);
@@ -183,6 +190,57 @@ populate_joinrel_uniquekeys(PlannerInfo *root, RelOptInfo *joinrel,
 
 
 	return;
+}
+
+/*
+ * populate_subquery_uniquekeys
+ *
+ * 'rel': outer query's RelOptInfo for the subquery relation.
+ * 'subquery_uniquekeys': the subquery's output pathkeys, in its terms.
+ * 'subquery_tlist': the subquery's output targetlist, in its terms.
+ *
+ *  subquery issues: a). tlist mapping.  b). interesting uniquekey. c). not nulls.
+ */
+void
+populate_subquery_uniquekeys(PlannerInfo *root, RelOptInfo *rel, RelOptInfo *sub_final_rel)
+{
+	List	*sub_uniquekeys = sub_final_rel->uniquekeys;
+	ListCell	*lc;
+	foreach(lc, sub_uniquekeys)
+	{
+		UniqueKey *sub_ukey = lfirst_node(UniqueKey, lc);
+		convert_subquery_uniquekey(root, rel, sub_ukey);
+	}
+}
+
+/*
+ * populate_uniquekeys_from_pathkeys
+ *
+ */
+void
+populate_uniquekeys_from_pathkeys(PlannerInfo *root, RelOptInfo *rel, List *pathkeys)
+{
+	ListCell *lc;
+	List	*unique_exprs = NIL;
+	if (pathkeys == NIL)
+		return;
+	foreach(lc, pathkeys)
+	{
+		PathKey *pathkey = lfirst(lc);
+		unique_exprs = lappend(unique_exprs, pathkey->pk_eclass);
+	}
+	rel->uniquekeys = list_make1(
+		make_uniquekey(bms_make_singleton(list_length(root->unique_exprs)),
+					   false,
+					   true));
+	root->unique_exprs = lappend(root->unique_exprs, unique_exprs);
+}
+
+
+void
+simple_copy_uniquekeys(RelOptInfo *tarrel, RelOptInfo *srcrel)
+{
+	tarrel->uniquekeys = srcrel->uniquekeys;
 }
 
 /*
@@ -708,6 +766,127 @@ is_uniquekey_useful_afterjoin(PlannerInfo *root, UniqueKey *ukey,
 		}
 	}
 	return true;
+}
+
+/*
+ * find_outer_ec_with_subquery_em
+ *
+ *	Given a em in subquery, return the related EquivalenceClass outside.
+ */
+static EquivalenceClass *
+find_outer_ec_with_subquery_em(PlannerInfo *root, RelOptInfo *rel,
+							   EquivalenceClass *sub_ec, EquivalenceMember *sub_em)
+{
+	TargetEntry *sub_tle;
+	Var *outer_var;
+	EquivalenceClass *outer_ec;
+
+	sub_tle = get_tle_from_expr(sub_em->em_expr, rel->subroot->processed_tlist);
+
+	if (!sub_tle)
+		return NULL;
+
+	outer_var = find_var_for_subquery_tle(rel, sub_tle);
+	if (!outer_var)
+		return NULL;
+
+	outer_ec = get_eclass_for_sort_expr(root,
+										(Expr *)outer_var,
+										NULL,
+										sub_ec->ec_opfamilies,
+										sub_em->em_datatype,
+										sub_ec->ec_collation,
+										0,
+										rel->relids,
+										false);
+	return outer_ec;
+}
+
+
+/*
+ * convert_subquery_eclass_list
+ *
+ *		Given a list of eclass in subquery, find the corresponding eclass in outer side.
+ * return NULL if no related eclass outside is found for any eclass in subquery.
+ */
+static List *
+convert_subquery_eclass_list(PlannerInfo *root, RelOptInfo *rel, List *sub_eclass_list)
+{
+	ListCell	*lc;
+	List	*ec_list = NIL;
+	foreach(lc, sub_eclass_list)
+	{
+		EquivalenceClass *sub_ec = lfirst_node(EquivalenceClass, lc);
+		EquivalenceClass *ec = NULL;
+		ListCell	*emc;
+		foreach(emc, sub_ec->ec_members)
+		{
+			EquivalenceMember *sub_em = lfirst(emc);
+			if ((ec = find_outer_ec_with_subquery_em(root, rel, sub_ec, sub_em)) != NULL)
+				break;
+		}
+		if (!ec)
+			return NIL;
+		ec_list = lappend(ec_list, ec);
+	}
+	return ec_list;
+}
+
+
+/*
+ * convert_subquery_uniquekey
+ *
+ */
+static void
+convert_subquery_uniquekey(PlannerInfo *root, RelOptInfo *rel, UniqueKey *sub_ukey)
+{
+	PlannerInfo *sub_root = rel->subroot;
+	List	*unique_exprs_list = NIL;
+	Bitmapset	*unique_exprs_indexes = NULL;
+	UniqueKey	*ukey = NULL;
+	int i = -1;
+	ListCell	*lc;
+	while((i = bms_next_member(sub_ukey->unique_expr_indexes, i)) >= 0)
+	{
+		Node *sub_eq_list = list_nth(sub_root->unique_exprs, i);
+		if (IsA(sub_eq_list, SingleRow))
+		{
+			/*
+			 * TODO: Unclear what to do, don't think it hard before the overall
+			 * design is accepted.
+			 */
+			return;
+		}
+		else
+		{
+			List *upper_eq_list;
+			Assert(IsA(sub_eq_list, List));
+			/*
+			 * Note: upper_eq_list is just part of uniquekey's exprs, to covert the whole
+			 * UniqueKey, we needs all the parts are shown in the upper rel.
+			 */
+			upper_eq_list = convert_subquery_eclass_list(root, rel, (List *)sub_eq_list);
+			if (upper_eq_list == NIL)
+			{
+				if (unique_exprs_list != NIL)
+					pfree(unique_exprs_list);
+				return;
+			}
+			unique_exprs_list = lappend(unique_exprs_list, upper_eq_list);
+		}
+	}
+
+	foreach(lc, unique_exprs_list)
+	{
+		unique_exprs_indexes = bms_add_member(unique_exprs_indexes, list_length(root->unique_exprs));
+		root->unique_exprs = lappend(root->unique_exprs, lfirst(lc));
+	}
+
+	ukey = make_uniquekey(unique_exprs_indexes,
+						  sub_ukey->multi_nulls,
+						  /* TODO: need check again, case SELECT * FROM (SELECT u FROM x OFFSET 0) v where x.u = 0; */
+						  true);
+	rel->uniquekeys = lappend(rel->uniquekeys, ukey);
 }
 
 /*

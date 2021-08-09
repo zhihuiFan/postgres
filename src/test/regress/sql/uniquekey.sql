@@ -106,3 +106,24 @@ SELECT uqk1.c, uqk2.c FROM uqk1, uqk2 WHERE uqk1.pk = 2 AND uqk2.pk = 1 order BY
 -----------------------------------------
 EXPLAIN (COSTS OFF) SELECT DISTINCT uqk1.pk FROM uqk1, uqk2 WHERE uqk1.c = uqk2.c;
 EXPLAIN (COSTS OFF) SELECT DISTINCT uqk1.d FROM uqk1, uqk2 WHERE uqk1.pk = 1 AND uqk1.c = uqk2.c;
+
+-----------------------------------------
+-- Test DISTINCT/GROUP BY CASE.
+-----------------------------------------
+
+
+--------------------------------------------------------------------------------------------
+-- Test subquery cases.
+-- Note that current the UniqueKey still not push down the interesting UniqueKey to subquery.
+-- like uniquekey, so the below test case need a "DISTINCT" in subquery to make sure the
+-- UniqueKey is maintain.
+--------------------------------------------------------------------------------------------
+-- Test a normal case - one side
+EXPLAIN SELECT DISTINCT v.* FROM
+(SELECT DISTINCT uqk1.c, uqk1.d FROM uqk1, uqk2
+WHERE uqk1.a = uqk2.pk AND uqk1.c is not null offset 0) v;
+
+-- Test a normal case - composited side.
+EXPLAIN SELECT DISTINCT v.* FROM
+(SELECT DISTINCT t1.c, t1.d, t2.pk FROM uqk1 t1 cross join uqk2 t2 where t1.c is not null OFFSET 0)
+v;

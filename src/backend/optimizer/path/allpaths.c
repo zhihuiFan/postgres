@@ -2288,6 +2288,8 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		return;
 	}
 
+	populate_subquery_uniquekeys(root, rel, sub_final_rel);
+
 	/*
 	 * Mark rel with estimated output rows, width, etc.  Note that we have to
 	 * do this before generating outer-query paths, else cost_subqueryscan is

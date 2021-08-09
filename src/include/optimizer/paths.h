@@ -265,11 +265,17 @@ extern void add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 
 extern void populate_baserel_uniquekeys(PlannerInfo *root,
 										RelOptInfo *baserel);
+extern Var *find_var_for_subquery_tle(RelOptInfo *rel, TargetEntry *tle);
 extern void populate_baserel_uniquekeys(PlannerInfo *root,
 										RelOptInfo *baserel);
 extern void populate_joinrel_uniquekeys(PlannerInfo *root, RelOptInfo *joinrel,
 										RelOptInfo *outerrel, RelOptInfo *innerrel,
 										List *restrictlist, JoinType jointype);
+extern void populate_uniquekeys_from_pathkeys(PlannerInfo *root, RelOptInfo *rel,
+											  List *pathkeys);
+extern void populate_subquery_uniquekeys(PlannerInfo *root, RelOptInfo *rel,
+										 RelOptInfo *sub_final_rel);
+extern void simple_copy_uniquekeys(RelOptInfo *srcrel, RelOptInfo *tarrel);
 extern bool relation_is_distinct_for(PlannerInfo *root, RelOptInfo *rel,
 									 List *distinct_pathkey);
 #endif							/* PATHS_H */
