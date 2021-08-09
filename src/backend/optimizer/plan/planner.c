@@ -4238,6 +4238,16 @@ create_distinct_paths(PlannerInfo *root,
 	Path	   *path;
 	ListCell   *lc;
 
+	/*
+	 * distinct_pathkeys may be NIL if it distinctClause is sortable.
+	 * see standard_qp_callback. But for the efficiency of relation_is_distinct_for
+	 * we can't use distinctClause (rather than EC) here. Fortunately not sortable
+	 * clause is rare in real case.
+	 */
+	if (root->distinct_pathkeys &&
+		relation_is_distinct_for(root, input_rel, root->distinct_pathkeys))
+		return input_rel;
+
 	/* For now, do all work in the (DISTINCT, NULL) upperrel */
 	distinct_rel = fetch_upper_rel(root, UPPERREL_DISTINCT, NULL);
 

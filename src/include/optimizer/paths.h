@@ -263,4 +263,8 @@ extern PathKey *make_canonical_pathkey(PlannerInfo *root,
 extern void add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 									List *live_childrels);
 
+extern void populate_baserel_uniquekeys(PlannerInfo *root,
+										RelOptInfo *baserel);
+extern bool relation_is_distinct_for(PlannerInfo *root, RelOptInfo *rel,
+									 List *distinct_pathkey);
 #endif							/* PATHS_H */
