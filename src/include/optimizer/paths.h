@@ -265,6 +265,11 @@ extern void add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 
 extern void populate_baserel_uniquekeys(PlannerInfo *root,
 										RelOptInfo *baserel);
+extern void populate_baserel_uniquekeys(PlannerInfo *root,
+										RelOptInfo *baserel);
+extern void populate_joinrel_uniquekeys(PlannerInfo *root, RelOptInfo *joinrel,
+										RelOptInfo *outerrel, RelOptInfo *innerrel,
+										List *restrictlist, JoinType jointype);
 extern bool relation_is_distinct_for(PlannerInfo *root, RelOptInfo *rel,
 									 List *distinct_pathkey);
 #endif							/* PATHS_H */

@@ -27,6 +27,26 @@ static bool add_uniquekey_for_uniqueindex(PlannerInfo *root,
 										  List *mergeable_const_peer,
 										  List *expr_opfamilies);
 
+static bool is_uniquekey_nulls_removed(PlannerInfo *root,
+									   UniqueKey *ukey,
+									   RelOptInfo *rel);
+static UniqueKey *adjust_uniquekey_multinull_for_joinrel(PlannerInfo *root,
+														 UniqueKey *joinrel_ukey,
+														 RelOptInfo *rel,
+														 bool below_outer_side);
+
+static bool populate_joinrel_uniquekey_for_rel(PlannerInfo *root, RelOptInfo *joinrel,
+											   RelOptInfo *rel, RelOptInfo *other_rel,
+											   List *restrictlist, JoinType jointype);
+static void populate_joinrel_composited_uniquekey(PlannerInfo *root,
+												  RelOptInfo *joinrel,
+												  RelOptInfo *outerrel,
+												  RelOptInfo *innerrel,
+												  List	*restrictlist,
+												  JoinType jointype,
+												  bool outeruk_still_valid,
+												  bool inneruk_still_valid);
+
 /* UniqueKey is subset of .. */
 static bool uniquekey_contains_in(PlannerInfo *root, UniqueKey *ukey,
 								  List *ecs, Relids relids);
@@ -35,6 +55,9 @@ static bool uniquekey_contains_in(PlannerInfo *root, UniqueKey *ukey,
 static bool unique_ecs_useful_for_distinct(PlannerInfo *root, List *ecs);
 static bool unique_ecs_useful_for_merging(PlannerInfo *root, RelOptInfo *rel,
 										  List *unique_ecs);
+static bool is_uniquekey_useful_afterjoin(PlannerInfo *root, UniqueKey *ukey,
+										  RelOptInfo *joinrel);
+
 /* Helper functions to create UniqueKey. */
 static UniqueKey *make_uniquekey(Bitmapset *unique_expr_indexes,
 								 bool multi_null,
@@ -88,6 +111,78 @@ populate_baserel_uniquekeys(PlannerInfo *root, RelOptInfo *rel)
 	}
 
 	print_uniquekey(root, rel);
+}
+
+/*
+ * populate_joinrel_uniquekeys
+ */
+void
+populate_joinrel_uniquekeys(PlannerInfo *root, RelOptInfo *joinrel,
+							RelOptInfo *outerrel, RelOptInfo *innerrel,
+							List *restrictlist, JoinType jointype)
+{
+	bool outeruk_still_valid = false, inneruk_still_valid = false;
+	if (jointype == JOIN_SEMI || jointype == JOIN_ANTI)
+	{
+		ListCell	*lc;
+		foreach(lc, outerrel->uniquekeys)
+		{
+			/*
+			 * SEMI/ANTI join can be used to remove NULL values as well.
+			 * So we need to adjust multi_nulls for join.
+			 */
+			joinrel->uniquekeys = lappend(joinrel->uniquekeys,
+										  adjust_uniquekey_multinull_for_joinrel(root,
+																				 lfirst(lc),
+																				 joinrel,
+																				 false));
+			return;
+		}
+	}
+
+	if (outerrel->uniquekeys == NIL || innerrel->uniquekeys == NIL)
+		return;
+
+	switch(jointype)
+	{
+		case JOIN_INNER:
+			outeruk_still_valid = populate_joinrel_uniquekey_for_rel(root, joinrel, outerrel,
+																	 innerrel, restrictlist, jointype);
+			inneruk_still_valid = populate_joinrel_uniquekey_for_rel(root, joinrel, innerrel,
+																	 outerrel, restrictlist, jointype);
+			break;
+
+		case JOIN_LEFT:
+			/*
+			 * For left join, we are sure the innerrel's multi_nulls would be true
+			 * and it can't become to multi_nulls=false any more. so just discard it
+			 * and only check the outerrel and composited ones.
+			 */
+			outeruk_still_valid = populate_joinrel_uniquekey_for_rel(root, joinrel, outerrel,
+																	 innerrel, restrictlist, jointype);
+			break;
+
+		case JOIN_FULL:
+			/*
+			 * Both sides would contains multi_nulls, don't maintain it
+			 * any more.
+			 */
+			break;
+
+		default:
+			elog(ERROR, "unexpected join_type %d", jointype);
+	}
+
+	populate_joinrel_composited_uniquekey(root, joinrel,
+										  outerrel,
+										  innerrel,
+										  restrictlist,
+										  jointype,
+										  outeruk_still_valid,
+										  inneruk_still_valid);
+
+
+	return;
 }
 
 /*
@@ -238,6 +333,251 @@ add_uniquekey_for_uniqueindex(PlannerInfo *root, IndexOptInfo *unique_index,
 											 used_for_distinct));
 	return false;
 }
+
+/*
+ * is_uniquekey_nulls_removed
+ *
+ *	note this function will not consider the OUTER JOIN impacts. Caller should
+ * take care of it.
+ *	-- Use my way temporary (RelOptInfo.notnull_attrs) until Tom's is ready.
+ */
+static bool
+is_uniquekey_nulls_removed(PlannerInfo *root,
+						   UniqueKey *ukey,
+						   RelOptInfo *joinrel)
+{
+	int i = -1;
+
+	while((i = bms_next_member(ukey->unique_expr_indexes, i)) >= 0)
+	{
+		Node *node = list_nth(root->unique_exprs, i);
+		List	*ecs;
+		ListCell	*lc;
+		if (IsA(node, SingleRow))
+			continue;
+		ecs = castNode(List, node);
+		foreach(lc, ecs)
+		{
+			EquivalenceClass *ec = lfirst_node(EquivalenceClass, lc);
+			ListCell *emc;
+			foreach(emc, ec->ec_members)
+			{
+				EquivalenceMember *em = lfirst_node(EquivalenceMember, emc);
+				int relid;
+				Var *var;
+				Bitmapset *notnull_attrs;
+				if (!bms_is_subset(em->em_relids, joinrel->relids))
+					continue;
+
+				if (!bms_get_singleton_member(em->em_relids, &relid))
+					continue;
+
+				if (!IsA(em->em_expr, Var))
+					continue;
+
+				var = castNode(Var, em->em_expr);
+
+				if (relid != var->varno)
+					continue;
+
+				notnull_attrs = joinrel->notnull_attrs[var->varno];
+
+				if (!bms_is_member(var->varattno - FirstLowInvalidHeapAttributeNumber,
+								   notnull_attrs))
+					return false;
+				else
+					break; /* Break to check next ECs */
+			}
+		}
+	}
+	return true;
+}
+
+/*
+ * adjust_uniquekey_multinull_for_joinrel
+ *
+ *	After the join, some NULL values can be removed due to join-clauses.
+ * but the outer join can generated null values again. Return the final
+ * state of the UniqueKey on joinrel.
+ */
+static UniqueKey *
+adjust_uniquekey_multinull_for_joinrel(PlannerInfo *root,
+									   UniqueKey *ukey,
+									   RelOptInfo *joinrel,
+									   bool below_outer_side)
+{
+	if (below_outer_side)
+	{
+		if (ukey->multi_nulls)
+			/* we need it to be multi_nulls, but it is already, just return it. */
+			return ukey;
+		else
+			/* we need it to be multi_nulls, but it is not, create a new one. */
+			return make_uniquekey(ukey->unique_expr_indexes,
+								  true,
+								  ukey->use_for_distinct);
+	}
+	else
+	{
+		/*
+		 * We need to check if the join clauses can remove the NULL values. However
+		 * if it doesn't contain NULL values at the first, we don't need to check it.
+		 */
+		if (!ukey->multi_nulls)
+			return ukey;
+		else
+		{
+			/*
+			 * Multi null values exists. It's time to check if the nulls values
+			 * are removed via outer join.
+			 */
+			if (!is_uniquekey_nulls_removed(root, ukey, joinrel))
+				/* null values can be removed, return the original one. */
+				return ukey;
+			else
+				return make_uniquekey(ukey->unique_expr_indexes,
+									  false, ukey->use_for_distinct);
+		}
+	}
+}
+
+/*
+ * populate_joinrel_uniquekey_for_rel
+ *
+ *    Check if rel.any_column = other_rel.unique_key_columns.
+ * The return value is if the rel->uniquekeys still valid.
+ */
+static bool
+populate_joinrel_uniquekey_for_rel(PlannerInfo *root, RelOptInfo *joinrel,
+								   RelOptInfo *rel, RelOptInfo *other_rel,
+								   List *restrictlist, JoinType type)
+{
+	bool	rel_keep_unique = false;
+	List *other_ecs = NIL;
+	Relids	other_relids = NULL;
+	ListCell	*lc;
+
+	/*
+	 * Gather all the other ECs regarding to rel, if all the unique ecs contains
+	 * in this list, then it hits our expectations.
+	 */
+	foreach(lc, restrictlist)
+	{
+		RestrictInfo *r = lfirst_node(RestrictInfo, lc);
+
+		if (r->mergeopfamilies == NIL)
+			continue;
+
+		if (bms_equal(r->left_relids, rel->relids) && r->right_ec != NULL)
+		{
+			other_ecs = lappend(other_ecs, r->right_ec);
+			other_relids = bms_add_members(other_relids, r->right_relids);
+		}
+		else if (bms_equal(r->right_relids, rel->relids) && r->left_ec != NULL)
+		{
+			other_ecs = lappend(other_ecs, r->right_ec);
+			other_relids = bms_add_members(other_relids, r->left_relids);
+		}
+	}
+
+	foreach(lc, other_rel->uniquekeys)
+	{
+		UniqueKey *ukey = lfirst_node(UniqueKey, lc);
+		if (uniquekey_contains_in(root, ukey, other_ecs, other_relids))
+		{
+			rel_keep_unique = true;
+			break;
+		}
+	}
+
+	if (!rel_keep_unique)
+		return false;
+
+	foreach(lc, rel->uniquekeys)
+	{
+
+		UniqueKey *ukey = lfirst_node(UniqueKey, lc);
+
+		if (is_uniquekey_useful_afterjoin(root, ukey, joinrel))
+		{
+			ukey = adjust_uniquekey_multinull_for_joinrel(root,
+														  ukey,
+														  joinrel,
+														  false /* outer_side, caller grantees this */);
+			joinrel->uniquekeys = lappend(joinrel->uniquekeys, ukey);
+		}
+	}
+
+	return true;
+}
+
+
+/*
+ * Populate_joinrel_composited_uniquekey
+ *
+ *	A composited unqiuekey is valid no matter with join type and restrictlist.
+ */
+static void
+populate_joinrel_composited_uniquekey(PlannerInfo *root,
+									  RelOptInfo *joinrel,
+									  RelOptInfo *outerrel,
+									  RelOptInfo *innerrel,
+									  List	*restrictlist,
+									  JoinType jointype,
+									  bool left_added,
+									  bool right_added)
+{
+	ListCell	*lc;
+	if (left_added || right_added)
+		/* No need to create the composited ones */
+		return;
+
+	foreach(lc, outerrel->uniquekeys)
+	{
+		UniqueKey	*outer_ukey = adjust_uniquekey_multinull_for_joinrel(root,
+																		 lfirst(lc),
+																		 joinrel,
+																		 jointype == JOIN_FULL);
+		ListCell	*lc2;
+
+		if (!is_uniquekey_useful_afterjoin(root, outer_ukey, joinrel))
+			continue;
+
+		foreach(lc2, innerrel->uniquekeys)
+		{
+			UniqueKey	*inner_ukey = adjust_uniquekey_multinull_for_joinrel(root,
+																			 lfirst(lc2),
+																			 joinrel,
+																			 (jointype == JOIN_FULL || jointype == JOIN_LEFT)
+				);
+
+			UniqueKey	*comp_ukey;
+
+			if (!is_uniquekey_useful_afterjoin(root, inner_ukey, joinrel))
+				continue;
+
+			comp_ukey = make_uniquekey(
+				/* unique_expr_indexes is easy, just union the both sides. */
+				bms_union(outer_ukey->unique_expr_indexes, inner_ukey->unique_expr_indexes),
+				/*
+				 * If both are !multi_nulls, then the composited one is !multi_null
+				 * no matter with jointype and join clauses. otherwise, it is multi
+				 * nulls no matter with other factors.
+				 *
+				 */
+				outer_ukey->multi_nulls || inner_ukey->multi_nulls,
+				/*
+				 * we need both sides are used in distinct to say the composited
+				 * one is used for distinct as well.
+				 */
+				outer_ukey->use_for_distinct && inner_ukey->use_for_distinct);
+
+			joinrel->uniquekeys = lappend(joinrel->uniquekeys, comp_ukey);
+		}
+	}
+}
+
+
 /*
  * uniquekey_contains_in
  *	Return if UniqueKey contains in the list of EquivalenceClass
@@ -333,6 +673,43 @@ unique_ecs_useful_for_merging(PlannerInfo *root, RelOptInfo *rel, List *unique_e
 
 	return true;
 }
+
+/*
+ * is_uniquekey_useful_afterjoin
+ *
+ *  is useful when it contains in distinct_pathkey or in mergable join clauses.
+ */
+static bool
+is_uniquekey_useful_afterjoin(PlannerInfo *root, UniqueKey *ukey,
+							 RelOptInfo *joinrel)
+{
+	int	i = -1;
+
+	if (ukey->use_for_distinct)
+		return true;
+
+	while((i = bms_next_member(ukey->unique_expr_indexes, i)) >= 0)
+	{
+		Node *exprs =  list_nth(root->unique_exprs, i);
+		if (IsA(exprs, List))
+		{
+			if (!unique_ecs_useful_for_merging(root, joinrel, (List *)exprs))
+				return false;
+		}
+		else
+		{
+			Assert(IsA(exprs, SingleRow));
+			/*
+			 * Ideally we should check if there are a expr on SingleRow
+			 * used in joinrel's joinclauses, but it can't be checked effectively
+			 * for now, so we just check the rest part. so just think
+			 * it is useful.
+			 */
+		}
+	}
+	return true;
+}
+
 /*
  *	make_uniquekey
  */

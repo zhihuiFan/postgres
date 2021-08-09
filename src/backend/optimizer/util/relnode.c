@@ -846,6 +846,8 @@ build_join_rel(PlannerInfo *root,
 	}
 
 	set_joinrel_notnull_attrs(joinrel, outer_rel, inner_rel, restrictlist, sjinfo);
+	populate_joinrel_uniquekeys(root, joinrel, outer_rel, inner_rel,
+								restrictlist, sjinfo->jointype);
 
 	return joinrel;
 }
