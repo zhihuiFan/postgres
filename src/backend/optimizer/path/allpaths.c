@@ -396,6 +396,9 @@ static void
 set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			 Index rti, RangeTblEntry *rte)
 {
+	/* Set the notnull before the UniqueKey population. */
+	set_baserel_notnull_attrs(rel);
+
 	if (rel->reloptkind == RELOPT_BASEREL &&
 		relation_excluded_by_constraints(root, rel, rte))
 	{
@@ -491,7 +494,7 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		}
 	}
 
-	set_baserel_notnull_attrs(rel);
+
 
 	/*
 	 * We insist that all non-dummy rels have a nonzero rowcount estimate.
@@ -615,6 +618,8 @@ set_plain_rel_size(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	 * first since partial unique indexes can affect size estimates.
 	 */
 	check_index_predicates(root, rel);
+
+	populate_baserel_uniquekeys(root, rel);
 
 	/* Mark rel with estimated output rows, width, etc */
 	set_baserel_size_estimates(root, rel);
@@ -2282,6 +2287,8 @@ set_subquery_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		set_dummy_rel_pathlist(rel);
 		return;
 	}
+
+	populate_subquery_uniquekeys(root, rel, sub_final_rel);
 
 	/*
 	 * Mark rel with estimated output rows, width, etc.  Note that we have to

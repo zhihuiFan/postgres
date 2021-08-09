@@ -260,6 +260,7 @@ build_simple_rel(PlannerInfo *root, int relid, RelOptInfo *parent)
 	rel->partexprs = NULL;
 	rel->nullable_partexprs = NULL;
 	rel->notnull_attrs = palloc0(sizeof(Bitmapset *) * 1);
+	rel->uniquekeys = NIL;
 
 	/*
 	 * Pass assorted information down the inheritance hierarchy.
@@ -750,6 +751,7 @@ build_join_rel(PlannerInfo *root,
 	joinrel->partexprs = NULL;
 	joinrel->nullable_partexprs = NULL;
 	joinrel->notnull_attrs = palloc0(sizeof(Bitmapset *) * (bms_max_member(joinrel->relids) + 1));
+	joinrel->uniquekeys = NIL;
 
 	/* Compute information relevant to the foreign relations. */
 	set_foreign_rel_properties(joinrel, outer_rel, inner_rel);
@@ -842,6 +844,8 @@ build_join_rel(PlannerInfo *root,
 	}
 
 	set_joinrel_notnull_attrs(joinrel, outer_rel, inner_rel, restrictlist, sjinfo);
+	populate_joinrel_uniquekeys(root, joinrel, outer_rel, inner_rel,
+								restrictlist, sjinfo->jointype);
 
 	return joinrel;
 }
