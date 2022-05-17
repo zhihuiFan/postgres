@@ -356,6 +356,39 @@ set_base_rel_pathlists(PlannerInfo *root)
 }
 
 /*
+ * set_baserel_notnull_attrs_for_quals
+ *
+ *	Set baserel's notnullattrs based on baserestrictinfo.
+ */
+static void
+set_baserel_notnull_attrs_for_quals(RelOptInfo *rel)
+{
+	List *clauses = extract_actual_clauses(rel->baserestrictinfo, false);
+	ListCell	*lc;
+	foreach(lc, find_nonnullable_vars((Node *)clauses))
+	{
+		Var *var = (Var *) lfirst(lc);
+		if (var->varno != rel->relid)
+		{
+			/* Lateral Join */
+			continue;
+		}
+		Assert(var->varno == rel->relid);
+		rel->notnull_attrs[0] = bms_add_member(rel->notnull_attrs[0],
+											   var->varattno - FirstLowInvalidHeapAttributeNumber);
+	}
+
+	/* Debug Only, Will be removed at last. */
+	if (!enable_geqo)
+	{
+		elog(INFO, "FirstLowInvalidHeapAttributeNumber = %d, BaseRel(%d), notnull_attrs = %s",
+			 FirstLowInvalidHeapAttributeNumber,
+			 rel->relid,
+			 bmsToString(rel->notnull_attrs[0]));
+	}
+}
+
+/*
  * set_rel_size
  *	  Set size estimates for a base relation
  */
@@ -457,6 +490,14 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 				break;
 		}
 	}
+
+	/*
+	 * Set the notnull attributes for all the baserel, including
+	 * RTE_RELATION(foreign table, partitioned table), RTE_SUBQUERY
+	 * etc. However this doesn't handle the notnull attributes from
+	 * catalog, which must be handled differently.
+	 */
+	set_baserel_notnull_attrs_for_quals(rel);
 
 	/*
 	 * We insist that all non-dummy rels have a nonzero rowcount estimate.

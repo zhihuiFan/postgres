@@ -692,6 +692,20 @@ typedef struct RelOptInfo
 	/* default result targetlist for Paths scanning this relation */
 	struct PathTarget *reltarget;	/* list of Vars/Exprs, cost, width */
 
+	/*
+	 * Record which Var is not nullable for current RelOptInfo
+	 * after all the quals on this RelOptInfo are executed.
+	 *
+	 * For a joinrel, the length of notnull_attrs array equals the
+	 * max value in relids, the array index is varno and the value
+	 * is a Bitmapset * which presents which varattnos are not
+	 * nullable for the varno.
+	 *
+	 * For baserel, to save space, notnull_attrs[0] is always used
+	 * for current RelOptInfo.
+	 */
+	Bitmapset	**notnull_attrs;
+
 	/* materialization information */
 	List	   *pathlist;		/* Path structures */
 	List	   *ppilist;		/* ParamPathInfos used in pathlist */
@@ -2596,7 +2610,7 @@ typedef enum
  *
  * flags indicating what kinds of grouping are possible.
  * partial_costs_set is true if the agg_partial_costs and agg_final_costs
- * 		have been initialized.
+ *		have been initialized.
  * agg_partial_costs gives partial aggregation costs.
  * agg_final_costs gives finalization costs.
  * target_parallel_safe is true if target is parallel safe.
@@ -2626,8 +2640,8 @@ typedef struct
  * limit_tuples is an estimated bound on the number of output tuples,
  *		or -1 if no LIMIT or couldn't estimate.
  * count_est and offset_est are the estimated values of the LIMIT and OFFSET
- * 		expressions computed by preprocess_limit() (see comments for
- * 		preprocess_limit() for more information).
+ *		expressions computed by preprocess_limit() (see comments for
+ *		preprocess_limit() for more information).
  */
 typedef struct
 {
