@@ -143,7 +143,8 @@ static void subquery_push_qual(Query *subquery,
 static void recurse_push_qual(Node *setOp, Query *topquery,
 							  RangeTblEntry *rte, Index rti, Node *qual);
 static void remove_unused_subquery_outputs(Query *subquery, RelOptInfo *rel);
-
+static void set_baserel_notnull_attrs_for_quals(RelOptInfo *rel);
+static void set_subquery_rel_notnull_attrs(RelOptInfo *rel);
 
 /*
  * make_one_rel
@@ -422,6 +423,9 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 				 * and build their paths immediately.
 				 */
 				set_subquery_pathlist(root, rel, rti, rte);
+
+				set_subquery_rel_notnull_attrs(rel);
+
 				break;
 			case RTE_FUNCTION:
 				set_function_size_estimates(root, rel);
@@ -457,6 +461,13 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 				break;
 		}
 	}
+
+	/*
+	 * Set the notnull attributes for all the kinds of baserel, including
+	 * RTE_RELATION(foreign table, partitioned table), RTE_SUBQUERY etc
+	 * Here doesn't handle the notnull attributes from catalog.
+	 */
+	set_baserel_notnull_attrs_for_quals(rel);
 
 	/*
 	 * We insist that all non-dummy rels have a nonzero rowcount estimate.
@@ -3270,6 +3281,15 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		initial_rels = lappend(initial_rels, thisrel);
 	}
 
+	/*
+	 * We put the initial_rels list into a PlannerInfo field because
+	 * has_legal_joinclause() needs to look at it (ugly :-().
+	 *
+	 * XXX: I kept this since I need to access the last join rel
+	 * during set_uppper_rel_notnull_attrs stage.
+	 */
+	root->initial_rels = initial_rels;
+
 	if (levels_needed == 1)
 	{
 		/*
@@ -3282,11 +3302,7 @@ make_rel_from_joinlist(PlannerInfo *root, List *joinlist)
 		/*
 		 * Consider the different orders in which we could join the rels,
 		 * using a plugin, GEQO, or the regular join search code.
-		 *
-		 * We put the initial_rels list into a PlannerInfo field because
-		 * has_legal_joinclause() needs to look at it (ugly :-().
 		 */
-		root->initial_rels = initial_rels;
 
 		if (join_search_hook)
 			return (*join_search_hook) (root, levels_needed, initial_rels);
@@ -4558,3 +4574,81 @@ debug_print_rel(PlannerInfo *root, RelOptInfo *rel)
 }
 
 #endif							/* OPTIMIZER_DEBUG */
+
+/*
+ * set_baserel_notnull_attrs_for_quals
+ *
+ *	Set baserel's notnullattrs based on baserestrictinfo.
+ */
+static void
+set_baserel_notnull_attrs_for_quals(RelOptInfo *rel)
+{
+	List *clauses = extract_actual_clauses(rel->baserestrictinfo, false);
+	ListCell	*lc;
+	foreach(lc, find_nonnullable_vars((Node *)clauses))
+	{
+		Var *var = (Var *) lfirst(lc);
+		if (var->varno != rel->relid)
+		{
+			/* Lateral Join */
+			continue;
+		}
+		Assert(var->varno == rel->relid);
+		rel->notnull_attrs[0] = bms_add_member(rel->notnull_attrs[0],
+											   var->varattno - FirstLowInvalidHeapAttributeNumber);
+	}
+
+	/* Debug Only, Will be removed at last. */
+	if (!enable_geqo)
+	{
+		elog(INFO, "FirstLowInvalidHeapAttributeNumber = %d, BaseRel(%d), notnull_attrs = %s",
+			 FirstLowInvalidHeapAttributeNumber,
+			 rel->relid,
+			 bmsToString(rel->notnull_attrs[0]));
+	}
+}
+
+/*
+ * set_subquery_rel_notnull_attrs
+ *
+ *	We only maintained Var level notnull_attrs, that means we can only
+ * know the VAR ONLY expr in subroot->processed_tlist is nullable or not.
+ * Build notnull_attrs with the position of these Vars in
+ * subroot->processed_tlist for subquery rel.
+ */
+static void
+set_subquery_rel_notnull_attrs(RelOptInfo *rel)
+{
+	PlannerInfo *subroot = rel->subroot;
+	RelOptInfo *subrel = fetch_upper_rel(subroot, UPPERREL_FINAL, NULL);
+	bool sub_single_rel = subroot->join_rel_list == NIL;
+	int attno = 0;
+	ListCell *lc;
+
+	if (subroot->initial_rels == NIL)
+		return;
+
+	foreach(lc, subroot->processed_tlist)
+	{
+		Var *inner_var;
+		int idx;
+		attno += 1;
+
+		inner_var = (Var *)lfirst_node(TargetEntry, lc)->expr;
+
+		if (!inner_var || !IsA(inner_var, Var))
+			continue;
+
+		/*
+		 * If the subquery is from a single baserel, the Bitmapset's
+		 * index is 0, or else, it is varno.
+		 */
+		idx = sub_single_rel ? 0 : inner_var->varno;
+
+		if (bms_is_member(inner_var->varattno - FirstLowInvalidHeapAttributeNumber,
+						  subrel->notnull_attrs[idx]))
+			/* Set the notnull_attrs for upper subquery_rel. */
+			rel->notnull_attrs[0] = bms_add_member(rel->notnull_attrs[0],
+												   inner_var->varattno - FirstLowInvalidHeapAttributeNumber);
+	}
+}

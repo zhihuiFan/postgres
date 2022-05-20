@@ -692,6 +692,20 @@ typedef struct RelOptInfo
 	/* default result targetlist for Paths scanning this relation */
 	struct PathTarget *reltarget;	/* list of Vars/Exprs, cost, width */
 
+	/*
+	 * Record which Var is not nullable for current RelOptInfo
+	 * after all the quals on this RelOptInfo are executed.
+	 *
+	 * For a joinrel, the length of notnull_attrs array equals the
+	 * max value in relids, the array index is varno and the value
+	 * is a Bitmapset * which presents which varattnos are not
+	 * nullable for the varno.
+	 *
+	 * For baserel, to save space, notnull_attrs[0] is always used
+	 * for current RelOptInfo.
+	 */
+	Bitmapset	**notnull_attrs;
+
 	/* materialization information */
 	List	   *pathlist;		/* Path structures */
 	List	   *ppilist;		/* ParamPathInfos used in pathlist */
