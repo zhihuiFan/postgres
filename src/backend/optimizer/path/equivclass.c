@@ -783,6 +783,26 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 
 /*
  * find_ec_member_matching_expr
+ *		Locate an EquivalenceClass matching the given expr, if any;
+ *		return NULL if no match.
+ */
+EquivalenceClass *
+find_ec_matching_expr(PlannerInfo *root,
+					  Expr *expr,
+					  RelOptInfo *baserel)
+{
+	int i = -1;
+	while ((i = bms_next_member(baserel->eclass_indexes, i)) >= 0)
+	{
+		EquivalenceClass *ec = list_nth(root->eq_classes, i);
+		if (find_ec_member_matching_expr(ec, expr, baserel->relids))
+			return ec;
+	}
+	return NULL;
+}
+
+/*
+ * find_ec_member_matching_expr
  *		Locate an EquivalenceClass member matching the given expr, if any;
  *		return NULL if no match.
  *
@@ -940,6 +960,56 @@ is_exprlist_member(Expr *node, List *exprs)
 			return true;
 	}
 	return false;
+}
+
+Expr *
+find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
+{
+	ListCell   *lc_em;
+
+	foreach(lc_em, ec->ec_members)
+	{
+		EquivalenceMember *em = lfirst(lc_em);
+
+		if (bms_is_subset(em->em_relids, rel->relids) &&
+			!bms_is_empty(em->em_relids))
+		{
+			/*
+			 * If there is more than one equivalence member whose Vars are
+			 * taken entirely from this relation, we'll be content to choose
+			 * any one of those.
+			 */
+			return em->em_expr;
+		}
+	}
+
+	/* We didn't find any suitable equivalence class expression */
+	return NULL;
+}
+
+
+/*
+ * build_equivalanceclass_list_for_exprs
+ *
+ * 	Given a list of expr, find the related ECs for everyone of them.
+ * if any exprs has no EC related, return NIL.
+ */
+List *
+build_equivalanceclass_list_for_exprs(PlannerInfo *root,
+									  List *exprs,
+									  RelOptInfo *rel)
+{
+	ListCell	*lc;
+	List	*ecs = NIL;
+
+	foreach(lc, exprs)
+	{
+		EquivalenceClass *ec = find_ec_matching_expr(root, lfirst(lc), rel);
+		if (!ec)
+			return NIL;
+		ecs = lappend(ecs, ec);
+	}
+	return ecs;
 }
 
 /*
