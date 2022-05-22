@@ -943,6 +943,49 @@ is_exprlist_member(Expr *node, List *exprs)
 }
 
 /*
+ * eclass_useful_for_joining
+ *
+ *	Check if the eclass is still useful above rel.
+ */
+bool
+eclass_useful_for_joining(PlannerInfo *root, RelOptInfo *rel,
+						  EquivalenceClass *ec)
+{
+	/*
+	 * First look into the EquivalenceClass to see if there are any members
+	 * not yet joined to the rel.
+	 */
+	if (rel->has_eclass_joins &&
+		eclass_useful_for_merging(root, ec, rel))
+		return true;
+	else
+	{
+		/*
+		 * Otherwise search the rel's joininfo list, which contains
+		 * non-EquivalenceClass-derivable join clauses that might
+		 * nonetheless be mergejoinable.
+		 */
+		ListCell	*j;
+		foreach(j, rel->joininfo)
+		{
+			RestrictInfo *restrictinfo = (RestrictInfo *) lfirst(j);
+
+			if (restrictinfo->mergeopfamilies == NIL)
+				continue;
+			update_mergeclause_eclasses(root, restrictinfo);
+
+			if (ec == restrictinfo->left_ec ||
+			    ec == restrictinfo->right_ec)
+			{
+				return true;
+			}
+		}
+	}
+
+	return false;
+}
+
+/*
  * relation_can_be_sorted_early
  *		Can this relation be sorted on this EC before the final output step?
  *
