@@ -294,7 +294,8 @@ typedef enum NodeTag
 	T_GroupingSetData,
 	T_StatisticExtInfo,
 	T_MergeAction,
-
+	T_UniqueKey,
+	T_SingleRow,
 	/*
 	 * TAGS FOR MEMORY NODES (memnodes.h)
 	 */

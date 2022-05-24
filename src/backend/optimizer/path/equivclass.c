@@ -781,24 +781,19 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 	return newec;
 }
 
-/*
- * find_ec_member_matching_expr
- *		Locate an EquivalenceClass matching the given expr, if any;
- *		return NULL if no match.
- */
-EquivalenceClass *
-find_ec_matching_expr(PlannerInfo *root,
-					  Expr *expr,
-					  RelOptInfo *baserel)
+int
+find_ec_position_matching_expr(PlannerInfo *root,
+							   Expr *expr,
+							   RelOptInfo *baserel)
 {
 	int i = -1;
 	while ((i = bms_next_member(baserel->eclass_indexes, i)) >= 0)
 	{
 		EquivalenceClass *ec = list_nth(root->eq_classes, i);
 		if (find_ec_member_matching_expr(ec, expr, baserel->relids))
-			return ec;
+			return i;
 	}
-	return NULL;
+	return -1;
 }
 
 /*
@@ -991,25 +986,25 @@ find_em_expr_for_rel(EquivalenceClass *ec, RelOptInfo *rel)
 /*
  * build_equivalanceclass_list_for_exprs
  *
- * 	Given a list of expr, find the related ECs for everyone of them.
- * if any exprs has no EC related, return NIL.
+ * 	Given a list of exprs, find the related ECs position for each of them.
+ * if any exprs has no EC related, return NULL;
  */
-List *
+Bitmapset *
 build_equivalanceclass_list_for_exprs(PlannerInfo *root,
 									  List *exprs,
 									  RelOptInfo *rel)
 {
 	ListCell	*lc;
-	List	*ecs = NIL;
+	Bitmapset	*res = NULL;
 
 	foreach(lc, exprs)
 	{
-		EquivalenceClass *ec = find_ec_matching_expr(root, lfirst(lc), rel);
-		if (!ec)
-			return NIL;
-		ecs = lappend(ecs, ec);
+		int pos = find_ec_position_matching_expr(root, lfirst(lc), rel);
+		if (pos < 0)
+			return NULL;
+		res = bms_add_member(res, pos);
 	}
-	return ecs;
+	return res;
 }
 
 /*
