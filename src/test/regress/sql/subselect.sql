@@ -968,3 +968,64 @@ select * from (with x as (select 2 as y) select * from x) ss;
 explain (verbose, costs off)
 with x as (select * from subselect_tbl)
 select * from x for update;
+
+
+-- Test transform the level-1 in-sublink to existing sublink.
+create temp table temp_t1 (a int, b int, c int) on commit delete rows;
+create temp table temp_t2 (a int, b int, c int) on commit delete rows;
+create temp table temp_t3 (a int, b int, c int) on commit delete rows;
+create temp table temp_t4 (a int, b int, c int, d int) on commit delete rows;
+
+begin;
+insert into temp_t1 values (1, 1, 1), (2, 2, null), (3, null, null);
+insert into temp_t2 values (1, 1, 1), (2, 2, null), (3, null, null);
+insert into temp_t3 values (1, 1, 1), (2, 2, null), (3, null, null);
+insert into temp_t4 values (1, 1, 1, 1), (2, 2, null, null), (3, null, null, null);
+
+analyze temp_t1;
+analyze temp_t2;
+analyze temp_t3;
+
+-- one-elem in subquery
+select * from temp_t1 t1 where a  in (select a from temp_t2 t2 where t2.b > t1.b);
+explain (costs off)
+select * from temp_t1 t1 where a  in (select a from temp_t2 t2 where t2.b > t1.b);
+
+-- two-elem in subquery
+select * from temp_t1 t1 where (a, b)  in (select a, b from temp_t2 t2 where t2.c = t1.c);
+explain (costs off)
+select * from temp_t1 t1 where (a, b)  in (select a, b from temp_t2 t2 where t2.c = t1.c);
+
+-- sublink in sublink
+select * from temp_t1 t1
+where (a, b) in (select a, b from temp_t2 t2
+                 where t2.c < t1.c
+		 and t2.c in (select c from temp_t3 t3 where t3.b = t2.b));
+explain (costs off)
+select * from temp_t1 t1
+where (a, b) in (select a, b from temp_t2 t2
+                 where t2.c < t1.c
+		 and t2.c in (select c from temp_t3 t3 where t3.b = t2.b));
+
+
+-- sublink in not-in sublinks. not in will not be transformed but the in-clause
+-- in the subselect should be transformed.
+explain (costs off)
+select * from temp_t1 t1
+where (a, b) not in (select a, b from temp_t2 t2
+      	     	     where t2.c < t1.c
+                     and t1.c in (SELECT c from temp_t3 t3 where t3.b = t2.b ))
+and c > 3;
+
+
+-- The clause in the ON-clause should be transformed.
+explain (costs off)
+select * from temp_t1 t1, (temp_t2 t2 join temp_t4 t4
+                           on t2.a in (select a from temp_t3 t3 where t4.b = t3.b)) v
+where t1.a = v.d;
+
+commit;
+
+
+
+

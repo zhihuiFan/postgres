@@ -130,6 +130,7 @@ static void substitute_phv_relids(Node *node,
 static void fix_append_rel_relids(List *append_rel_list, int varno,
 								  Relids subrelids);
 static Node *find_jointree_node_for_rel(Node *jtnode, int relid);
+static void transform_IN_sublink_to_EXIST_recurse(PlannerInfo *root, Node *jtnode);
 
 
 /*
@@ -256,6 +257,291 @@ replace_empty_jointree(Query *parse)
 	parse->jointree->fromlist = list_make1(rtr);
 }
 
+
+/*
+ * sublink_should_be_transformed
+ *
+ *	Check if the sublink is a simple IN sublink.
+ */
+static bool
+sublink_should_be_transformed(PlannerInfo *root, SubLink *sublink)
+{
+	const char	* operName;
+	Query		*subselect  = (Query *) sublink->subselect;
+	Node		*whereClause;
+
+	if (sublink->subLinkType != ANY_SUBLINK || list_length(sublink->operName) != 1)
+		return false;
+
+	operName = linitial_node(String, sublink->operName)->sval;
+
+	if (strcmp(operName, "=") != 0)
+		return false;
+
+	if (!contain_vars_of_level((Node *) subselect, 1))
+		/* The existing framework can handle it well, so no action needed. */
+		return false;
+
+	if (list_length(subselect->rtable) == 0)
+		/* Get rid of this special cases for safety. */
+		return false;
+
+	/*
+	 * The below checks are similar with the checks in convert_EXISTS_sublink_to_join
+	 * so that that the new EXISTS-Sublink can be pull-up later.
+	 */
+	if (subselect->cteList)
+		return false;
+
+	/* See simplify_EXISTS_query */
+
+	if (subselect->commandType != CMD_SELECT ||
+		subselect->setOperations ||
+		subselect->hasAggs ||
+		subselect->groupingSets ||
+		subselect->hasWindowFuncs ||
+		subselect->hasTargetSRFs ||
+		subselect->hasModifyingCTE ||
+		subselect->havingQual ||
+		subselect->limitOffset ||
+		subselect->rowMarks)
+		return false;
+
+	if (subselect->limitCount)
+	{
+		/*
+		 * The LIMIT clause has not yet been through eval_const_expressions,
+		 * so we have to apply that here.  It might seem like this is a waste
+		 * of cycles, since the only case plausibly worth worrying about is
+		 * "LIMIT 1" ... but what we'll actually see is "LIMIT int8(1::int4)",
+		 * so we have to fold constants or we're not going to recognize it.
+		 */
+		Node	   *node = eval_const_expressions(root, subselect->limitCount);
+		Const	   *limit;
+
+		/* Might as well update the query if we simplified the clause. */
+
+		/* XXX: we do have the modification, but it is not harmful. */
+		subselect->limitCount = node;
+
+		if (!IsA(node, Const))
+			return false;
+
+		limit = (Const *) node;
+		Assert(limit->consttype == INT8OID);
+		if (!limit->constisnull && DatumGetInt64(limit->constvalue) <= 0)
+			return false;
+	}
+
+	whereClause = subselect->jointree->quals;
+	subselect->jointree->quals = NULL;
+
+	if (contain_vars_of_level((Node *) subselect, 1) ||
+		!contain_vars_of_level(whereClause, 1) ||
+		contain_volatile_functions(whereClause))
+	{
+		subselect->jointree->quals = whereClause;
+		return false;
+	}
+
+	/* Restore the whereClause. */
+	subselect->jointree->quals = whereClause;
+
+	/*
+	 * No need to check the avaiable_rels like convert_EXISTS_sublink_to_join
+	 * since here we just transform the sublinks type, no SEMIJOIN related.
+	 */
+	return true;
+}
+
+/*
+ * replace_param_sublink_node
+ *
+ *	Replace the PARAM_SUBLINK in src with target.
+ */
+static Node *
+replace_param_sublink_node(Node *src, Node *target)
+{
+
+	if (IsA(src, Param))
+		return target;
+
+	switch (nodeTag(src))
+	{
+		case T_RelabelType:
+			{
+				RelabelType *rtype = castNode(RelabelType, src);
+				rtype->arg = (Expr *)target;
+				break;
+			}
+		case T_FuncExpr:
+			{
+				FuncExpr *fexpr = castNode(FuncExpr, src);
+				Assert(list_length(fexpr->args));
+				Assert(linitial_node(Param, fexpr->args)->paramkind == PARAM_SUBLINK);
+				linitial(fexpr->args) = target;
+				break;
+			}
+		default:
+			{
+				Assert(false);
+				elog(ERROR, "Unexpected node type: %d", nodeTag(src));
+			}
+	}
+
+	/* src is in-placed updated. */
+	return src;
+
+}
+
+/*
+ * transform_IN_sublink_to_EXIST_qual_recurse
+ *
+ *   Transform IN-SUBLINK with level-1 var to EXISTS-SUBLINK recursly.
+ */
+static Node *
+transform_IN_sublink_to_EXIST_qual_recurse(PlannerInfo *root, Node *node)
+{
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, SubLink))
+	{
+		SubLink *sublink = (SubLink *) node;
+		Query *subselect = (Query *)sublink->subselect;
+		FromExpr *sub_fromexpr;
+
+		Assert(IsA(subselect, Query));
+
+		if (!sublink_should_be_transformed(root, sublink))
+		{
+			/* We still need to transform the subselect->jointree. */
+			transform_IN_sublink_to_EXIST_recurse(root, (Node *) subselect->jointree);
+			return node;
+		}
+
+		/*
+		 * Make up the push-downed node from sublink->testexpr, the testexpr
+		 * will be set to NULL later, so in-place update would be OK.
+		 */
+		IncrementVarSublevelsUp(sublink->testexpr, 1, 0);
+
+		if (is_andclause(sublink->testexpr))
+		{
+			BoolExpr *and_expr = castNode(BoolExpr, sublink->testexpr);
+			ListCell *l1, *l2;
+			forboth(l1, and_expr->args, l2, subselect->targetList)
+			{
+				OpExpr *opexpr = lfirst_node(OpExpr, l1);
+				TargetEntry *tle = lfirst_node(TargetEntry, l2);
+				lsecond(opexpr->args) = replace_param_sublink_node(lsecond(opexpr->args),
+																   (Node *) tle->expr);
+			}
+		}
+		else
+		{
+			OpExpr *opexpr = (OpExpr *) sublink->testexpr;
+			TargetEntry *tle = linitial_node(TargetEntry, subselect->targetList);
+			Assert(IsA(sublink->testexpr, OpExpr));
+			lsecond(opexpr->args) = replace_param_sublink_node(lsecond(opexpr->args),
+															   (Node *) tle->expr);
+		}
+
+		/* Push down the transformed testexpr into subselect */
+		sub_fromexpr = subselect->jointree;
+		if (sub_fromexpr->quals == NULL)
+			sub_fromexpr->quals = sublink->testexpr;
+		else
+			sub_fromexpr->quals = make_and_qual(sub_fromexpr->quals,
+												(Node *) sublink->testexpr);
+
+		/*
+		 * Turn the IN-Sublink to exist-SUBLINK for the parent query.
+		 * sublink->subselect has already been modified.
+		 */
+		sublink->subLinkType = EXISTS_SUBLINK;
+		sublink->operName = NIL;
+		sublink->testexpr = NULL;
+
+		/* Now transform the FromExpr in the subselect->jointree. */
+		transform_IN_sublink_to_EXIST_recurse(root, (Node *)sub_fromexpr);
+		return node;
+	}
+
+	if (is_andclause(node))
+	{
+		List	*newclauses = NIL;
+		ListCell	*l;
+		foreach(l, ((BoolExpr *) node)->args)
+		{
+			Node	*oldclause = (Node *) lfirst(l);
+			Node	*newclause;
+
+			newclause = transform_IN_sublink_to_EXIST_qual_recurse(root, oldclause);
+			newclauses = lappend(newclauses, newclause);
+		}
+
+		if (newclauses == NIL)
+			return NULL;
+		else if (list_length(newclauses) == 1)
+			return (Node *) linitial(newclauses);
+		else
+			return (Node *) make_andclause(newclauses);
+	}
+	else if (is_notclause(node))
+	{
+		/*
+		 * NOT-IN can't be converted into NOT-exists.
+		 */
+		return node;
+	}
+
+	return node;
+}
+
+/*
+ * transform_IN_sublink_to_EXIST_recurse
+ *
+ *	Transform IN sublink to EXIST sublink if it benefits for sublink
+ * pull-ups.
+ */
+extern bool enable_geqo;
+static void
+transform_IN_sublink_to_EXIST_recurse(PlannerInfo *root, Node *jtnode)
+{
+	if (!enable_geqo)
+		return;
+
+	if (jtnode == NULL || IsA(jtnode, RangeTblRef))
+	{
+		return;
+	}
+	else if (IsA(jtnode, FromExpr))
+	{
+		FromExpr *f = (FromExpr *) jtnode;
+		ListCell *l;
+		foreach(l, f->fromlist)
+		{
+			transform_IN_sublink_to_EXIST_recurse(root, lfirst(l));
+		}
+		f->quals = transform_IN_sublink_to_EXIST_qual_recurse(root, f->quals);
+	}
+	else if (IsA(jtnode, JoinExpr))
+	{
+		JoinExpr *j = (JoinExpr *) jtnode;
+		transform_IN_sublink_to_EXIST_recurse(root, j->larg);
+		transform_IN_sublink_to_EXIST_recurse(root, j->rarg);
+
+		j->quals = transform_IN_sublink_to_EXIST_qual_recurse(root, j->quals);
+	}
+	else
+	{
+		elog(ERROR, "unrecognized node type: %d",
+			 (int) nodeTag(jtnode));
+	}
+}
+
+
 /*
  * pull_up_sublinks
  *		Attempt to pull up ANY and EXISTS SubLinks to be treated as
@@ -289,6 +575,9 @@ pull_up_sublinks(PlannerInfo *root)
 {
 	Node	   *jtnode;
 	Relids		relids;
+
+	transform_IN_sublink_to_EXIST_recurse(root,
+										  (Node *)root->parse->jointree);
 
 	/* Begin recursion through the jointree */
 	jtnode = pull_up_sublinks_jointree_recurse(root,

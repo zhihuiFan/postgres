@@ -5983,8 +5983,8 @@ lateral (select * from int8_tbl t1,
                                      where q2 = (select greatest(t1.q1,t2.q2))
                                        and (select v.id=0)) offset 0) ss2) ss
          where t1.q1 = ss.q2) ss0;
-                           QUERY PLAN                            
------------------------------------------------------------------
+                             QUERY PLAN                              
+---------------------------------------------------------------------
  Nested Loop
    Output: "*VALUES*".column1, t1.q1, t1.q2, ss2.q1, ss2.q2
    ->  Seq Scan on public.int8_tbl t1
@@ -5996,23 +5996,24 @@ lateral (select * from int8_tbl t1,
          ->  Subquery Scan on ss2
                Output: ss2.q1, ss2.q2
                Filter: (t1.q1 = ss2.q2)
-               ->  Seq Scan on public.int8_tbl t2
+               ->  Result
                      Output: t2.q1, t2.q2
-                     Filter: (SubPlan 3)
-                     SubPlan 3
+                     One-Time Filter: $3
+                     InitPlan 2 (returns $3)
                        ->  Result
-                             Output: t3.q2
-                             One-Time Filter: $4
-                             InitPlan 1 (returns $2)
-                               ->  Result
-                                     Output: GREATEST($0, t2.q2)
-                             InitPlan 2 (returns $4)
-                               ->  Result
-                                     Output: ($3 = 0)
-                             ->  Seq Scan on public.int8_tbl t3
-                                   Output: t3.q1, t3.q2
-                                   Filter: (t3.q2 = $2)
-(27 rows)
+                             Output: ($2 = 0)
+                     ->  Nested Loop Semi Join
+                           Output: t2.q1, t2.q2
+                           Join Filter: (t2.q1 = t3.q2)
+                           ->  Seq Scan on public.int8_tbl t2
+                                 Output: t2.q1, t2.q2
+                                 Filter: ((SubPlan 1) = t2.q1)
+                                 SubPlan 1
+                                   ->  Result
+                                         Output: GREATEST($0, t2.q2)
+                           ->  Seq Scan on public.int8_tbl t3
+                                 Output: t3.q1, t3.q2
+(28 rows)
 
 select * from (values (0), (1)) v(id),
 lateral (select * from int8_tbl t1,

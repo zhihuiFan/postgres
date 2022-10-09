@@ -1926,3 +1926,124 @@ select * from x for update;
    Output: subselect_tbl.f1, subselect_tbl.f2, subselect_tbl.f3
 (2 rows)
 
+-- Test transform the level-1 in-sublink to existing sublink.
+create temp table temp_t1 (a int, b int, c int) on commit delete rows;
+create temp table temp_t2 (a int, b int, c int) on commit delete rows;
+create temp table temp_t3 (a int, b int, c int) on commit delete rows;
+create temp table temp_t4 (a int, b int, c int, d int) on commit delete rows;
+begin;
+insert into temp_t1 values (1, 1, 1), (2, 2, null), (3, null, null);
+insert into temp_t2 values (1, 1, 1), (2, 2, null), (3, null, null);
+insert into temp_t3 values (1, 1, 1), (2, 2, null), (3, null, null);
+insert into temp_t4 values (1, 1, 1, 1), (2, 2, null, null), (3, null, null, null);
+analyze temp_t1;
+analyze temp_t2;
+analyze temp_t3;
+-- one-elem in subquery
+select * from temp_t1 t1 where a  in (select a from temp_t2 t2 where t2.b > t1.b);
+ a | b | c 
+---+---+---
+(0 rows)
+
+explain (costs off)
+select * from temp_t1 t1 where a  in (select a from temp_t2 t2 where t2.b > t1.b);
+             QUERY PLAN             
+------------------------------------
+ Hash Semi Join
+   Hash Cond: (t1.a = t2.a)
+   Join Filter: (t2.b > t1.b)
+   ->  Seq Scan on temp_t1 t1
+   ->  Hash
+         ->  Seq Scan on temp_t2 t2
+(6 rows)
+
+-- two-elem in subquery
+select * from temp_t1 t1 where (a, b)  in (select a, b from temp_t2 t2 where t2.c = t1.c);
+ a | b | c 
+---+---+---
+ 1 | 1 | 1
+(1 row)
+
+explain (costs off)
+select * from temp_t1 t1 where (a, b)  in (select a, b from temp_t2 t2 where t2.c = t1.c);
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Hash Semi Join
+   Hash Cond: ((t1.c = t2.c) AND (t1.a = t2.a) AND (t1.b = t2.b))
+   ->  Seq Scan on temp_t1 t1
+   ->  Hash
+         ->  Seq Scan on temp_t2 t2
+(5 rows)
+
+-- sublink in sublink
+select * from temp_t1 t1
+where (a, b) in (select a, b from temp_t2 t2
+                 where t2.c < t1.c
+		 and t2.c in (select c from temp_t3 t3 where t3.b = t2.b));
+ a | b | c 
+---+---+---
+(0 rows)
+
+explain (costs off)
+select * from temp_t1 t1
+where (a, b) in (select a, b from temp_t2 t2
+                 where t2.c < t1.c
+		 and t2.c in (select c from temp_t3 t3 where t3.b = t2.b));
+                             QUERY PLAN                             
+--------------------------------------------------------------------
+ Nested Loop Semi Join
+   Join Filter: ((t2.c < t1.c) AND (t1.b = t3.b) AND (t1.a = t2.a))
+   ->  Seq Scan on temp_t1 t1
+   ->  Materialize
+         ->  Hash Semi Join
+               Hash Cond: ((t2.b = t3.b) AND (t2.c = t3.c))
+               ->  Seq Scan on temp_t2 t2
+               ->  Hash
+                     ->  Seq Scan on temp_t3 t3
+(9 rows)
+
+-- sublink in not-in sublinks. not in will not be transformed but the in-clause
+-- in the subselect should be transformed.
+explain (costs off)
+select * from temp_t1 t1
+where (a, b) not in (select a, b from temp_t2 t2
+      	     	     where t2.c < t1.c
+                     and t1.c in (SELECT c from temp_t3 t3 where t3.b = t2.b ))
+and c > 3;
+                QUERY PLAN                 
+-------------------------------------------
+ Seq Scan on temp_t1 t1
+   Filter: ((c > 3) AND (NOT (SubPlan 1)))
+   SubPlan 1
+     ->  Nested Loop Semi Join
+           Join Filter: (t2.b = t3.b)
+           ->  Seq Scan on temp_t2 t2
+                 Filter: (c < t1.c)
+           ->  Seq Scan on temp_t3 t3
+                 Filter: (t1.c = c)
+(9 rows)
+
+-- The clause in the ON-clause should be transformed.
+explain (costs off)
+select * from temp_t1 t1, (temp_t2 t2 join temp_t4 t4
+                           on t2.a in (select a from temp_t3 t3 where t4.b = t3.b)) v
+where t1.a = v.d;
+                      QUERY PLAN                      
+------------------------------------------------------
+ Nested Loop
+   Join Filter: (t3.a = t2.a)
+   ->  Hash Join
+         Hash Cond: (t4.d = t1.a)
+         ->  Hash Join
+               Hash Cond: (t4.b = t3.b)
+               ->  Seq Scan on temp_t4 t4
+               ->  Hash
+                     ->  HashAggregate
+                           Group Key: t3.b, t3.a
+                           ->  Seq Scan on temp_t3 t3
+         ->  Hash
+               ->  Seq Scan on temp_t1 t1
+   ->  Seq Scan on temp_t2 t2
+(14 rows)
+
+commit;
