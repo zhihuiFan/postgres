@@ -887,6 +887,32 @@ json_object_field_text(PG_FUNCTION_ARGS)
 }
 
 Datum
+jsonb_object_field_numeric(PG_FUNCTION_ARGS)
+{
+	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	text	   *key = PG_GETARG_TEXT_PP(1);
+	JsonbValue *v;
+	JsonbValue	vbuf;
+
+	if (!JB_ROOT_IS_OBJECT(jb))
+		PG_RETURN_NULL();
+
+	v = getKeyJsonValueFromContainer(&jb->root,
+									 VARDATA_ANY(key),
+									 VARSIZE_ANY_EXHDR(key),
+									 &vbuf);
+
+	if (v == NULL || v->type == jbvNull)
+		PG_RETURN_NULL();
+
+	if (v->type != jbvNumeric)
+		elog(ERROR, "field '%s' has non-numeric value.", text_to_cstring(key));
+
+	return PointerGetDatum(v->val.numeric);
+};
+
+
+Datum
 jsonb_object_field_text(PG_FUNCTION_ARGS)
 {
 	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
