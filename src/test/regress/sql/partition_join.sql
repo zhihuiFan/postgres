@@ -1176,3 +1176,9 @@ DROP TABLE fract_t;
 
 RESET max_parallel_workers_per_gather;
 RESET enable_partitionwise_join;
+
+EXPLAIN (COSTS OFF)
+SELECT t1.a, t1.c, t2.b, t2.c FROM prt1 t1 join prt2 t2 on t1.a = t2.b AND t1.b = 0  limit 3;
+
+EXPLAIN (COSTS OFF)
+SELECT t1.a, t1.c, t2.b, t2.c FROM prt1 t1 join prt2 t2 on t1.a = t2.b AND t1.b = 0 join prt1_p2 p2 on t2.c = p2.c limit 3;

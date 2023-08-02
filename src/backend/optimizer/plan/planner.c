@@ -241,7 +241,8 @@ static void apply_scanjoin_target_to_paths(PlannerInfo *root,
 										   List *scanjoin_targets,
 										   List *scanjoin_targets_contain_srfs,
 										   bool scanjoin_target_parallel_safe,
-										   bool tlist_same_exprs);
+										   bool tlist_same_exprs,
+										   Relids top_relids);
 static void create_partitionwise_grouping_paths(PlannerInfo *root,
 												RelOptInfo *input_rel,
 												RelOptInfo *grouped_rel,
@@ -415,7 +416,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 
 	/* Select best Path and turn it into a Plan */
 	final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
-	best_path = get_cheapest_fractional_path(final_rel, tuple_fraction);
+	best_path = get_cheapest_fractional_path(final_rel, tuple_fraction, true);
 
 	top_plan = create_plan(root, best_path);
 
@@ -1633,7 +1634,8 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 		apply_scanjoin_target_to_paths(root, current_rel, scanjoin_targets,
 									   scanjoin_targets_contain_srfs,
 									   scanjoin_target_parallel_safe,
-									   scanjoin_target_same_exprs);
+									   scanjoin_target_same_exprs,
+									   current_rel->relids);
 
 		/*
 		 * Save the various upper-rel PathTargets we just computed into
@@ -6326,28 +6328,28 @@ make_sort_input_target(PlannerInfo *root,
  * We assume set_cheapest() has been run on the given rel.
  */
 Path *
-get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction)
+get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction,
+							 bool allow_parameterized)
 {
 	Path	   *best_path = rel->cheapest_total_path;
 	ListCell   *l;
+	double		total_rows = rel->rows;
 
 	/* If all tuples will be retrieved, just return the cheapest-total path */
 	if (tuple_fraction <= 0.0)
 		return best_path;
 
 	/* Convert absolute # of tuples to a fraction; no need to clamp to 0..1 */
-	if (tuple_fraction >= 1.0 && best_path->rows > 0)
-		tuple_fraction /= best_path->rows;
+	if (tuple_fraction >= 1.0 && total_rows > 0)
+		tuple_fraction /= total_rows;
 
 	foreach(l, rel->pathlist)
 	{
 		Path	   *path = (Path *) lfirst(l);
 
-		if (path == rel->cheapest_total_path ||
-			compare_fractional_path_costs(best_path, path, tuple_fraction) <= 0)
-			continue;
-
-		best_path = path;
+		if (best_path == NULL ||
+			compare_fractional_path_costs(best_path, path, tuple_fraction) > 0)
+			best_path = path;	
 	}
 
 	return best_path;
@@ -7540,7 +7542,8 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 							   List *scanjoin_targets,
 							   List *scanjoin_targets_contain_srfs,
 							   bool scanjoin_target_parallel_safe,
-							   bool tlist_same_exprs)
+							   bool tlist_same_exprs,
+							   Relids top_relids)
 {
 	bool		rel_is_partitioned = IS_PARTITIONED_REL(rel);
 	PathTarget *scanjoin_target;
@@ -7723,7 +7726,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 										   child_scanjoin_targets,
 										   scanjoin_targets_contain_srfs,
 										   scanjoin_target_parallel_safe,
-										   tlist_same_exprs);
+										   tlist_same_exprs, top_relids);
 
 			/* Save non-dummy children for Append paths. */
 			if (!IS_DUMMY_REL(child_rel))
@@ -7731,7 +7734,7 @@ apply_scanjoin_target_to_paths(PlannerInfo *root,
 		}
 
 		/* Build new paths for this relation by appending child paths. */
-		add_paths_to_append_rel(root, rel, live_children);
+		add_paths_to_append_rel(root, rel, live_children, top_relids);
 	}
 
 	/*
@@ -7888,7 +7891,8 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 		Assert(partially_grouped_live_children != NIL);
 
 		add_paths_to_append_rel(root, partially_grouped_rel,
-								partially_grouped_live_children);
+								partially_grouped_live_children,
+								input_rel->relids);
 
 		/*
 		 * We need call set_cheapest, since the finalization step will use the
@@ -7903,7 +7907,8 @@ create_partitionwise_grouping_paths(PlannerInfo *root,
 	{
 		Assert(grouped_live_children != NIL);
 
-		add_paths_to_append_rel(root, grouped_rel, grouped_live_children);
+		/* group_rel->relids is not set. */
+		add_paths_to_append_rel(root, grouped_rel, grouped_live_children, input_rel->relids);
 	}
 }
 

@@ -61,8 +61,8 @@ extern int	compute_parallel_worker(RelOptInfo *rel, double heap_pages,
 extern void create_partial_bitmap_paths(PlannerInfo *root, RelOptInfo *rel,
 										Path *bitmapqual);
 extern void generate_partitionwise_join_paths(PlannerInfo *root,
-											  RelOptInfo *rel);
-
+											  RelOptInfo *rel,
+											  Relids top_relids);
 #ifdef OPTIMIZER_DEBUG
 extern void debug_print_rel(PlannerInfo *root, RelOptInfo *rel);
 #endif
@@ -261,6 +261,6 @@ extern PathKey *make_canonical_pathkey(PlannerInfo *root,
 									   EquivalenceClass *eclass, Oid opfamily,
 									   int strategy, bool nulls_first);
 extern void add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
-									List *live_childrels);
+									List *live_childrels, Relids top_relids);
 
 #endif							/* PATHS_H */

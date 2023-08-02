@@ -120,6 +120,9 @@ compare_fractional_path_costs(Path *path1, Path *path2,
 	Cost		cost1,
 				cost2;
 
+	if (path1 == path2)
+		return 0;
+
 	if (fraction <= 0.0 || fraction >= 1.0)
 		return compare_path_costs(path1, path2, TOTAL_COST);
 	cost1 = path1->startup_cost +

@@ -97,7 +97,7 @@ static void set_base_rel_pathlists(PlannerInfo *root);
 static void set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 						 Index rti, RangeTblEntry *rte);
 static void set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
-							 Index rti, RangeTblEntry *rte);
+							 Index rti, RangeTblEntry *rte, Relids top_relids);
 static void set_plain_rel_size(PlannerInfo *root, RelOptInfo *rel,
 							   RangeTblEntry *rte);
 static void create_plain_partial_paths(PlannerInfo *root, RelOptInfo *rel);
@@ -116,7 +116,7 @@ static void set_foreign_pathlist(PlannerInfo *root, RelOptInfo *rel,
 static void set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 								Index rti, RangeTblEntry *rte);
 static void set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
-									Index rti, RangeTblEntry *rte);
+									Index rti, RangeTblEntry *rte, Relids relids);
 static void generate_orderedappend_paths(PlannerInfo *root, RelOptInfo *rel,
 										 List *live_childrels,
 										 List *all_child_pathkeys);
@@ -351,7 +351,7 @@ set_base_rel_pathlists(PlannerInfo *root)
 		if (rel->reloptkind != RELOPT_BASEREL)
 			continue;
 
-		set_rel_pathlist(root, rel, rti, root->simple_rte_array[rti]);
+		set_rel_pathlist(root, rel, rti, root->simple_rte_array[rti], rel->relids);
 	}
 }
 
@@ -470,7 +470,7 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
  */
 static void
 set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
-				 Index rti, RangeTblEntry *rte)
+				 Index rti, RangeTblEntry *rte, Relids top_relids)
 {
 	if (IS_DUMMY_REL(rel))
 	{
@@ -479,7 +479,7 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	else if (rte->inh)
 	{
 		/* It's an "append relation", process accordingly */
-		set_append_rel_pathlist(root, rel, rti, rte);
+		set_append_rel_pathlist(root, rel, rti, rte, top_relids);
 	}
 	else
 	{
@@ -1233,7 +1233,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
  */
 static void
 set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
-						Index rti, RangeTblEntry *rte)
+						Index rti, RangeTblEntry *rte, Relids top_relids)
 {
 	int			parentRTindex = rti;
 	List	   *live_childrels = NIL;
@@ -1271,7 +1271,7 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 		/*
 		 * Compute the child's access paths.
 		 */
-		set_rel_pathlist(root, childrel, childRTindex, childRTE);
+		set_rel_pathlist(root, childrel, childRTindex, childRTE, top_relids);
 
 		/*
 		 * If child is dummy, ignore it.
@@ -1286,7 +1286,7 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 	}
 
 	/* Add paths to the append relation. */
-	add_paths_to_append_rel(root, rel, live_childrels);
+	add_paths_to_append_rel(root, rel, live_childrels, top_relids);
 }
 
 
@@ -1303,7 +1303,7 @@ set_append_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
  */
 void
 add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
-						List *live_childrels)
+						List *live_childrels, Relids top_relids)
 {
 	List	   *subpaths = NIL;
 	bool		subpaths_valid = true;
@@ -1330,7 +1330,7 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		RelOptInfo *childrel = lfirst(l);
 		ListCell   *lcp;
 		Path	   *cheapest_partial_path = NULL;
-
+		Path	   *cheapest_startup_path = NULL;
 		/*
 		 * If child has an unparameterized cheapest-total path, add that to
 		 * the unparameterized Append path we are constructing for the parent.
@@ -1339,7 +1339,13 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 		 * With partitionwise aggregates, the child rel's pathlist may be
 		 * empty, so don't assume that a path exists here.
 		 */
-		if (childrel->pathlist != NIL &&
+		if (rel->consider_startup &&
+			bms_equal(top_relids, root->all_baserels) &&
+			(cheapest_startup_path = get_cheapest_fractional_path(childrel, root->tuple_fraction, false)) != NULL &&
+			enable_geqo)
+			accumulate_append_subpath(cheapest_startup_path,
+									  &subpaths, NULL);
+		else if (childrel->pathlist != NIL &&
 			childrel->cheapest_total_path->param_info == NULL)
 			accumulate_append_subpath(childrel->cheapest_total_path,
 									  &subpaths, NULL);
@@ -3468,7 +3474,7 @@ standard_join_search(PlannerInfo *root, int levels_needed, List *initial_rels)
 			rel = (RelOptInfo *) lfirst(lc);
 
 			/* Create paths for partitionwise joins. */
-			generate_partitionwise_join_paths(root, rel);
+			generate_partitionwise_join_paths(root, rel, rel->relids);
 
 			/*
 			 * Except for the topmost scan/join rel, consider gathering
@@ -4295,7 +4301,7 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
  * generated here has a reference.
  */
 void
-generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
+generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel, Relids top_relids)
 {
 	List	   *live_children = NIL;
 	int			cnt_parts;
@@ -4329,7 +4335,7 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 			continue;
 
 		/* Make partitionwise join paths for this partitioned child-join. */
-		generate_partitionwise_join_paths(root, child_rel);
+		generate_partitionwise_join_paths(root, child_rel, top_relids);
 
 		/* If we failed to make any path for this child, we must give up. */
 		if (child_rel->pathlist == NIL)
@@ -4364,7 +4370,7 @@ generate_partitionwise_join_paths(PlannerInfo *root, RelOptInfo *rel)
 	}
 
 	/* Build additional paths for this rel from child-join paths. */
-	add_paths_to_append_rel(root, rel, live_children);
+	add_paths_to_append_rel(root, rel, live_children, top_relids);
 	list_free(live_children);
 }
 
