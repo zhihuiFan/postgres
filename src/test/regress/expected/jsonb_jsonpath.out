@@ -34,26 +34,6 @@ select jsonb '{"a": 12}' @? '$.b + 2';
  
 (1 row)
 
-select jsonb '{"a": 12}' @-> 'a';
- ?column? 
-----------
-       12
-(1 row)
-
-select pg_typeof(jsonb '{"a": 12}' @-> 'a');
- pg_typeof 
------------
- numeric
-(1 row)
-
-select jsonb '{"a": 12}' @-> 'b';
- ?column? 
-----------
-         
-(1 row)
-
-select jsonb '{"a": "12a"}' @-> 'a';
-ERROR:  field 'a' has non-numeric value.
 select jsonb '{"a": {"a": 12}}' @? '$.a.a';
  ?column? 
 ----------
