@@ -6331,7 +6331,7 @@ Path *
 get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction,
 							 bool allow_parameterized)
 {
-	Path	   *best_path = allow_parameterized ? NULL : rel->cheapest_total_path;
+	Path	   *best_path = allow_parameterized ? rel->cheapest_total_path : NULL;
 	ListCell   *l;
 	double		total_rows = rel->cheapest_total_path->rows;
 
@@ -6346,6 +6346,9 @@ get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction,
 	foreach(l, rel->pathlist)
 	{
 		Path	   *path = (Path *) lfirst(l);
+
+		if (!allow_parameterized && !bms_is_empty(PATH_REQ_OUTER(path)))
+			continue;
 
 		if (best_path == NULL ||
 			compare_fractional_path_costs(best_path, path, tuple_fraction) > 0)
