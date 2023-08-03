@@ -6331,9 +6331,9 @@ Path *
 get_cheapest_fractional_path(RelOptInfo *rel, double tuple_fraction,
 							 bool allow_parameterized)
 {
-	Path	   *best_path = rel->cheapest_total_path;
+	Path	   *best_path = allow_parameterized ? NULL : rel->cheapest_total_path;
 	ListCell   *l;
-	double		total_rows = rel->rows;
+	double		total_rows = rel->cheapest_total_path->rows;
 
 	/* If all tuples will be retrieved, just return the cheapest-total path */
 	if (tuple_fraction <= 0.0)

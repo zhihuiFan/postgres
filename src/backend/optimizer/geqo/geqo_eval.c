@@ -265,7 +265,7 @@ merge_clump(PlannerInfo *root, List *clumps, Clump *new_clump, int num_gene,
 			if (joinrel)
 			{
 				/* Create paths for partitionwise joins. */
-				generate_partitionwise_join_paths(root, joinrel);
+				generate_partitionwise_join_paths(root, joinrel, joinrel->relids);
 
 				/*
 				 * Except for the topmost scan/join rel, consider gathering
