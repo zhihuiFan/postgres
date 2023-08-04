@@ -17,11 +17,14 @@
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
+#include "nodes/makefuncs.h"
+#include "nodes/supportnodes.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
+#include "utils/fmgroids.h"
 #include "utils/json.h"
 #include "utils/jsonb.h"
 #include "utils/jsonfuncs.h"
@@ -2036,6 +2039,133 @@ cannotCastJsonbValue(enum jbvType type, const char *sqltype)
 
 	/* should be unreachable */
 	elog(ERROR, "unknown jsonb type: %d", (int) type);
+}
+
+static bool
+jsonb_cast_is_optimized(Oid target_type)
+{
+	switch(target_type)
+	{
+		case NUMERICOID:
+		case BOOLOID:
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+		case FLOAT4OID:
+		case FLOAT8OID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+Datum
+jsonb_cast_support(PG_FUNCTION_ARGS)
+{
+	Node	   *rawreq = (Node *) PG_GETARG_POINTER(0);
+
+	if (IsA(rawreq, SupportRequestSimplify))
+	{
+		SupportRequestSimplify *req = (SupportRequestSimplify *) rawreq;
+		FuncExpr	*fexpr = palloc(sizeof(FuncExpr));
+		OpExpr		*opexpr;
+
+		memcpy(fexpr, req->fcall, sizeof(FuncExpr));
+
+		opexpr = (OpExpr *) linitial(fexpr->args);
+
+		if (IsA(opexpr, OpExpr) &&
+			opexpr->opfuncid  == F_JSONB_OBJECT_FIELD &&
+			jsonb_cast_is_optimized(fexpr->funcresulttype))
+		{
+			fexpr->funcid = F_JSONB_OBJECT_FIELD_TYPE;
+			fexpr->args = opexpr->args;
+			fexpr->args = lappend(fexpr->args, makeConst(OIDOID, 0, 0, sizeof(Oid),
+														 fexpr->funcresulttype,
+														 false, true));
+		}
+
+		PG_RETURN_POINTER(fexpr);
+	}
+
+	PG_RETURN_POINTER(NULL);
+}
+
+Datum
+jsonb_object_field_type(PG_FUNCTION_ARGS)
+{
+	Jsonb	   *jb = PG_GETARG_JSONB_P(0);
+	text	   *key = PG_GETARG_TEXT_PP(1);
+	Oid			targetOid = PG_GETARG_OID(2);
+
+	JsonbValue *v;
+	JsonbValue	vbuf;
+
+	if (!JB_ROOT_IS_OBJECT(jb))
+		PG_RETURN_NULL();
+
+	v = getKeyJsonValueFromContainer(&jb->root,
+									 VARDATA_ANY(key),
+									 VARSIZE_ANY_EXHDR(key),
+									 &vbuf);
+
+	if (v == NULL || v->type == jbvNull)
+		PG_RETURN_NULL();
+
+	switch(targetOid)
+	{
+		Datum	retValue;
+		case NUMERICOID:
+			if (v->type != jbvNumeric)
+				cannotCastJsonbValue(v->type, "numeric");
+			PG_RETURN_NUMERIC(v->val.numeric);
+		case BOOLOID:
+			if (v->type != jbvBool)
+				cannotCastJsonbValue(v->type, "bool");
+			PG_RETURN_BOOL(v->val.boolean);
+
+		case INT2OID:
+			if (v->type != jbvNumeric)
+				cannotCastJsonbValue(v->type, "smallint");
+			retValue = DirectFunctionCall1(numeric_int2,
+										   NumericGetDatum(v->val.numeric));
+			PG_RETURN_DATUM(retValue);
+		case INT4OID:
+			if (v->type != jbvNumeric)
+				cannotCastJsonbValue(v->type, "integer");
+			retValue = DirectFunctionCall1(numeric_int4,
+										   NumericGetDatum(v->val.numeric));
+			PG_RETURN_DATUM(retValue);
+
+		case INT8OID:
+			if (v->type != jbvNumeric)
+				cannotCastJsonbValue(v->type, "bigint");
+			retValue = DirectFunctionCall1(numeric_int8,
+										   NumericGetDatum(v->val.numeric));
+			PG_RETURN_DATUM(retValue);
+
+		case FLOAT4OID:
+			if (v->type != jbvNumeric)
+				cannotCastJsonbValue(v->type, "real");
+			retValue = DirectFunctionCall1(numeric_float4,
+										   NumericGetDatum(v->val.numeric));
+			PG_RETURN_DATUM(retValue);
+
+		case FLOAT8OID:
+			if (v->type != jbvNumeric)
+				cannotCastJsonbValue(v->type, "double precision");
+			retValue = DirectFunctionCall1(numeric_float8,
+										   NumericGetDatum(v->val.numeric));
+			PG_RETURN_DATUM(retValue);
+
+		/*
+		 * Whenever a cast is added for jsonb to anytype, and a
+		 * here. the below error will happens */
+		default:
+			elog(ERROR, "cast jsonb field to %d is not supported.", targetOid);
+	}
+
+	PG_RETURN_POINTER(0);
 }
 
 Datum
