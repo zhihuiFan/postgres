@@ -1663,9 +1663,12 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 												gset_data);
 			/* Fix things up if grouping_target contains SRFs */
 			if (parse->hasTargetSRFs)
+			{
 				adjust_paths_for_srfs(root, current_rel,
 									  grouping_targets,
 									  grouping_targets_contain_srfs);
+				current_rel->uniquekeys = NIL;
+			}
 		}
 
 		/*
@@ -1725,6 +1728,7 @@ grouping_planner(PlannerInfo *root, double tuple_fraction)
 	 * Now we are prepared to build the final-output upperrel.
 	 */
 	final_rel = fetch_upper_rel(root, UPPERREL_FINAL, NULL);
+	/* simple_copy_uniquekeys(final_rel, current_rel); */
 
 	/*
 	 * If the input rel is marked consider_parallel and there's nothing that's
@@ -4049,6 +4053,22 @@ create_ordinary_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 									  gd,
 									  extra->targetList);
 
+	if (root->parse->groupingSets)
+	{
+		/* nothing to do */
+	}
+	else if (root->parse->groupClause && root->group_pathkeys != NIL)
+	{
+		/*
+		 * populate_uniquekeys_from_pathkeys(root, grouped_rel,
+		 * root->group_pathkeys);
+		 */
+	}
+	else
+	{
+		/* SingleRow Case */
+	}
+
 	/* Build final grouping paths */
 	add_paths_to_grouping_rel(root, input_rel, grouped_rel,
 							  partially_grouped_rel, agg_costs, gd,
@@ -4668,8 +4688,21 @@ create_distinct_paths(PlannerInfo *root, RelOptInfo *input_rel)
 {
 	RelOptInfo *distinct_rel;
 
+	/*
+	 * distinct_pathkeys may be NIL if it distinctClause is not sortable. XXX:
+	 * What should we do for the else?
+	 */
+	if (root->distinct_pathkeys &&
+		relation_is_distinct_for(root, input_rel, root->distinct_pathkeys))
+		return input_rel;
+
 	/* For now, do all work in the (DISTINCT, NULL) upperrel */
 	distinct_rel = fetch_upper_rel(root, UPPERREL_DISTINCT, NULL);
+
+	/*
+	 * populate_uniquekeys_from_pathkeys(root, distinct_rel,
+	 * root->distinct_pathkeys);
+	 */
 
 	/*
 	 * We don't compute anything at this level, so distinct_rel will be

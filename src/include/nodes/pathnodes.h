@@ -876,6 +876,7 @@ typedef struct RelOptInfo
 	 * Vars/Exprs, cost, width
 	 */
 	struct PathTarget *reltarget;
+	List	   *uniquekeys;		/* A list of UniqueKey. */
 
 	/*
 	 * materialization information
@@ -913,6 +914,9 @@ typedef struct RelOptInfo
 	Relids	   *attr_needed pg_node_attr(read_write_ignore);
 	/* array indexed [min_attr .. max_attr] */
 	int32	   *attr_widths pg_node_attr(read_write_ignore);
+
+	/* The not null attrs from catalogs or baserestrictinfo. */
+	Bitmapset  *notnullattrs;
 	/* relids of outer joins that can null this baserel */
 	Relids		nulling_relids;
 	/* LATERAL Vars and PHVs referenced by rel */
@@ -1455,6 +1459,21 @@ typedef struct PathKey
 	int			pk_strategy;	/* sort direction (ASC or DESC) */
 	bool		pk_nulls_first; /* do NULLs come before normal values? */
 } PathKey;
+
+
+typedef struct UniqueKey
+{
+	pg_node_attr(no_read, no_query_jumble)
+
+	NodeTag		type;
+	Bitmapset  *eclass_indexes; /* Indexes in PlannerInfo's eq_class list of
+								 * ECs that is unique for a RelOptInfo. */
+	int			relid;
+	bool		use_for_distinct;	/* true if it is used in distinct-pathkey,
+									 * in this case we would never check if we
+									 * should discard it during join search. */
+}			UniqueKey;
+
 
 /*
  * VolatileFunctionStatus -- allows nodes to cache their

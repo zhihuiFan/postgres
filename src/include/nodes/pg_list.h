@@ -581,6 +581,8 @@ extern bool list_member_int(const List *list, int datum);
 extern bool list_member_oid(const List *list, Oid datum);
 extern bool list_member_xid(const List *list, TransactionId datum);
 
+extern int	list_member_ptr_pos(const List *list, const void *datum);
+
 extern pg_nodiscard List *list_delete(List *list, void *datum);
 extern pg_nodiscard List *list_delete_ptr(List *list, void *datum);
 extern pg_nodiscard List *list_delete_int(List *list, int datum);

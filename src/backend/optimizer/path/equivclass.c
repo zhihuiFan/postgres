@@ -745,6 +745,54 @@ get_eclass_for_sort_expr(PlannerInfo *root,
 }
 
 /*
+ * find_ec_position_matching_expr
+ *		Locate the position of EquivalenceClass whose members matching
+ *		the given expr, if any; return -1 if no match.
+ */
+int
+find_ec_position_matching_expr(PlannerInfo *root,
+							   Expr *expr,
+							   RelOptInfo *baserel)
+{
+	int			i = -1;
+
+	while ((i = bms_next_member(baserel->eclass_indexes, i)) >= 0)
+	{
+		EquivalenceClass *ec = list_nth(root->eq_classes, i);
+
+		if (find_ec_member_matching_expr(ec, expr, baserel->relids))
+			return i;
+	}
+	return -1;
+}
+
+/*
+ * build_ec_positions_for_exprs
+ *
+ *		Given a list of exprs, find the related EC positions for each of
+ *		them. if any exprs has no EC related, return NULL;
+ */
+Bitmapset *
+build_ec_positions_for_exprs(PlannerInfo *root, List *exprs, RelOptInfo *rel)
+{
+	ListCell   *lc;
+	Bitmapset  *res = NULL;
+
+	foreach(lc, exprs)
+	{
+		int			pos = find_ec_position_matching_expr(root, lfirst(lc), rel);
+
+		if (pos < 0)
+		{
+			bms_free(res);
+			return NULL;
+		}
+		res = bms_add_member(res, pos);
+	}
+	return res;
+}
+
+/*
  * find_ec_member_matching_expr
  *		Locate an EquivalenceClass member matching the given expr, if any;
  *		return NULL if no match.

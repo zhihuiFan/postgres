@@ -458,6 +458,8 @@ set_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		}
 	}
 
+	populate_baserel_uniquekeys(root, rel);
+
 	/*
 	 * We insist that all non-dummy rels have a nonzero rowcount estimate.
 	 */

@@ -2647,6 +2647,14 @@ distribute_restrictinfo_to_rels(PlannerInfo *root,
 			/* Add clause to rel's restriction list */
 			rel->baserestrictinfo = lappend(rel->baserestrictinfo,
 											restrictinfo);
+			{
+				List	   *not_null_vars = find_nonnullable_vars((Node *) restrictinfo->clause);
+
+				if (not_null_vars != NIL)
+					rel->notnullattrs = bms_union(rel->notnullattrs,
+												  list_nth(not_null_vars, rel->relid));
+			}
+
 			/* Update security level info */
 			rel->baserestrict_min_security = Min(rel->baserestrict_min_security,
 												 restrictinfo->security_level);
