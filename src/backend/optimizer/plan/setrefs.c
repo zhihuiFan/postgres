@@ -60,6 +60,8 @@ typedef struct
 	PlannerInfo *root;
 	int			rtoffset;
 	double		num_exec;
+	int			level;
+	Bitmapset	**scan_reference_attrs;
 } fix_scan_expr_context;
 
 typedef struct
@@ -71,6 +73,9 @@ typedef struct
 	int			rtoffset;
 	NullingRelsMatch nrm_match;
 	double		num_exec;
+	int			level;
+	Bitmapset	**outer_reference_attrs;
+	Bitmapset	**inner_reference_attrs;
 } fix_join_expr_context;
 
 typedef struct
@@ -96,6 +101,16 @@ typedef struct
 	PlannerGlobal *glob;
 	Query	   *query;
 } flatten_rtes_walker_context;
+
+#define CONTEXT_LEVEL_SUB_RET(n) \
+do { \
+	if (!ignore_level) \
+	{ \
+		context->level--; \
+	} \
+	return (Node *) n; \
+} while (false)
+
 
 /*
  * Selecting the best alternative in an AlternativeSubPlan expression requires
@@ -127,8 +142,8 @@ typedef struct
 	(((con)->consttype == REGCLASSOID || (con)->consttype == OIDOID) && \
 	 !(con)->constisnull)
 
-#define fix_scan_list(root, lst, rtoffset, num_exec) \
-	((List *) fix_scan_expr(root, (Node *) (lst), rtoffset, num_exec))
+#define fix_scan_list(root, lst, rtoffset, num_exec, ref_attrs) \
+	((List *) fix_scan_expr(root, (Node *) (lst), rtoffset, num_exec, ref_attrs))
 
 static void add_rtes_to_flat_rtable(PlannerInfo *root, bool recursing);
 static void flatten_unplanned_rtes(PlannerGlobal *glob, RangeTblEntry *rte);
@@ -158,7 +173,8 @@ static Plan *set_mergeappend_references(PlannerInfo *root,
 static void set_hash_references(PlannerInfo *root, Plan *plan, int rtoffset);
 static Relids offset_relid_set(Relids relids, int rtoffset);
 static Node *fix_scan_expr(PlannerInfo *root, Node *node,
-						   int rtoffset, double num_exec);
+						   int rtoffset, double num_exec,
+						   Bitmapset **scan_reference_attrs);
 static Node *fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context);
 static bool fix_scan_expr_walker(Node *node, fix_scan_expr_context *context);
 static void set_join_references(PlannerInfo *root, Join *join, int rtoffset);
@@ -166,7 +182,14 @@ static void set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset);
 static void set_param_references(PlannerInfo *root, Plan *plan);
 static Node *convert_combining_aggrefs(Node *node, void *context);
 static void set_dummy_tlist_references(Plan *plan, int rtoffset);
+static void trim_shared_detoast_attrs(indexed_tlist *plan_itlist,
+									  Bitmapset	*detoasted_attr,
+									  int varno);
+
 static indexed_tlist *build_tlist_index(List *tlist);
+static tlist_vinfo *search_indexed_tlist_for_varno_attr(indexed_tlist *itlist,
+														int varno,
+														int varattrno);
 static Var *search_indexed_tlist_for_var(Var *var,
 										 indexed_tlist *itlist,
 										 int newvarno,
@@ -190,7 +213,10 @@ static List *fix_join_expr(PlannerInfo *root,
 						   Index acceptable_rel,
 						   int rtoffset,
 						   NullingRelsMatch nrm_match,
-						   double num_exec);
+						   double num_exec,
+						   Bitmapset **outer_reference_attrs,
+						   Bitmapset **inner_reference_attrs);
+
 static Node *fix_join_expr_mutator(Node *node,
 								   fix_join_expr_context *context);
 static Node *fix_upper_expr(PlannerInfo *root,
@@ -212,6 +238,12 @@ static List *set_windowagg_runcondition_references(PlannerInfo *root,
 												   Plan *plan);
 
 
+static inline void
+add_reference_attrs(Bitmapset **reference_attr,  Var *var)
+{
+	if (reference_attr != NULL)
+		*reference_attr = bms_add_member(*reference_attr, var->varattno - 1);
+}
 /*****************************************************************************
  *
  *		SUBPLAN REFERENCES
@@ -628,10 +660,12 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_SampleScan:
@@ -641,13 +675,17 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs
+						);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 				splan->tablesample = (TableSampleClause *)
 					fix_scan_expr(root, (Node *) splan->tablesample,
-								  rtoffset, 1);
+								  rtoffset, 1,
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_IndexScan:
@@ -657,22 +695,27 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
+
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
+
 				splan->indexqual =
 					fix_scan_list(root, splan->indexqual,
-								  rtoffset, 1);
+								  rtoffset, 1, &splan->scan.reference_attrs);
 				splan->indexqualorig =
 					fix_scan_list(root, splan->indexqualorig,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 				splan->indexorderby =
 					fix_scan_list(root, splan->indexorderby,
-								  rtoffset, 1);
+								  rtoffset, 1, &splan->scan.reference_attrs);
 				splan->indexorderbyorig =
 					fix_scan_list(root, splan->indexorderbyorig,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan), &splan->scan.reference_attrs);
 			}
 			break;
 		case T_IndexOnlyScan:
@@ -691,10 +734,12 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				Assert(splan->scan.plan.targetlist == NIL);
 				Assert(splan->scan.plan.qual == NIL);
 				splan->indexqual =
-					fix_scan_list(root, splan->indexqual, rtoffset, 1);
+					fix_scan_list(root, splan->indexqual, rtoffset, 1,
+								  &splan->scan.reference_attrs);
 				splan->indexqualorig =
 					fix_scan_list(root, splan->indexqualorig,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_BitmapHeapScan:
@@ -704,13 +749,16 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 				splan->bitmapqualorig =
 					fix_scan_list(root, splan->bitmapqualorig,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_TidScan:
@@ -720,13 +768,16 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 				splan->tidquals =
 					fix_scan_list(root, splan->tidquals,
-								  rtoffset, 1);
+								  rtoffset, 1,
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_TidRangeScan:
@@ -736,13 +787,16 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 				splan->tidrangequals =
 					fix_scan_list(root, splan->tidrangequals,
-								  rtoffset, 1);
+								  rtoffset, 1,
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_SubqueryScan:
@@ -757,12 +811,16 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 				splan->functions =
-					fix_scan_list(root, splan->functions, rtoffset, 1);
+					fix_scan_list(root, splan->functions, rtoffset, 1,
+								  &splan->scan.reference_attrs);
+
 			}
 			break;
 		case T_TableFuncScan:
@@ -772,13 +830,17 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
+
 				splan->tablefunc = (TableFunc *)
 					fix_scan_expr(root, (Node *) splan->tablefunc,
-								  rtoffset, 1);
+								  rtoffset, 1,
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_ValuesScan:
@@ -788,13 +850,16 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 				splan->values_lists =
 					fix_scan_list(root, splan->values_lists,
-								  rtoffset, 1);
+								  rtoffset, 1,
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_CteScan:
@@ -804,10 +869,12 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_NamedTuplestoreScan:
@@ -817,10 +884,12 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_WorkTableScan:
@@ -830,10 +899,12 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist,
-								  rtoffset, NUM_EXEC_TLIST(plan));
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  &splan->scan.reference_attrs);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual,
-								  rtoffset, NUM_EXEC_QUAL(plan));
+								  rtoffset, NUM_EXEC_QUAL(plan),
+								  &splan->scan.reference_attrs);
 			}
 			break;
 		case T_ForeignScan:
@@ -873,7 +944,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 
 				mplan->param_exprs = fix_scan_list(root, mplan->param_exprs,
 												   rtoffset,
-												   NUM_EXEC_TLIST(plan));
+												   NUM_EXEC_TLIST(plan),
+												   NULL);
 				break;
 			}
 
@@ -1118,13 +1190,15 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 						fix_join_expr(root, splan->onConflictSet,
 									  NULL, itlist,
 									  linitial_int(splan->resultRelations),
-									  rtoffset, NRM_EQUAL, NUM_EXEC_QUAL(plan));
+									  rtoffset, NRM_EQUAL, NUM_EXEC_QUAL(plan),
+									  NULL, NULL);
 
 					splan->onConflictWhere = (Node *)
 						fix_join_expr(root, (List *) splan->onConflictWhere,
 									  NULL, itlist,
 									  linitial_int(splan->resultRelations),
-									  rtoffset, NRM_EQUAL, NUM_EXEC_QUAL(plan));
+									  rtoffset, NRM_EQUAL, NUM_EXEC_QUAL(plan),
+									  NULL, NULL);
 
 					pfree(itlist);
 
@@ -1182,7 +1256,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 															   resultrel,
 															   rtoffset,
 															   NRM_EQUAL,
-															   NUM_EXEC_TLIST(plan));
+															   NUM_EXEC_TLIST(plan),
+															   NULL, NULL);
 
 							/* Fix quals too. */
 							action->qual = (Node *) fix_join_expr(root,
@@ -1191,7 +1266,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 																  resultrel,
 																  rtoffset,
 																  NRM_EQUAL,
-																  NUM_EXEC_QUAL(plan));
+																  NUM_EXEC_QUAL(plan),
+																  NULL, NULL);
 						}
 					}
 				}
@@ -2130,13 +2206,16 @@ fix_alternative_subplan(PlannerInfo *root, AlternativeSubPlan *asplan,
  * if that seems safe.
  */
 static Node *
-fix_scan_expr(PlannerInfo *root, Node *node, int rtoffset, double num_exec)
+fix_scan_expr(PlannerInfo *root, Node *node, int rtoffset,
+			  double num_exec, Bitmapset **scan_reference_attrs)
 {
 	fix_scan_expr_context context;
 
 	context.root = root;
 	context.rtoffset = rtoffset;
 	context.num_exec = num_exec;
+	context.level = 0;
+	context.scan_reference_attrs = scan_reference_attrs;
 
 	if (rtoffset != 0 ||
 		root->multiexpr_params != NIL ||
@@ -2167,8 +2246,14 @@ fix_scan_expr(PlannerInfo *root, Node *node, int rtoffset, double num_exec)
 static Node *
 fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 {
+	bool	ignore_level;
+	Node	*n;
+
 	if (node == NULL)
 		return NULL;
+
+	ignore_level = IsA(node, List) || IsA(node, TargetEntry);
+
 	if (IsA(node, Var))
 	{
 		Var		   *var = copyVar((Var *) node);
@@ -2186,10 +2271,15 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 			var->varno += context->rtoffset;
 		if (var->varnosyn > 0)
 			var->varnosyn += context->rtoffset;
-		return (Node *) var;
+
+		add_reference_attrs(context->scan_reference_attrs, var);
+		CONTEXT_LEVEL_SUB_RET(var);
 	}
 	if (IsA(node, Param))
-		return fix_param_node(context->root, (Param *) node);
+	{
+		Node *n = fix_param_node(context->root, (Param *) node);
+		CONTEXT_LEVEL_SUB_RET(n);
+	}
 	if (IsA(node, Aggref))
 	{
 		Aggref	   *aggref = (Aggref *) node;
@@ -2200,7 +2290,8 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 		if (aggparam != NULL)
 		{
 			/* Make a copy of the Param for paranoia's sake */
-			return (Node *) copyObject(aggparam);
+			Node *n = (Node *) copyObject(aggparam);
+			CONTEXT_LEVEL_SUB_RET(n);
 		}
 		/* If no match, just fall through to process it normally */
 	}
@@ -2210,7 +2301,7 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 
 		Assert(!IS_SPECIAL_VARNO(cexpr->cvarno));
 		cexpr->cvarno += context->rtoffset;
-		return (Node *) cexpr;
+		CONTEXT_LEVEL_SUB_RET(cexpr);
 	}
 	if (IsA(node, PlaceHolderVar))
 	{
@@ -2218,16 +2309,20 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 		PlaceHolderVar *phv = (PlaceHolderVar *) node;
 
 		/* XXX can we assert something about phnullingrels? */
-		return fix_scan_expr_mutator((Node *) phv->phexpr, context);
+		Node *n = fix_scan_expr_mutator((Node *) phv->phexpr, context);
+		CONTEXT_LEVEL_SUB_RET(n);
 	}
 	if (IsA(node, AlternativeSubPlan))
-		return fix_scan_expr_mutator(fix_alternative_subplan(context->root,
-															 (AlternativeSubPlan *) node,
-															 context->num_exec),
-									 context);
+	{
+		Node *n = fix_scan_expr_mutator(fix_alternative_subplan(context->root,
+																(AlternativeSubPlan *) node,
+																context->num_exec),
+										context);
+		CONTEXT_LEVEL_SUB_RET(n);
+	}
 	fix_expr_common(context->root, node);
-	return expression_tree_mutator(node, fix_scan_expr_mutator,
-								   (void *) context);
+	n = expression_tree_mutator(node, fix_scan_expr_mutator, (void *) context);
+	CONTEXT_LEVEL_SUB_RET(n);
 }
 
 static bool
@@ -2276,7 +2371,10 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 								   (Index) 0,
 								   rtoffset,
 								   NRM_EQUAL,
-								   NUM_EXEC_QUAL((Plan *) join));
+								   NUM_EXEC_QUAL((Plan *) join),
+								   &join->outer_reference_attrs,
+								   &join->inner_reference_attrs
+		);
 
 	/* Now do join-type-specific stuff */
 	if (IsA(join, NestLoop))
@@ -2323,7 +2421,9 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 										 (Index) 0,
 										 rtoffset,
 										 NRM_EQUAL,
-										 NUM_EXEC_QUAL((Plan *) join));
+										 NUM_EXEC_QUAL((Plan *) join),
+										 &join->outer_reference_attrs,
+										 &join->inner_reference_attrs);
 	}
 	else if (IsA(join, HashJoin))
 	{
@@ -2336,7 +2436,9 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 										(Index) 0,
 										rtoffset,
 										NRM_EQUAL,
-										NUM_EXEC_QUAL((Plan *) join));
+										NUM_EXEC_QUAL((Plan *) join),
+										&join->outer_reference_attrs,
+										&join->inner_reference_attrs);
 
 		/*
 		 * HashJoin's hashkeys are used to look for matching tuples from its
@@ -2368,7 +2470,9 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 										  (Index) 0,
 										  rtoffset,
 										  (join->jointype == JOIN_INNER ? NRM_EQUAL : NRM_SUPERSET),
-										  NUM_EXEC_TLIST((Plan *) join));
+										  NUM_EXEC_TLIST((Plan *) join),
+										  &join->outer_reference_attrs,
+										  &join->inner_reference_attrs);
 	join->plan.qual = fix_join_expr(root,
 									join->plan.qual,
 									outer_itlist,
@@ -2376,8 +2480,17 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 									(Index) 0,
 									rtoffset,
 									(join->jointype == JOIN_INNER ? NRM_EQUAL : NRM_SUPERSET),
-									NUM_EXEC_QUAL((Plan *) join));
+									NUM_EXEC_QUAL((Plan *) join),
+									&join->outer_reference_attrs,
+									&join->inner_reference_attrs);
 
+	if (join->plan.small_tlist)
+	{
+		indexed_tlist *plan_itlist = build_tlist_index(join->plan.small_tlist);
+		trim_shared_detoast_attrs(plan_itlist, join->outer_reference_attrs, OUTER_VAR);
+		trim_shared_detoast_attrs(plan_itlist, join->inner_reference_attrs, INNER_VAR);
+		pfree(plan_itlist);
+	}
 	pfree(outer_itlist);
 	pfree(inner_itlist);
 }
@@ -2643,6 +2756,19 @@ set_dummy_tlist_references(Plan *plan, int rtoffset)
 	/* We don't touch plan->qual here */
 }
 
+static void
+trim_shared_detoast_attrs(indexed_tlist *plan_itlist,
+						  Bitmapset	*detoasted_attr,
+						  int varno)
+{
+	int i = -1;
+
+	while (bms_next_member(detoasted_attr, i) >= 0)
+	{
+		if (search_indexed_tlist_for_varno_attr(plan_itlist, varno, i+1))
+			detoasted_attr = bms_del_member(detoasted_attr, i);
+	}
+}
 
 /*
  * build_tlist_index --- build an index data structure for a child tlist
@@ -2750,6 +2876,25 @@ build_tlist_index_other_vars(List *tlist, int ignore_rel)
 	itlist->num_vars = (vinfo - itlist->vars);
 
 	return itlist;
+}
+
+/*
+ * search_indexed_tlist_for_varno_attr -- find the vinfo for the given varno/attrno.
+ */
+static tlist_vinfo *
+search_indexed_tlist_for_varno_attr(indexed_tlist *itlist,
+									int varno,
+									int varattrno)
+{
+	tlist_vinfo *vinfo = itlist->vars;
+	int			 i = itlist->num_vars;
+
+	while (i-- > 0)
+	{
+		if (vinfo->varno == varno && vinfo->varattno == varattrno)
+			return vinfo;
+	}
+	return NULL;
 }
 
 /*
@@ -3010,7 +3155,9 @@ fix_join_expr(PlannerInfo *root,
 			  Index acceptable_rel,
 			  int rtoffset,
 			  NullingRelsMatch nrm_match,
-			  double num_exec)
+			  double num_exec,
+			  Bitmapset	**outer_reference_attrs,
+			  Bitmapset	**inner_reference_attrs)
 {
 	fix_join_expr_context context;
 
@@ -3021,6 +3168,9 @@ fix_join_expr(PlannerInfo *root,
 	context.rtoffset = rtoffset;
 	context.nrm_match = nrm_match;
 	context.num_exec = num_exec;
+	context.outer_reference_attrs = outer_reference_attrs;
+	context.inner_reference_attrs = inner_reference_attrs;
+	context.level = 0;
 	return (List *) fix_join_expr_mutator((Node *) clauses, &context);
 }
 
@@ -3029,8 +3179,18 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 {
 	Var		   *newvar;
 
+	Bitmapset **outer_attrs = context->outer_reference_attrs;
+	Bitmapset **inner_attrs = context->inner_reference_attrs;
+
+	/* TargetList is input with List(TargetEntry1, TargetEntry2) */
+	bool	ignore_level = IsA(node, List) || IsA(node, TargetEntry);
+	Node	*ret_node;
+
 	if (node == NULL)
 		return NULL;
+
+	if (!ignore_level)
+		context->level++;
 	if (IsA(node, Var))
 	{
 		Var		   *var = (Var *) node;
@@ -3044,7 +3204,13 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 												  context->rtoffset,
 												  context->nrm_match);
 			if (newvar)
-				return (Node *) newvar;
+			{
+				if (outer_attrs && context->level > 1)
+					// only for toast version. varlen = -1?
+					*outer_attrs = bms_add_member(*outer_attrs,
+												  newvar->varattno - 1);
+				CONTEXT_LEVEL_SUB_RET(newvar);
+			}
 		}
 
 		/* then in the inner. */
@@ -3056,7 +3222,13 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 												  context->rtoffset,
 												  context->nrm_match);
 			if (newvar)
-				return (Node *) newvar;
+			{
+				if (inner_attrs && context->level > 1)
+					// only for toast type?
+					*inner_attrs = bms_add_member(*inner_attrs,
+												  newvar->varattno - 1);
+				CONTEXT_LEVEL_SUB_RET(newvar);
+			}
 		}
 
 		/* If it's for acceptable_rel, adjust and return it */
@@ -3066,6 +3238,9 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 			var->varno += context->rtoffset;
 			if (var->varnosyn > 0)
 				var->varnosyn += context->rtoffset;
+			/* XXX acceptable_rel?  we can ignore it for safety. */
+			if (!ignore_level)
+				context->level--;
 			return (Node *) var;
 		}
 
@@ -3084,21 +3259,36 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 												  OUTER_VAR,
 												  context->nrm_match);
 			if (newvar)
-				return (Node *) newvar;
+			{
+				if (outer_attrs && context->level > 1)
+					// only for toast type?
+					*inner_attrs = bms_add_member(*inner_attrs,
+												  newvar->varattno - 1);
+
+				CONTEXT_LEVEL_SUB_RET(newvar);
+			}
 		}
 		if (context->inner_itlist && context->inner_itlist->has_ph_vars)
 		{
+
 			newvar = search_indexed_tlist_for_phv(phv,
 												  context->inner_itlist,
 												  INNER_VAR,
 												  context->nrm_match);
 			if (newvar)
-				return (Node *) newvar;
+			{
+				if (inner_attrs && context->level > 1)
+					// only for toast version. varlen = -1?
+					*inner_attrs = bms_add_member(*inner_attrs,
+												  newvar->varattno - 1);
+				CONTEXT_LEVEL_SUB_RET(newvar);
+			}
 		}
 
 		/* If not supplied by input plans, evaluate the contained expr */
 		/* XXX can we assert something about phnullingrels? */
-		return fix_join_expr_mutator((Node *) phv->phexpr, context);
+		ret_node = fix_join_expr_mutator((Node *) phv->phexpr, context);
+		CONTEXT_LEVEL_SUB_RET(ret_node);
 	}
 	/* Try matching more complex expressions too, if tlists have any */
 	if (context->outer_itlist && context->outer_itlist->has_non_vars)
@@ -3107,7 +3297,12 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 												  context->outer_itlist,
 												  OUTER_VAR);
 		if (newvar)
-			return (Node *) newvar;
+		{
+			if (outer_attrs && context->level > 1)
+				*outer_attrs = bms_add_member(*outer_attrs,
+											  newvar->varattno - 1);
+			CONTEXT_LEVEL_SUB_RET(newvar);
+		}
 	}
 	if (context->inner_itlist && context->inner_itlist->has_non_vars)
 	{
@@ -3115,20 +3310,32 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 												  context->inner_itlist,
 												  INNER_VAR);
 		if (newvar)
-			return (Node *) newvar;
+		{
+			if (inner_attrs && context->level > 1)
+				*inner_attrs = bms_add_member(*inner_attrs,
+											  newvar->varattno-1);
+			CONTEXT_LEVEL_SUB_RET(newvar);
+		}
 	}
 	/* Special cases (apply only AFTER failing to match to lower tlist) */
 	if (IsA(node, Param))
-		return fix_param_node(context->root, (Param *) node);
+	{
+		ret_node = fix_param_node(context->root, (Param *) node);
+		CONTEXT_LEVEL_SUB_RET(ret_node);
+	}
 	if (IsA(node, AlternativeSubPlan))
-		return fix_join_expr_mutator(fix_alternative_subplan(context->root,
+	{
+		ret_node = fix_join_expr_mutator(fix_alternative_subplan(context->root,
 															 (AlternativeSubPlan *) node,
 															 context->num_exec),
-									 context);
+										 context);
+		CONTEXT_LEVEL_SUB_RET(ret_node);
+	}
 	fix_expr_common(context->root, node);
-	return expression_tree_mutator(node,
+	ret_node = expression_tree_mutator(node,
 								   fix_join_expr_mutator,
 								   (void *) context);
+	CONTEXT_LEVEL_SUB_RET(ret_node);
 }
 
 /*
@@ -3163,7 +3370,7 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
  * varno = newvarno, varattno = resno of corresponding targetlist element.
  * The original tree is not modified.
  */
-static Node *
+static Node * /* XXX: shall I care about this for shared detoast optimization? */
 fix_upper_expr(PlannerInfo *root,
 			   Node *node,
 			   indexed_tlist *subplan_itlist,
@@ -3318,7 +3525,10 @@ set_returning_clause_references(PlannerInfo *root,
 						  resultRelation,
 						  rtoffset,
 						  NRM_EQUAL,
-						  NUM_EXEC_TLIST(topplan));
+						  NUM_EXEC_TLIST(topplan),
+						  NULL,
+						  NULL
+		);
 
 	pfree(itlist);
 

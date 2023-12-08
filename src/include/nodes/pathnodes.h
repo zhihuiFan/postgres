@@ -530,6 +530,8 @@ struct PlannerInfo
 	/* not-yet-assigned NestLoopParams */
 	List	   *curOuterParams;
 
+	List	   *curSmallTlist;
+
 	/*
 	 * These fields are workspace for setrefs.c.  Each is an array
 	 * corresponding to glob->subplans.  (We could probably teach
