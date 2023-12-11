@@ -285,6 +285,14 @@ typedef struct ExprContext
 
 	/* Functions to call back when ExprContext is shut down or rescanned */
 	ExprContext_CB *ecxt_callbacks;
+
+	/* an memory context which have the same life cycle as outer tuple. */
+	MemoryContext ecxt_per_outer_memory;
+	MemoryContext ecxt_per_inner_memory;
+
+	Bitmapset  *inner_detoast_attrs;
+	Bitmapset  *outer_detoast_attrs;
+	Bitmapset  *scan_detoast_attrs;
 } ExprContext;
 
 /*
@@ -2764,4 +2772,5 @@ typedef struct LimitState
 	TupleTableSlot *last_slot;	/* slot for evaluation of ties */
 } LimitState;
 
+extern void ExecSetInnerOuterSlotRefAttrs(PlanState *joinstate);
 #endif							/* EXECNODES_H */

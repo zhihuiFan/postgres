@@ -171,8 +171,9 @@ typedef struct Plan
 	Bitmapset  *allParam;
 
 	/*
-	 * The final targetlist as a input of SMALL_TLIST node(Sort / Hash and so on)
-	 * Note: it may contain some nodes which doesn't belong to current plan.
+	 * The final targetlist as a input of SMALL_TLIST node(Sort / Hash and so
+	 * on) Note: it may contain some nodes which doesn't belong to current
+	 * plan.
 	 */
 	List	   *small_tlist;
 } Plan;
@@ -391,8 +392,7 @@ typedef struct Scan
 
 	Plan		plan;
 	Index		scanrelid;		/* relid is index into the range table */
-	int			flags;
-	Bitmapset	*reference_attrs;
+	Bitmapset  *reference_attrs;
 } Scan;
 
 /* ----------------

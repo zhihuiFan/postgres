@@ -106,6 +106,7 @@ ExecNestLoop(PlanState *pstate)
 		if (node->nl_NeedNewOuter)
 		{
 			ENL1_printf("getting new outer tuple");
+			MemoryContextResetConditional(econtext->ecxt_per_outer_memory);
 			outerTupleSlot = ExecProcNode(outerPlan);
 
 			/*
@@ -157,6 +158,7 @@ ExecNestLoop(PlanState *pstate)
 		 */
 		ENL1_printf("getting new inner tuple");
 
+		MemoryContextResetConditional(econtext->ecxt_per_inner_memory);
 		innerTupleSlot = ExecProcNode(innerPlan);
 		econtext->ecxt_innertuple = innerTupleSlot;
 
@@ -306,6 +308,8 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	 */
 	ExecInitResultTupleSlotTL(&nlstate->js.ps, &TTSOpsVirtual);
 	ExecAssignProjectionInfo(&nlstate->js.ps, NULL);
+
+	ExecSetInnerOuterSlotRefAttrs((PlanState *) nlstate);
 
 	/*
 	 * initialize child expressions

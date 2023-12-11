@@ -78,6 +78,7 @@ static inline void tts_buffer_heap_store_tuple(TupleTableSlot *slot,
 											   Buffer buffer,
 											   bool transfer_pin);
 static void tts_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple, bool shouldFree);
+static Bitmapset *trim_untoast_attrs(Bitmapset **reference_attrs, TupleDesc tupleDesc);
 
 
 const TupleTableSlotOps TTSOpsVirtual;
@@ -85,6 +86,31 @@ const TupleTableSlotOps TTSOpsHeapTuple;
 const TupleTableSlotOps TTSOpsMinimalTuple;
 const TupleTableSlotOps TTSOpsBufferHeapTuple;
 
+
+static Bitmapset *
+trim_untoast_attrs(Bitmapset **reference_attrs, TupleDesc tupleDesc)
+{
+	int			i;
+	Bitmapset  *toast_attrs = NULL,
+			   *ret;
+
+	if (*reference_attrs == NULL)
+		return NULL;
+
+	for (i = 0; i < tupleDesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupleDesc, i);
+
+		if (attr->attlen == -1 && attr->attstorage != TYPSTORAGE_PLAIN)
+		{
+			toast_attrs = bms_add_member(toast_attrs, attr->attnum - 1);
+		}
+	}
+
+	ret = bms_intersect(*reference_attrs, toast_attrs);
+	bms_free(toast_attrs);
+	return ret;
+}
 
 /*
  * TupleTableSlotOps implementations.
@@ -1812,12 +1838,27 @@ void
 ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
 					  TupleDesc tupledesc, const TupleTableSlotOps *tts_ops)
 {
+	Scan	   *splan = (Scan *) scanstate->ps.plan;
+
 	scanstate->ss_ScanTupleSlot = ExecAllocTableSlot(&estate->es_tupleTable,
 													 tupledesc, tts_ops);
 	scanstate->ps.scandesc = tupledesc;
 	scanstate->ps.scanopsfixed = tupledesc != NULL;
 	scanstate->ps.scanops = tts_ops;
 	scanstate->ps.scanopsset = true;
+
+	if (IsA(splan, SeqScan) ||
+		IsA(splan, SampleScan) ||
+		IsA(splan, IndexScan) ||
+		IsA(splan, IndexOnlyScan) ||
+		IsA(splan, BitmapIndexScan) ||
+		IsA(splan, BitmapHeapScan) ||
+		IsA(splan, TidScan) ||
+		IsA(splan, SubqueryScan))
+	{
+		scanstate->ps.ps_ExprContext->scan_detoast_attrs =
+			trim_untoast_attrs(&splan->reference_attrs, tupledesc);
+	}
 }
 
 /* ----------------
@@ -2337,4 +2378,19 @@ end_tup_output(TupOutputState *tstate)
 	/* note that destroying the dest is not ours to do */
 	ExecDropSingleTupleTableSlot(tstate->slot);
 	pfree(tstate);
+}
+
+void
+ExecSetInnerOuterSlotRefAttrs(PlanState *joinstate)
+{
+	Join	   *join = (Join *) joinstate->plan;
+	PlanState  *outerstate = outerPlanState(joinstate);
+	PlanState  *innerstate = innerPlanState(joinstate);
+	ExprContext *econtext = joinstate->ps_ExprContext;
+
+	econtext->outer_detoast_attrs = trim_untoast_attrs(
+													   &join->outer_reference_attrs, outerstate->ps_ResultTupleDesc);
+
+	econtext->inner_detoast_attrs = trim_untoast_attrs(
+													   &join->inner_reference_attrs, innerstate->ps_ResultTupleDesc);
 }

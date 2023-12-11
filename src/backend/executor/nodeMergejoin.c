@@ -653,6 +653,7 @@ ExecMergeJoin(PlanState *pstate)
 			case EXEC_MJ_INITIALIZE_OUTER:
 				MJ_printf("ExecMergeJoin: EXEC_MJ_INITIALIZE_OUTER\n");
 
+				MemoryContextResetConditional(econtext->ecxt_per_outer_memory);
 				outerTupleSlot = ExecProcNode(outerPlan);
 				node->mj_OuterTupleSlot = outerTupleSlot;
 
@@ -701,6 +702,10 @@ ExecMergeJoin(PlanState *pstate)
 			case EXEC_MJ_INITIALIZE_INNER:
 				MJ_printf("ExecMergeJoin: EXEC_MJ_INITIALIZE_INNER\n");
 
+				/*
+				 *
+				 * MemoryContextResetConditional(econtext->ecxt_per_inner_memory);
+				 */
 				innerTupleSlot = ExecProcNode(innerPlan);
 				node->mj_InnerTupleSlot = innerTupleSlot;
 
@@ -876,6 +881,11 @@ ExecMergeJoin(PlanState *pstate)
 				 * NB: must NOT do "extraMarks" here, since we may need to
 				 * return to previously marked tuples.
 				 */
+
+				/*
+				 *
+				 * MemoryContextResetConditional(econtext->ecxt_per_inner_memory);
+				 */
 				innerTupleSlot = ExecProcNode(innerPlan);
 				node->mj_InnerTupleSlot = innerTupleSlot;
 				MJ_DEBUG_PROC_NODE(innerTupleSlot);
@@ -972,6 +982,7 @@ ExecMergeJoin(PlanState *pstate)
 				/*
 				 * now we get the next outer tuple, if any
 				 */
+				MemoryContextResetConditional(econtext->ecxt_per_outer_memory);
 				outerTupleSlot = ExecProcNode(outerPlan);
 				node->mj_OuterTupleSlot = outerTupleSlot;
 				MJ_DEBUG_PROC_NODE(outerTupleSlot);
@@ -1234,6 +1245,7 @@ ExecMergeJoin(PlanState *pstate)
 				/*
 				 * now we get the next outer tuple, if any
 				 */
+				MemoryContextResetConditional(econtext->ecxt_per_outer_memory);
 				outerTupleSlot = ExecProcNode(outerPlan);
 				node->mj_OuterTupleSlot = outerTupleSlot;
 				MJ_DEBUG_PROC_NODE(outerTupleSlot);
@@ -1299,6 +1311,11 @@ ExecMergeJoin(PlanState *pstate)
 
 				/*
 				 * now we get the next inner tuple, if any
+				 */
+
+				/*
+				 *
+				 * MemoryContextResetConditional(econtext->ecxt_per_inner_memory);
 				 */
 				innerTupleSlot = ExecProcNode(innerPlan);
 				node->mj_InnerTupleSlot = innerTupleSlot;
@@ -1370,6 +1387,11 @@ ExecMergeJoin(PlanState *pstate)
 				/*
 				 * now we get the next inner tuple, if any
 				 */
+
+				/*
+				 *
+				 * MemoryContextResetConditional(econtext->ecxt_per_inner_memory);
+				 */
 				innerTupleSlot = ExecProcNode(innerPlan);
 				node->mj_InnerTupleSlot = innerTupleSlot;
 				MJ_DEBUG_PROC_NODE(innerTupleSlot);
@@ -1412,6 +1434,7 @@ ExecMergeJoin(PlanState *pstate)
 				/*
 				 * now we get the next outer tuple, if any
 				 */
+				MemoryContextResetConditional(econtext->ecxt_per_outer_memory);
 				outerTupleSlot = ExecProcNode(outerPlan);
 				node->mj_OuterTupleSlot = outerTupleSlot;
 				MJ_DEBUG_PROC_NODE(outerTupleSlot);
@@ -1496,6 +1519,8 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 											  eflags :
 											  (eflags | EXEC_FLAG_MARK));
 	innerDesc = ExecGetResultType(innerPlanState(mergestate));
+
+	ExecSetInnerOuterSlotRefAttrs((PlanState *) mergestate);
 
 	/*
 	 * For certain types of inner child nodes, it is advantageous to issue

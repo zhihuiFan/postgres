@@ -181,9 +181,26 @@ static pg_attribute_always_inline void ExecAggPlainTransByRef(AggState *aggstate
 															  ExprContext *aggcontext,
 															  int setno);
 
+static inline void
+ExecSaveDetoastValue(TupleTableSlot *slot, Bitmapset *detoast_attrs,
+					 int attnum, MemoryContext parent, MemoryContext *under_ctx)
+{
+	MemoryContext old;
+
+	if (!bms_is_member(attnum, detoast_attrs) || slot->tts_isnull[attnum])
+		return;
+
+	if (*under_ctx == NULL)
+		*under_ctx = AllocSetContextCreate(parent, "detoastCtx", ALLOCSET_SMALL_SIZES);
+
+	old = MemoryContextSwitchTo(*under_ctx);
+	slot->tts_values[attnum] = PointerGetDatum(PG_DETOAST_DATUM(slot->tts_values[attnum]));
+	MemoryContextSwitchTo(old);
+}
+
 /*
- * ScalarArrayOpExprHashEntry
- * 		Hash table entry type used during EEOP_HASHED_SCALARARRAYOP
+ * Scalararrayopexprhashentry
+ *		Hash table entry type used during EEOP_HASHED_SCALARARRAYOP
  */
 typedef struct ScalarArrayOpExprHashEntry
 {
@@ -567,6 +584,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * have an Assert to check that that did happen.
 			 */
 			Assert(attnum >= 0 && attnum < innerslot->tts_nvalid);
+			ExecSaveDetoastValue(innerslot, econtext->inner_detoast_attrs,
+								 attnum, econtext->ecxt_per_query_memory,
+								 &econtext->ecxt_per_inner_memory);
+
 			*op->resvalue = innerslot->tts_values[attnum];
 			*op->resnull = innerslot->tts_isnull[attnum];
 
@@ -580,6 +601,10 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			/* See EEOP_INNER_VAR comments */
 
 			Assert(attnum >= 0 && attnum < outerslot->tts_nvalid);
+			ExecSaveDetoastValue(outerslot, econtext->outer_detoast_attrs,
+								 attnum, econtext->ecxt_per_query_memory,
+								 &econtext->ecxt_per_outer_memory);
+
 			*op->resvalue = outerslot->tts_values[attnum];
 			*op->resnull = outerslot->tts_isnull[attnum];
 
@@ -593,6 +618,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			/* See EEOP_INNER_VAR comments */
 
 			Assert(attnum >= 0 && attnum < scanslot->tts_nvalid);
+			ExecSaveDetoastValue(scanslot, econtext->scan_detoast_attrs,
+								 attnum, econtext->ecxt_per_query_memory,
+								 &econtext->ecxt_per_outer_memory);
 			*op->resvalue = scanslot->tts_values[attnum];
 			*op->resnull = scanslot->tts_isnull[attnum];
 

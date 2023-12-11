@@ -178,6 +178,7 @@ ExecScan(ScanState *node,
 	if (!qual && !projInfo)
 	{
 		ResetExprContext(econtext);
+		MemoryContextResetConditional(econtext->ecxt_per_outer_memory);
 		return ExecScanFetch(node, accessMtd, recheckMtd);
 	}
 
@@ -195,6 +196,7 @@ ExecScan(ScanState *node,
 	{
 		TupleTableSlot *slot;
 
+		MemoryContextResetConditional(econtext->ecxt_per_outer_memory);
 		slot = ExecScanFetch(node, accessMtd, recheckMtd);
 
 		/*

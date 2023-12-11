@@ -315,6 +315,7 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 						 (outerNode->plan->startup_cost < hashNode->ps.plan->total_cost &&
 						  !node->hj_OuterNotEmpty))
 				{
+					MemoryContextResetConditional(econtext->ecxt_per_outer_memory);
 					node->hj_FirstOuterTupleSlot = ExecProcNode(outerNode);
 					if (TupIsNull(node->hj_FirstOuterTupleSlot))
 					{
@@ -422,6 +423,8 @@ ExecHashJoinImpl(PlanState *pstate, bool parallel)
 				/* FALL THRU */
 
 			case HJ_NEED_NEW_OUTER:
+
+				MemoryContextResetConditional(econtext->ecxt_per_outer_memory);
 
 				/*
 				 * We don't have an outer tuple, try to get the next one
@@ -762,6 +765,8 @@ ExecInitHashJoin(HashJoin *node, EState *estate, int eflags)
 	ExecInitResultTupleSlotTL(&hjstate->js.ps, &TTSOpsVirtual);
 	ExecAssignProjectionInfo(&hjstate->js.ps, NULL);
 
+	ExecSetInnerOuterSlotRefAttrs((PlanState *) hjstate);
+
 	/*
 	 * tuple table initialization
 	 */
@@ -906,6 +911,7 @@ ExecHashJoinOuterGetTuple(PlanState *outerNode,
 			hjstate->hj_FirstOuterTupleSlot = NULL;
 		else
 			slot = ExecProcNode(outerNode);
+
 
 		while (!TupIsNull(slot))
 		{

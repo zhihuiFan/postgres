@@ -179,4 +179,11 @@ extern MemoryContext GenerationContextCreate(MemoryContext parent,
 #define SLAB_DEFAULT_BLOCK_SIZE		(8 * 1024)
 #define SLAB_LARGE_BLOCK_SIZE		(8 * 1024 * 1024)
 
+static inline void
+MemoryContextResetConditional(MemoryContext context)
+{
+	if (context == NULL)
+		return;
+	MemoryContextReset(context);
+}
 #endif							/* MEMUTILS_H */
