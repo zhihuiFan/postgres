@@ -57,6 +57,7 @@
 #include "postgres.h"
 
 #include "access/heaptoast.h"
+#include "access/detoast.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "executor/execExpr.h"
@@ -182,20 +183,22 @@ static pg_attribute_always_inline void ExecAggPlainTransByRef(AggState *aggstate
 															  int setno);
 
 static inline void
-ExecSaveDetoastValue(TupleTableSlot *slot, Bitmapset *detoast_attrs,
-					 int attnum, MemoryContext parent, MemoryContext *under_ctx)
+ExecEvalToastVar(TupleTableSlot *slot,
+				 ExprEvalStep *op,
+				 int attnum,
+				 MemoryContext ctx)
 {
-	MemoryContext old;
+	if (!slot->tts_isnull[attnum] && VARATT_IS_EXTENDED(slot->tts_values[attnum]))
+	{
+		MemoryContext old = MemoryContextSwitchTo(ctx);
 
-	if (!bms_is_member(attnum, detoast_attrs) || slot->tts_isnull[attnum])
-		return;
+		slot->tts_values[attnum] = PointerGetDatum(detoast_attr(
+																(struct varlena *) slot->tts_values[attnum]));
+		MemoryContextSwitchTo(old);
+	}
 
-	if (*under_ctx == NULL)
-		*under_ctx = AllocSetContextCreate(parent, "detoastCtx", ALLOCSET_SMALL_SIZES);
-
-	old = MemoryContextSwitchTo(*under_ctx);
-	slot->tts_values[attnum] = PointerGetDatum(PG_DETOAST_DATUM(slot->tts_values[attnum]));
-	MemoryContextSwitchTo(old);
+	*op->resvalue = slot->tts_values[attnum];
+	*op->resnull = slot->tts_isnull[attnum];
 }
 
 /*
@@ -347,6 +350,7 @@ ExecReadyInterpretedExpr(ExprState *state)
 			state->evalfunc_private = (void *) ExecJustConst;
 			return;
 		}
+		/* ???? */
 		else if (step0 == EEOP_INNER_VAR)
 		{
 			state->evalfunc_private = (void *) ExecJustInnerVarVirt;
@@ -429,6 +433,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_INNER_VAR,
 		&&CASE_EEOP_OUTER_VAR,
 		&&CASE_EEOP_SCAN_VAR,
+		&&CASE_EEOP_INNER_VAR_TOAST,
+		&&CASE_EEOP_OUTER_VAR_TOAST,
+		&&CASE_EEOP_SCAN_VAR_TOAST,
 		&&CASE_EEOP_INNER_SYSVAR,
 		&&CASE_EEOP_OUTER_SYSVAR,
 		&&CASE_EEOP_SCAN_SYSVAR,
@@ -584,10 +591,6 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * have an Assert to check that that did happen.
 			 */
 			Assert(attnum >= 0 && attnum < innerslot->tts_nvalid);
-			ExecSaveDetoastValue(innerslot, econtext->inner_detoast_attrs,
-								 attnum, econtext->ecxt_per_query_memory,
-								 &econtext->ecxt_per_inner_memory);
-
 			*op->resvalue = innerslot->tts_values[attnum];
 			*op->resnull = innerslot->tts_isnull[attnum];
 
@@ -601,10 +604,6 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			/* See EEOP_INNER_VAR comments */
 
 			Assert(attnum >= 0 && attnum < outerslot->tts_nvalid);
-			ExecSaveDetoastValue(outerslot, econtext->outer_detoast_attrs,
-								 attnum, econtext->ecxt_per_query_memory,
-								 &econtext->ecxt_per_outer_memory);
-
 			*op->resvalue = outerslot->tts_values[attnum];
 			*op->resnull = outerslot->tts_isnull[attnum];
 
@@ -618,12 +617,29 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			/* See EEOP_INNER_VAR comments */
 
 			Assert(attnum >= 0 && attnum < scanslot->tts_nvalid);
-			ExecSaveDetoastValue(scanslot, econtext->scan_detoast_attrs,
-								 attnum, econtext->ecxt_per_query_memory,
-								 &econtext->ecxt_per_outer_memory);
 			*op->resvalue = scanslot->tts_values[attnum];
 			*op->resnull = scanslot->tts_isnull[attnum];
+			EEO_NEXT();
+		}
 
+		EEO_CASE(EEOP_INNER_VAR_TOAST)
+		{
+			ExecEvalToastVar(innerslot, op, op->d.var.attnum,
+							 econtext->ecxt_per_inner_memory);
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_OUTER_VAR_TOAST)
+		{
+			ExecEvalToastVar(outerslot, op, op->d.var.attnum,
+							 econtext->ecxt_per_outer_memory);
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_SCAN_VAR_TOAST)
+		{
+			ExecEvalToastVar(scanslot, op, op->d.var.attnum,
+							 econtext->ecxt_per_outer_memory);
 			EEO_NEXT();
 		}
 

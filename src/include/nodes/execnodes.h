@@ -1482,6 +1482,7 @@ typedef struct ScanState
 	Relation	ss_currentRelation;
 	struct TableScanDescData *ss_currentScanDesc;
 	TupleTableSlot *ss_ScanTupleSlot;
+	Bitmapset  *scan_reference_attrs;
 } ScanState;
 
 /* ----------------
@@ -2011,6 +2012,8 @@ typedef struct JoinState
 	bool		single_match;	/* True if we should skip to next outer tuple
 								 * after finding one inner match */
 	ExprState  *joinqual;		/* JOIN quals (in addition to ps.qual) */
+	Bitmapset  *outer_reference_attrs;
+	Bitmapset  *inner_reference_attrs;
 } JoinState;
 
 /* ----------------

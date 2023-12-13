@@ -87,6 +87,9 @@ const TupleTableSlotOps TTSOpsMinimalTuple;
 const TupleTableSlotOps TTSOpsBufferHeapTuple;
 
 
+/*
+ * XXX: why '**' for reference_attrs.
+ */
 static Bitmapset *
 trim_untoast_attrs(Bitmapset **reference_attrs, TupleDesc tupleDesc)
 {
@@ -96,6 +99,9 @@ trim_untoast_attrs(Bitmapset **reference_attrs, TupleDesc tupleDesc)
 
 	if (*reference_attrs == NULL)
 		return NULL;
+
+	/* can I? */
+	Assert(tupleDesc != NULL);
 
 	for (i = 0; i < tupleDesc->natts; i++)
 	{
@@ -1847,17 +1853,17 @@ ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
 	scanstate->ps.scanops = tts_ops;
 	scanstate->ps.scanopsset = true;
 
-	if (IsA(splan, SeqScan) ||
-		IsA(splan, SampleScan) ||
-		IsA(splan, IndexScan) ||
-		IsA(splan, IndexOnlyScan) ||
-		IsA(splan, BitmapIndexScan) ||
-		IsA(splan, BitmapHeapScan) ||
-		IsA(splan, TidScan) ||
-		IsA(splan, SubqueryScan))
+	if (is_scan_plan((Plan *) splan))
 	{
-		scanstate->ps.ps_ExprContext->scan_detoast_attrs =
+		ExprContext *econtext = scanstate->ps.ps_ExprContext;
+
+		scanstate->scan_reference_attrs =
 			trim_untoast_attrs(&splan->reference_attrs, tupledesc);
+
+		if (!bms_is_empty(scanstate->scan_reference_attrs))
+			econtext->ecxt_per_outer_memory = AllocSetContextCreate(econtext->ecxt_per_query_memory,
+																	"detoastCtx",
+																	ALLOCSET_SMALL_SIZES);
 	}
 }
 
@@ -2386,11 +2392,22 @@ ExecSetInnerOuterSlotRefAttrs(PlanState *joinstate)
 	Join	   *join = (Join *) joinstate->plan;
 	PlanState  *outerstate = outerPlanState(joinstate);
 	PlanState  *innerstate = innerPlanState(joinstate);
+	JoinState  *j = (JoinState *) joinstate;
 	ExprContext *econtext = joinstate->ps_ExprContext;
 
-	econtext->outer_detoast_attrs = trim_untoast_attrs(
-													   &join->outer_reference_attrs, outerstate->ps_ResultTupleDesc);
 
-	econtext->inner_detoast_attrs = trim_untoast_attrs(
-													   &join->inner_reference_attrs, innerstate->ps_ResultTupleDesc);
+	j->outer_reference_attrs = trim_untoast_attrs(&join->outer_reference_attrs,
+												  outerstate->ps_ResultTupleDesc);
+
+	j->inner_reference_attrs = trim_untoast_attrs(&join->inner_reference_attrs,
+												  innerstate->ps_ResultTupleDesc);
+
+	if (!bms_is_empty(j->outer_reference_attrs))
+		econtext->ecxt_per_outer_memory = AllocSetContextCreate(econtext->ecxt_per_query_memory,
+																"detoastCtx",
+																ALLOCSET_SMALL_SIZES);
+	if (!bms_is_empty(j->inner_reference_attrs))
+		econtext->ecxt_per_inner_memory = AllocSetContextCreate(econtext->ecxt_per_query_memory,
+																"detoastCtx",
+																ALLOCSET_SMALL_SIZES);
 }

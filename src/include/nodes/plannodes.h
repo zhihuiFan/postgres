@@ -1598,4 +1598,24 @@ typedef enum MonotonicFunction
 	MONOTONICFUNC_BOTH = MONOTONICFUNC_INCREASING | MONOTONICFUNC_DECREASING,
 } MonotonicFunction;
 
+static inline bool
+is_join_plan(Plan *plan)
+{
+	return (plan != NULL) && (IsA(plan, NestLoop) || IsA(plan, HashJoin) || IsA(plan, MergeJoin));
+}
+
+static inline bool
+is_scan_plan(Plan *plan)
+{
+	return (plan != NULL) &&
+		(IsA(plan, SeqScan) ||
+		 IsA(plan, SampleScan) ||
+		 IsA(plan, IndexScan) ||
+		 IsA(plan, IndexOnlyScan) ||
+		 IsA(plan, BitmapIndexScan) ||
+		 IsA(plan, BitmapHeapScan) ||
+		 IsA(plan, TidScan) ||
+		 IsA(plan, SubqueryScan));
+}
+
 #endif							/* PLANNODES_H */
