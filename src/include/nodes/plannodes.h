@@ -169,6 +169,13 @@ typedef struct Plan
 	 */
 	Bitmapset  *extParam;
 	Bitmapset  *allParam;
+
+	/*
+	 * The final targetlist as a input of SMALL_TLIST node(Sort / Hash and so
+	 * on) Note: it may contain some nodes which doesn't belong to current
+	 * plan.
+	 */
+	List	   *small_tlist;
 } Plan;
 
 /* ----------------
@@ -385,6 +392,7 @@ typedef struct Scan
 
 	Plan		plan;
 	Index		scanrelid;		/* relid is index into the range table */
+	Bitmapset  *reference_attrs;
 } Scan;
 
 /* ----------------
@@ -789,6 +797,8 @@ typedef struct Join
 	JoinType	jointype;
 	bool		inner_unique;
 	List	   *joinqual;		/* JOIN quals (in addition to plan.qual) */
+	Bitmapset  *outer_reference_attrs;
+	Bitmapset  *inner_reference_attrs;
 } Join;
 
 /* ----------------
@@ -1587,5 +1597,25 @@ typedef enum MonotonicFunction
 	MONOTONICFUNC_DECREASING = (1 << 1),
 	MONOTONICFUNC_BOTH = MONOTONICFUNC_INCREASING | MONOTONICFUNC_DECREASING,
 } MonotonicFunction;
+
+static inline bool
+is_join_plan(Plan *plan)
+{
+	return (plan != NULL) && (IsA(plan, NestLoop) || IsA(plan, HashJoin) || IsA(plan, MergeJoin));
+}
+
+static inline bool
+is_scan_plan(Plan *plan)
+{
+	return (plan != NULL) &&
+		(IsA(plan, SeqScan) ||
+		 IsA(plan, SampleScan) ||
+		 IsA(plan, IndexScan) ||
+		 IsA(plan, IndexOnlyScan) ||
+		 IsA(plan, BitmapIndexScan) ||
+		 IsA(plan, BitmapHeapScan) ||
+		 IsA(plan, TidScan) ||
+		 IsA(plan, SubqueryScan));
+}
 
 #endif							/* PLANNODES_H */

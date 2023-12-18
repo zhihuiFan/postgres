@@ -342,6 +342,7 @@ create_plan(PlannerInfo *root, Path *best_path)
 	/* Initialize this module's workspace in PlannerInfo */
 	root->curOuterRels = NULL;
 	root->curOuterParams = NIL;
+	root->curSmallTlist = NULL;
 
 	/* Recursively process the path tree, demanding the correct tlist result */
 	plan = create_plan_recurse(root, best_path, CP_EXACT_TLIST);
@@ -386,6 +387,7 @@ static Plan *
 create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 {
 	Plan	   *plan;
+	List	   *curSamllTlist = root->curSmallTlist;
 
 	/* Guard against stack overflow due to overly complex plans */
 	check_stack_depth();
@@ -546,6 +548,10 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 			break;
 	}
 
+	if (flags & CP_SMALL_TLIST)
+		root->curSmallTlist = plan->targetlist;
+
+	plan->small_tlist = curSamllTlist;
 	return plan;
 }
 

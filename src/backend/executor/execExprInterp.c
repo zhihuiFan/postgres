@@ -57,6 +57,7 @@
 #include "postgres.h"
 
 #include "access/heaptoast.h"
+#include "access/detoast.h"
 #include "catalog/pg_type.h"
 #include "commands/sequence.h"
 #include "executor/execExpr.h"
@@ -180,6 +181,26 @@ static pg_attribute_always_inline void ExecAggPlainTransByRef(AggState *aggstate
 															  AggStatePerGroup pergroup,
 															  ExprContext *aggcontext,
 															  int setno);
+
+static inline void
+ExecEvalToastVar(TupleTableSlot *slot,
+				 ExprEvalStep *op,
+				 int attnum,
+				 MemoryContext ctx)
+{
+	if (!slot->tts_isnull[attnum] && VARATT_IS_EXTENDED(slot->tts_values[attnum]))
+	{
+		MemoryContext old = MemoryContextSwitchTo(ctx);
+
+		slot->tts_values[attnum] = PointerGetDatum(detoast_attr(
+																(struct varlena *) slot->tts_values[attnum]));
+		slot->detoast_attrs = bms_add_member(slot->detoast_attrs, attnum);
+		MemoryContextSwitchTo(old);
+	}
+
+	*op->resvalue = slot->tts_values[attnum];
+	*op->resnull = slot->tts_isnull[attnum];
+}
 
 /*
  * ScalarArrayOpExprHashEntry
@@ -330,6 +351,7 @@ ExecReadyInterpretedExpr(ExprState *state)
 			state->evalfunc_private = (void *) ExecJustConst;
 			return;
 		}
+		/* ???? */
 		else if (step0 == EEOP_INNER_VAR)
 		{
 			state->evalfunc_private = (void *) ExecJustInnerVarVirt;
@@ -412,6 +434,9 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_INNER_VAR,
 		&&CASE_EEOP_OUTER_VAR,
 		&&CASE_EEOP_SCAN_VAR,
+		&&CASE_EEOP_INNER_VAR_TOAST,
+		&&CASE_EEOP_OUTER_VAR_TOAST,
+		&&CASE_EEOP_SCAN_VAR_TOAST,
 		&&CASE_EEOP_INNER_SYSVAR,
 		&&CASE_EEOP_OUTER_SYSVAR,
 		&&CASE_EEOP_SCAN_SYSVAR,
@@ -595,7 +620,27 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			Assert(attnum >= 0 && attnum < scanslot->tts_nvalid);
 			*op->resvalue = scanslot->tts_values[attnum];
 			*op->resnull = scanslot->tts_isnull[attnum];
+			EEO_NEXT();
+		}
 
+		EEO_CASE(EEOP_INNER_VAR_TOAST)
+		{
+			ExecEvalToastVar(innerslot, op, op->d.var.attnum,
+							 innerslot->tts_mcxt);
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_OUTER_VAR_TOAST)
+		{
+			ExecEvalToastVar(outerslot, op, op->d.var.attnum,
+							 outerslot->tts_mcxt);
+			EEO_NEXT();
+		}
+
+		EEO_CASE(EEOP_SCAN_VAR_TOAST)
+		{
+			ExecEvalToastVar(scanslot, op, op->d.var.attnum,
+							 scanslot->tts_mcxt);
 			EEO_NEXT();
 		}
 

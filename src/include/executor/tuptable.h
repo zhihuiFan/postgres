@@ -18,6 +18,7 @@
 #include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/tupdesc.h"
+#include "nodes/bitmapset.h"
 #include "storage/buf.h"
 
 /*----------
@@ -128,6 +129,8 @@ typedef struct TupleTableSlot
 	MemoryContext tts_mcxt;		/* slot itself is in this context */
 	ItemPointerData tts_tid;	/* stored tuple's tid */
 	Oid			tts_tableOid;	/* table oid of tuple */
+
+	Bitmapset  *detoast_attrs;
 } TupleTableSlot;
 
 /* routines for a TupleTableSlot implementation */
@@ -431,6 +434,16 @@ slot_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 static inline TupleTableSlot *
 ExecClearTuple(TupleTableSlot *slot)
 {
+	int			attnum = -1;
+
+	while ((attnum = bms_next_member(slot->detoast_attrs, attnum)) >= 0)
+	{
+		pfree((void *) slot->tts_values[attnum]);
+	}
+
+	bms_free(slot->detoast_attrs);
+	slot->detoast_attrs = NULL;
+
 	slot->tts_ops->clear(slot);
 
 	return slot;
@@ -449,6 +462,10 @@ ExecClearTuple(TupleTableSlot *slot)
 static inline void
 ExecMaterializeSlot(TupleTableSlot *slot)
 {
+	/*
+	 * XXX: detoast_attrs  doesn't dependent on any external storage, so
+	 * nothing need to be done here.
+	 */
 	slot->tts_ops->materialize(slot);
 }
 
@@ -460,6 +477,10 @@ ExecCopySlotHeapTuple(TupleTableSlot *slot)
 {
 	Assert(!TTS_EMPTY(slot));
 
+	/*
+	 * XXX: HeapTuple is built by tts_values, all the Datum in detoast_atttrs
+	 * is valid.
+	 */
 	return slot->tts_ops->copy_heap_tuple(slot);
 }
 
@@ -486,6 +507,26 @@ ExecCopySlot(TupleTableSlot *dstslot, TupleTableSlot *srcslot)
 
 	dstslot->tts_ops->copyslot(dstslot, srcslot);
 
+	if (dstslot->tts_nvalid == srcslot->tts_nvalid
+		&& !bms_is_empty(srcslot->detoast_attrs))
+	{
+		int			attnum = 0;
+		MemoryContext old = MemoryContextSwitchTo(dstslot->tts_mcxt);
+
+		dstslot->detoast_attrs = bms_copy(srcslot->detoast_attrs);
+
+		while ((attnum = bms_next_member(dstslot->detoast_attrs, attnum)) >= 0)
+		{
+			struct varlena *datum = (struct varlena *) srcslot->tts_values[attnum];
+			Size		len;
+
+			Assert(!VARATT_IS_EXTENDED(datum));
+			len = VARSIZE(datum);
+			dstslot->tts_values[attnum] = (Datum) palloc(len);
+			memcpy((void *) dstslot->tts_values[attnum], datum, len);
+		}
+		MemoryContextSwitchTo(old);
+	}
 	return dstslot;
 }
 
