@@ -951,6 +951,13 @@ ExecInitExprRec(Expr *node, ExprState *state,
 								bms_is_member(attnum,
 											  ((JoinState *) state->parent)->inner_reference_attrs))
 							{
+								/* debug purpose. */
+								if (!jit_enabled)
+								{
+									elog(INFO, "EEOP_INNER_VAR_TOAST at %s, attnum: %d",
+										 nodeToString(plan),
+										 attnum);
+								}
 								scratch.opcode = EEOP_INNER_VAR_TOAST;
 							}
 							else
@@ -963,6 +970,14 @@ ExecInitExprRec(Expr *node, ExprState *state,
 								bms_is_member(attnum,
 											  ((JoinState *) state->parent)->outer_reference_attrs))
 							{
+								/* debug purpose. */
+								if (!jit_enabled)
+								{
+									elog(INFO,
+										 "EEOP_OUTER_VAR_TOAST at %s, attnum: %d",
+										 nodeToString(plan),
+										 attnum);
+								}
 								scratch.opcode = EEOP_OUTER_VAR_TOAST;
 							}
 							else
@@ -976,6 +991,14 @@ ExecInitExprRec(Expr *node, ExprState *state,
 																	attnum,
 																	((ScanState *) state->parent)->scan_reference_attrs))
 							{
+								if (!jit_enabled)
+								{
+									elog(INFO,
+										 "EEOP_SCAN_VAR_TOAST: %s, scanId: %d, attnum: %d",
+										 nodeToString(plan),
+										 ((Scan *) plan)->scanrelid,
+										 attnum);
+								}
 								scratch.opcode = EEOP_SCAN_VAR_TOAST;
 							}
 							else

@@ -185,12 +185,11 @@ static pg_attribute_always_inline void ExecAggPlainTransByRef(AggState *aggstate
 static inline void
 ExecEvalToastVar(TupleTableSlot *slot,
 				 ExprEvalStep *op,
-				 int attnum,
-				 MemoryContext ctx)
+				 int attnum)
 {
 	if (!slot->tts_isnull[attnum] && VARATT_IS_EXTENDED(slot->tts_values[attnum]))
 	{
-		MemoryContext old = MemoryContextSwitchTo(ctx);
+		MemoryContext old = MemoryContextSwitchTo(slot->tts_mcxt);
 
 		slot->tts_values[attnum] = PointerGetDatum(detoast_attr(
 																(struct varlena *) slot->tts_values[attnum]));
@@ -625,22 +624,21 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 
 		EEO_CASE(EEOP_INNER_VAR_TOAST)
 		{
-			ExecEvalToastVar(innerslot, op, op->d.var.attnum,
-							 innerslot->tts_mcxt);
+			ExecEvalToastVar(innerslot, op, op->d.var.attnum);
 			EEO_NEXT();
 		}
 
 		EEO_CASE(EEOP_OUTER_VAR_TOAST)
 		{
-			ExecEvalToastVar(outerslot, op, op->d.var.attnum,
-							 outerslot->tts_mcxt);
+			ExecEvalToastVar(outerslot, op, op->d.var.attnum);
+
 			EEO_NEXT();
 		}
 
 		EEO_CASE(EEOP_SCAN_VAR_TOAST)
 		{
-			ExecEvalToastVar(scanslot, op, op->d.var.attnum,
-							 scanslot->tts_mcxt);
+			ExecEvalToastVar(scanslot, op, op->d.var.attnum);
+
 			EEO_NEXT();
 		}
 

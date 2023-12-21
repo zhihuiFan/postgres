@@ -307,6 +307,8 @@ ExecInitNestLoop(NestLoop *node, EState *estate, int eflags)
 	ExecInitResultTupleSlotTL(&nlstate->js.ps, &TTSOpsVirtual);
 	ExecAssignProjectionInfo(&nlstate->js.ps, NULL);
 
+	ExecSetInnerOuterSlotRefAttrs((PlanState *) nlstate);
+
 	/*
 	 * initialize child expressions
 	 */

@@ -102,7 +102,8 @@ typedef struct
 	Query	   *query;
 } flatten_rtes_walker_context;
 
-#define CONTEXT_LEVEL_SUB_RET(n) \
+
+#define CONTEXT_LEVEL_SUB_RET(n, ignore_level) \
 do { \
 	if (!ignore_level) \
 	{ \
@@ -2279,14 +2280,15 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 		if (var->varnosyn > 0)
 			var->varnosyn += context->rtoffset;
 
-		add_reference_attrs(context->scan_reference_attrs, var);
-		CONTEXT_LEVEL_SUB_RET(var);
+		if (context->level > 1)
+			add_reference_attrs(context->scan_reference_attrs, var);
+		CONTEXT_LEVEL_SUB_RET(var, ignore_level);
 	}
 	if (IsA(node, Param))
 	{
 		Node	   *n = fix_param_node(context->root, (Param *) node);
 
-		CONTEXT_LEVEL_SUB_RET(n);
+		CONTEXT_LEVEL_SUB_RET(n, ignore_level);
 	}
 	if (IsA(node, Aggref))
 	{
@@ -2300,7 +2302,7 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 			/* Make a copy of the Param for paranoia's sake */
 			Node	   *n = (Node *) copyObject(aggparam);
 
-			CONTEXT_LEVEL_SUB_RET(n);
+			CONTEXT_LEVEL_SUB_RET(n, ignore_level);
 		}
 		/* If no match, just fall through to process it normally */
 	}
@@ -2310,7 +2312,7 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 
 		Assert(!IS_SPECIAL_VARNO(cexpr->cvarno));
 		cexpr->cvarno += context->rtoffset;
-		CONTEXT_LEVEL_SUB_RET(cexpr);
+		CONTEXT_LEVEL_SUB_RET(cexpr, ignore_level);
 	}
 	if (IsA(node, PlaceHolderVar))
 	{
@@ -2320,7 +2322,7 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 		/* XXX can we assert something about phnullingrels? */
 		Node	   *n = fix_scan_expr_mutator((Node *) phv->phexpr, context);
 
-		CONTEXT_LEVEL_SUB_RET(n);
+		CONTEXT_LEVEL_SUB_RET(n, ignore_level);
 	}
 	if (IsA(node, AlternativeSubPlan))
 	{
@@ -2329,24 +2331,44 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 																	  context->num_exec),
 											  context);
 
-		CONTEXT_LEVEL_SUB_RET(n);
+		CONTEXT_LEVEL_SUB_RET(n, ignore_level);
 	}
 	fix_expr_common(context->root, node);
 	n = expression_tree_mutator(node, fix_scan_expr_mutator, (void *) context);
-	CONTEXT_LEVEL_SUB_RET(n);
+	CONTEXT_LEVEL_SUB_RET(n, ignore_level);
 }
 
 static bool
 fix_scan_expr_walker(Node *node, fix_scan_expr_context *context)
 {
+	bool		ignore_level,
+				ret;
+
 	if (node == NULL)
 		return false;
+	ignore_level = IsA(node, List) || IsA(node, TargetEntry);
+
+	if (!ignore_level)
+		context->level += 1;
+
+	if (context->level > 1 && IsA(node, Var))
+	{
+		Var		   *var = castNode(Var, node);
+
+		if (var->varno >= 0 && var->varattno > 0)
+			add_reference_attrs(context->scan_reference_attrs, var);
+	}
 	Assert(!(IsA(node, Var) && ((Var *) node)->varno == ROWID_VAR));
 	Assert(!IsA(node, PlaceHolderVar));
 	Assert(!IsA(node, AlternativeSubPlan));
 	fix_expr_common(context->root, node);
-	return expression_tree_walker(node, fix_scan_expr_walker,
-								  (void *) context);
+	ret = expression_tree_walker(node, fix_scan_expr_walker,
+								 (void *) context);
+
+	if (!ignore_level)
+		context->level -= 1;
+
+	return ret;
 }
 
 /*
@@ -3222,7 +3244,7 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 					/* only for toast version. varlen = -1? */
 					*outer_attrs = bms_add_member(*outer_attrs,
 												  newvar->varattno - 1);
-				CONTEXT_LEVEL_SUB_RET(newvar);
+				CONTEXT_LEVEL_SUB_RET(newvar, ignore_level);
 			}
 		}
 
@@ -3240,7 +3262,7 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 					/* only for toast type? */
 					*inner_attrs = bms_add_member(*inner_attrs,
 												  newvar->varattno - 1);
-				CONTEXT_LEVEL_SUB_RET(newvar);
+				CONTEXT_LEVEL_SUB_RET(newvar, ignore_level);
 			}
 		}
 
@@ -3278,7 +3300,7 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 					*inner_attrs = bms_add_member(*inner_attrs,
 												  newvar->varattno - 1);
 
-				CONTEXT_LEVEL_SUB_RET(newvar);
+				CONTEXT_LEVEL_SUB_RET(newvar, ignore_level);
 			}
 		}
 		if (context->inner_itlist && context->inner_itlist->has_ph_vars)
@@ -3294,14 +3316,14 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 					/* only for toast version. varlen = -1? */
 					*inner_attrs = bms_add_member(*inner_attrs,
 												  newvar->varattno - 1);
-				CONTEXT_LEVEL_SUB_RET(newvar);
+				CONTEXT_LEVEL_SUB_RET(newvar, ignore_level);
 			}
 		}
 
 		/* If not supplied by input plans, evaluate the contained expr */
 		/* XXX can we assert something about phnullingrels? */
 		ret_node = fix_join_expr_mutator((Node *) phv->phexpr, context);
-		CONTEXT_LEVEL_SUB_RET(ret_node);
+		CONTEXT_LEVEL_SUB_RET(ret_node, ignore_level);
 	}
 	/* Try matching more complex expressions too, if tlists have any */
 	if (context->outer_itlist && context->outer_itlist->has_non_vars)
@@ -3314,7 +3336,7 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 			if (outer_attrs && context->level > 1)
 				*outer_attrs = bms_add_member(*outer_attrs,
 											  newvar->varattno - 1);
-			CONTEXT_LEVEL_SUB_RET(newvar);
+			CONTEXT_LEVEL_SUB_RET(newvar, ignore_level);
 		}
 	}
 	if (context->inner_itlist && context->inner_itlist->has_non_vars)
@@ -3327,14 +3349,14 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 			if (inner_attrs && context->level > 1)
 				*inner_attrs = bms_add_member(*inner_attrs,
 											  newvar->varattno - 1);
-			CONTEXT_LEVEL_SUB_RET(newvar);
+			CONTEXT_LEVEL_SUB_RET(newvar, ignore_level);
 		}
 	}
 	/* Special cases (apply only AFTER failing to match to lower tlist) */
 	if (IsA(node, Param))
 	{
 		ret_node = fix_param_node(context->root, (Param *) node);
-		CONTEXT_LEVEL_SUB_RET(ret_node);
+		CONTEXT_LEVEL_SUB_RET(ret_node, ignore_level);
 	}
 	if (IsA(node, AlternativeSubPlan))
 	{
@@ -3342,13 +3364,13 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 																 (AlternativeSubPlan *) node,
 																 context->num_exec),
 										 context);
-		CONTEXT_LEVEL_SUB_RET(ret_node);
+		CONTEXT_LEVEL_SUB_RET(ret_node, ignore_level);
 	}
 	fix_expr_common(context->root, node);
 	ret_node = expression_tree_mutator(node,
 									   fix_join_expr_mutator,
 									   (void *) context);
-	CONTEXT_LEVEL_SUB_RET(ret_node);
+	CONTEXT_LEVEL_SUB_RET(ret_node, ignore_level);
 }
 
 /*
