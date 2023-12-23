@@ -183,14 +183,7 @@ static void set_upper_references(PlannerInfo *root, Plan *plan, int rtoffset);
 static void set_param_references(PlannerInfo *root, Plan *plan);
 static Node *convert_combining_aggrefs(Node *node, void *context);
 static void set_dummy_tlist_references(Plan *plan, int rtoffset);
-static void trim_shared_detoast_attrs(indexed_tlist *plan_itlist,
-									  Bitmapset *detoasted_attr,
-									  int varno);
-
 static indexed_tlist *build_tlist_index(List *tlist);
-static tlist_vinfo *search_indexed_tlist_for_varno_attr(indexed_tlist *itlist,
-														int varno,
-														int varattrno);
 static Var *search_indexed_tlist_for_var(Var *var,
 										 indexed_tlist *itlist,
 										 int newvarno,
@@ -668,6 +661,10 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->scan.plan.qual,
 								  rtoffset, NUM_EXEC_QUAL(plan),
 								  &splan->scan.reference_attrs);
+
+				splan->scan.plan.toast_attrs =
+					fix_scan_list(root, splan->scan.plan.toast_attrs,
+								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
 			}
 			break;
 		case T_SampleScan:
@@ -688,6 +685,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_expr(root, (Node *) splan->tablesample,
 								  rtoffset, 1,
 								  &splan->scan.reference_attrs);
+				splan->scan.plan.toast_attrs =
+					fix_scan_list(root, splan->scan.plan.toast_attrs,
+								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
 			}
 			break;
 		case T_IndexScan:
@@ -718,13 +718,22 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->indexorderbyorig =
 					fix_scan_list(root, splan->indexorderbyorig,
 								  rtoffset, NUM_EXEC_QUAL(plan), &splan->scan.reference_attrs);
+				splan->scan.plan.toast_attrs =
+					fix_scan_list(root, splan->scan.plan.toast_attrs,
+								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
 			}
 			break;
 		case T_IndexOnlyScan:
 			{
 				IndexOnlyScan *splan = (IndexOnlyScan *) plan;
 
+				splan->scan.plan.toast_attrs =
+					fix_scan_list(root, splan->scan.plan.toast_attrs,
+								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
+
 				return set_indexonlyscan_references(root, splan, rtoffset);
+
+
 			}
 			break;
 		case T_BitmapIndexScan:
@@ -742,6 +751,9 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->indexqualorig,
 								  rtoffset, NUM_EXEC_QUAL(plan),
 								  &splan->scan.reference_attrs);
+				splan->scan.plan.toast_attrs =
+					fix_scan_list(root, splan->scan.plan.toast_attrs,
+								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
 			}
 			break;
 		case T_BitmapHeapScan:
@@ -761,6 +773,10 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->bitmapqualorig,
 								  rtoffset, NUM_EXEC_QUAL(plan),
 								  &splan->scan.reference_attrs);
+				splan->scan.plan.toast_attrs =
+					fix_scan_list(root, splan->scan.plan.toast_attrs,
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  NULL);
 			}
 			break;
 		case T_TidScan:
@@ -780,6 +796,10 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->tidquals,
 								  rtoffset, 1,
 								  &splan->scan.reference_attrs);
+				splan->scan.plan.toast_attrs =
+					fix_scan_list(root, splan->scan.plan.toast_attrs,
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  NULL);
 			}
 			break;
 		case T_TidRangeScan:
@@ -799,10 +819,15 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->tidrangequals,
 								  rtoffset, 1,
 								  &splan->scan.reference_attrs);
+				splan->scan.plan.toast_attrs =
+					fix_scan_list(root, splan->scan.plan.toast_attrs,
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  NULL);
 			}
 			break;
 		case T_SubqueryScan:
 			/* Needs special treatment, see comments below */
+			/* XXX: shall I do anything? */
 			return set_subqueryscan_references(root,
 											   (SubqueryScan *) plan,
 											   rtoffset);
@@ -877,6 +902,10 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->scan.plan.qual,
 								  rtoffset, NUM_EXEC_QUAL(plan),
 								  &splan->scan.reference_attrs);
+				splan->scan.plan.toast_attrs =
+					fix_scan_list(root, splan->scan.plan.toast_attrs,
+								  rtoffset, NUM_EXEC_TLIST(plan),
+								  NULL);
 			}
 			break;
 		case T_NamedTuplestoreScan:
@@ -2257,7 +2286,7 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 	if (node == NULL)
 		return NULL;
 
-	ignore_level = IsA(node, List) || IsA(node, TargetEntry);
+	ignore_level = IsA(node, List) || IsA(node, TargetEntry) || IsA(node, NullTest);
 
 	if (!ignore_level)
 		context->level++;
@@ -2346,7 +2375,8 @@ fix_scan_expr_walker(Node *node, fix_scan_expr_context *context)
 
 	if (node == NULL)
 		return false;
-	ignore_level = IsA(node, List) || IsA(node, TargetEntry);
+
+	ignore_level = IsA(node, List) || IsA(node, TargetEntry) || IsA(node, NullTest);
 
 	if (!ignore_level)
 		context->level += 1;
@@ -2517,16 +2547,14 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 									&join->outer_reference_attrs,
 									&join->inner_reference_attrs);
 
-	if (join->plan.small_tlist)
-	{
-		indexed_tlist *plan_itlist = build_tlist_index(join->plan.small_tlist);
-
-		trim_shared_detoast_attrs(plan_itlist, join->outer_reference_attrs, OUTER_VAR);
-		trim_shared_detoast_attrs(plan_itlist, join->inner_reference_attrs, INNER_VAR);
-		pfree(plan_itlist);
-	}
 	pfree(outer_itlist);
 	pfree(inner_itlist);
+	join->plan.toast_attrs = fix_join_expr(root, join->plan.toast_attrs, outer_itlist, inner_itlist,
+										   (Index) 0, rtoffset,
+										   (join->jointype == JOIN_INNER ? NRM_EQUAL : NRM_SUPERSET),
+										   NUM_EXEC_TLIST((Plan *) join),
+										   NULL,
+										   NULL);
 }
 
 /*
@@ -2790,19 +2818,6 @@ set_dummy_tlist_references(Plan *plan, int rtoffset)
 	/* We don't touch plan->qual here */
 }
 
-static void
-trim_shared_detoast_attrs(indexed_tlist *plan_itlist,
-						  Bitmapset *detoasted_attr,
-						  int varno)
-{
-	int			i = -1;
-
-	while ((i = bms_next_member(detoasted_attr, i)) >= 0)
-	{
-		if (search_indexed_tlist_for_varno_attr(plan_itlist, varno, i + 1))
-			detoasted_attr = bms_del_member(detoasted_attr, i);
-	}
-}
 
 /*
  * build_tlist_index --- build an index data structure for a child tlist
@@ -2910,25 +2925,6 @@ build_tlist_index_other_vars(List *tlist, int ignore_rel)
 	itlist->num_vars = (vinfo - itlist->vars);
 
 	return itlist;
-}
-
-/*
- * search_indexed_tlist_for_varno_attr -- find the vinfo for the given varno/attrno.
- */
-static tlist_vinfo *
-search_indexed_tlist_for_varno_attr(indexed_tlist *itlist,
-									int varno,
-									int varattrno)
-{
-	tlist_vinfo *vinfo = itlist->vars;
-	int			i = itlist->num_vars;
-
-	while (i-- > 0)
-	{
-		if (vinfo->varno == varno && vinfo->varattno == varattrno)
-			return vinfo;
-	}
-	return NULL;
 }
 
 /*
@@ -3223,9 +3219,11 @@ fix_join_expr_mutator(Node *node, fix_join_expr_context *context)
 	if (node == NULL)
 		return NULL;
 
-	ignore_level = IsA(node, List) || IsA(node, TargetEntry);
+	ignore_level = IsA(node, List) || IsA(node, TargetEntry) || IsA(node, NullTest);
+
 	if (!ignore_level)
 		context->level++;
+
 	if (IsA(node, Var))
 	{
 		Var		   *var = (Var *) node;

@@ -342,7 +342,6 @@ create_plan(PlannerInfo *root, Path *best_path)
 	/* Initialize this module's workspace in PlannerInfo */
 	root->curOuterRels = NULL;
 	root->curOuterParams = NIL;
-	root->curSmallTlist = NULL;
 
 	/* Recursively process the path tree, demanding the correct tlist result */
 	plan = create_plan_recurse(root, best_path, CP_EXACT_TLIST);
@@ -379,15 +378,58 @@ create_plan(PlannerInfo *root, Path *best_path)
 	return plan;
 }
 
+static void
+set_plan_toast_attrs(Plan *plan, List *recheck_list)
+{
+	ListCell   *lc;
+	Var		   *var;
+
+	foreach(lc, plan->targetlist)
+	{
+		TargetEntry *te = lfirst_node(TargetEntry, lc);
+
+		if (!IsA(te->expr, Var))
+			continue;
+		var = castNode(Var, te->expr);
+		if (var->varattno <= 0)
+			continue;
+		if (recheck_list == NIL || list_member(recheck_list, var))
+			plan->toast_attrs = lappend(plan->toast_attrs, var);
+	}
+}
+
+
+
+static void
+set_plan_toast_attrs_recurse(Plan *plan, List *existing_toast_attrs)
+{
+	if (plan == NULL)
+		return;
+
+	set_plan_toast_attrs(plan, existing_toast_attrs);
+
+	/*
+	 * upper node, append, mergeappend, bitmapand, bitmapor, sort, groupby,
+	 * windowagg.
+	 */
+	if (IsA(plan, Sort) || IsA(plan, Memoize) || IsA(plan, Hash))
+		set_plan_toast_attrs_recurse(plan->lefttree, plan->lefttree->targetlist);
+	else
+	{
+		set_plan_toast_attrs_recurse(plan->lefttree, plan->toast_attrs);
+		set_plan_toast_attrs_recurse(plan->righttree, plan->toast_attrs);
+	}
+}
+
+
 /*
  * create_plan_recurse
  *	  Recursive guts of create_plan().
  */
 static Plan *
-create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
+create_plan_recurse_old(PlannerInfo *root, Path *best_path, int flags)
 {
 	Plan	   *plan;
-	List	   *curSamllTlist = root->curSmallTlist;
 
 	/* Guard against stack overflow due to overly complex plans */
 	check_stack_depth();
@@ -548,10 +590,15 @@ create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 			break;
 	}
 
-	if (flags & CP_SMALL_TLIST)
-		root->curSmallTlist = plan->targetlist;
+	return plan;
+}
 
-	plan->small_tlist = curSamllTlist;
+static Plan *
+create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
+{
+	Plan	   *plan = create_plan_recurse_old(root, best_path, flags);
+
+	set_plan_toast_attrs_recurse(plan, NIL);
 	return plan;
 }
 

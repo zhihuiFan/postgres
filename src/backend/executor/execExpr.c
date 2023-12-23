@@ -954,8 +954,11 @@ ExecInitExprRec(Expr *node, ExprState *state,
 								/* debug purpose. */
 								if (!jit_enabled)
 								{
-									elog(INFO, "EEOP_INNER_VAR_TOAST at %s, attnum: %d",
-										 nodeToString(plan),
+									elog(INFO,
+										 "EEOP_INNER_VAR_TOAST: flags = %d costs=%.2f..%.2f, attnum: %d",
+										 state->flags,
+										 plan->startup_cost,
+										 plan->total_cost,
 										 attnum);
 								}
 								scratch.opcode = EEOP_INNER_VAR_TOAST;
@@ -974,8 +977,10 @@ ExecInitExprRec(Expr *node, ExprState *state,
 								if (!jit_enabled)
 								{
 									elog(INFO,
-										 "EEOP_OUTER_VAR_TOAST at %s, attnum: %d",
-										 nodeToString(plan),
+										 "EEOP_OUTER_VAR_TOAST: flags = %u costs=%.2f..%.2f, attnum: %d",
+										 state->flags,
+										 plan->startup_cost,
+										 plan->total_cost,
 										 attnum);
 								}
 								scratch.opcode = EEOP_OUTER_VAR_TOAST;
@@ -994,8 +999,10 @@ ExecInitExprRec(Expr *node, ExprState *state,
 								if (!jit_enabled)
 								{
 									elog(INFO,
-										 "EEOP_SCAN_VAR_TOAST: %s, scanId: %d, attnum: %d",
-										 nodeToString(plan),
+										 "EEOP_SCAN_VAR_TOAST: flags = %u costs=%.2f..%.2f, scanId: %d, attnum: %d",
+										 state->flags,
+										 plan->startup_cost,
+										 plan->total_cost,
 										 ((Scan *) plan)->scanrelid,
 										 attnum);
 								}

@@ -78,8 +78,6 @@ static inline void tts_buffer_heap_store_tuple(TupleTableSlot *slot,
 											   Buffer buffer,
 											   bool transfer_pin);
 static void tts_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple, bool shouldFree);
-static Bitmapset *trim_untoast_attrs(Bitmapset **reference_attrs, TupleDesc tupleDesc);
-
 
 const TupleTableSlotOps TTSOpsVirtual;
 const TupleTableSlotOps TTSOpsHeapTuple;
@@ -87,34 +85,36 @@ const TupleTableSlotOps TTSOpsMinimalTuple;
 const TupleTableSlotOps TTSOpsBufferHeapTuple;
 
 
-/*
- * XXX: why '**' for reference_attrs.
- */
 static Bitmapset *
-trim_untoast_attrs(Bitmapset **reference_attrs, TupleDesc tupleDesc)
+collect_toast_attrs(TupleDesc tupleDesc)
 {
 	int			i;
-	Bitmapset  *toast_attrs = NULL,
-			   *ret;
-
-	if (*reference_attrs == NULL)
-		return NULL;
-
-	/* can I? */
-	Assert(tupleDesc != NULL);
+	Bitmapset  *toast_attrs = NULL;
 
 	for (i = 0; i < tupleDesc->natts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupleDesc, i);
 
 		if (attr->attlen == -1 && attr->attstorage != TYPSTORAGE_PLAIN)
-		{
 			toast_attrs = bms_add_member(toast_attrs, attr->attnum - 1);
-		}
 	}
 
-	ret = bms_intersect(*reference_attrs, toast_attrs);
-	bms_free(toast_attrs);
+	return toast_attrs;
+}
+
+static Bitmapset *
+collect_not_predetoast_attrs(List *l)
+{
+	Bitmapset  *ret = NULL;
+	ListCell   *lc;
+
+	foreach(lc, l)
+	{
+		/* PlaceHolderVar */
+		Var		   *var = lfirst_node(Var, lc);
+
+		ret = bms_add_member(ret, var->varattno - 1);
+	}
 	return ret;
 }
 
@@ -1865,8 +1865,15 @@ ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
 
 	if (is_scan_plan((Plan *) splan))
 	{
-		scanstate->scan_reference_attrs =
-			trim_untoast_attrs(&splan->reference_attrs, tupledesc);
+		Bitmapset  *toast_attrs = collect_toast_attrs(tupledesc);
+		Bitmapset  *must_not_pretoast = collect_not_predetoast_attrs(splan->plan.toast_attrs);
+
+		scanstate->scan_reference_attrs = bms_intersect(scanstate->scan_reference_attrs,
+														toast_attrs);
+		scanstate->scan_reference_attrs = bms_del_members(scanstate->scan_reference_attrs,
+														  must_not_pretoast);
+		bms_free(toast_attrs);
+		bms_free(must_not_pretoast);
 	}
 }
 
@@ -2392,14 +2399,23 @@ end_tup_output(TupOutputState *tstate)
 void
 ExecSetInnerOuterSlotRefAttrs(PlanState *joinstate)
 {
-	Join	   *join = (Join *) joinstate->plan;
 	PlanState  *outerstate = outerPlanState(joinstate);
 	PlanState  *innerstate = innerPlanState(joinstate);
 	JoinState  *j = (JoinState *) joinstate;
 
-	j->outer_reference_attrs = trim_untoast_attrs(&join->outer_reference_attrs,
-												  outerstate->ps_ResultTupleDesc);
+	Bitmapset  *toast_attrs = collect_toast_attrs(outerstate->ps_ResultTupleDesc);
+	Bitmapset  *must_not_pretoast = collect_not_predetoast_attrs(outerstate->plan->toast_attrs);
 
-	j->inner_reference_attrs = trim_untoast_attrs(&join->inner_reference_attrs,
-												  innerstate->ps_ResultTupleDesc);
+	j->outer_reference_attrs = bms_intersect(j->outer_reference_attrs, toast_attrs);
+	j->outer_reference_attrs = bms_del_members(j->outer_reference_attrs, must_not_pretoast);
+	bms_free(toast_attrs);
+	bms_free(must_not_pretoast);
+
+	toast_attrs = collect_toast_attrs(innerstate->ps_ResultTupleDesc);
+	must_not_pretoast = collect_not_predetoast_attrs(innerstate->plan->toast_attrs);
+
+	j->inner_reference_attrs = bms_intersect(j->inner_reference_attrs, toast_attrs);
+	j->inner_reference_attrs = bms_del_members(j->inner_reference_attrs, must_not_pretoast);
+	bms_free(toast_attrs);
+	bms_free(must_not_pretoast);
 }

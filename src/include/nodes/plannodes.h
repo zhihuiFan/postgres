@@ -170,12 +170,8 @@ typedef struct Plan
 	Bitmapset  *extParam;
 	Bitmapset  *allParam;
 
-	/*
-	 * The final targetlist as a input of SMALL_TLIST node(Sort / Hash and so
-	 * on) Note: it may contain some nodes which doesn't belong to current
-	 * plan.
-	 */
-	List	   *small_tlist;
+	/* The attrs can't use the shared detoast datum feature. */
+	List	   *toast_attrs;
 } Plan;
 
 /* ----------------
@@ -392,6 +388,11 @@ typedef struct Scan
 
 	Plan		plan;
 	Index		scanrelid;		/* relid is index into the range table */
+
+	/*
+	 * Records of var's varattno - 1 where the Var is accessed indirectly by
+	 * any expression, like a > 3.  However a IS [NOT] NULL is not included.
+	 */
 	Bitmapset  *reference_attrs;
 } Scan;
 
