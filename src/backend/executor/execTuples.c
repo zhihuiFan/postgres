@@ -110,7 +110,7 @@ collect_not_predetoast_attrs(List *l)
 
 	foreach(lc, l)
 	{
-		/* PlaceHolderVar */
+		/* XXX: PlaceHolderVar */
 		Var		   *var = lfirst_node(Var, lc);
 
 		ret = bms_add_member(ret, var->varattno - 1);
@@ -1865,10 +1865,12 @@ ExecInitScanTupleSlot(EState *estate, ScanState *scanstate,
 
 	if (is_scan_plan((Plan *) splan))
 	{
-		Bitmapset  *toast_attrs = collect_toast_attrs(tupledesc);
-		Bitmapset  *must_not_pretoast = collect_not_predetoast_attrs(splan->plan.toast_attrs);
+		/* XXX: output may be different from Relation's tupledesc. */
 
-		scanstate->scan_reference_attrs = bms_intersect(scanstate->scan_reference_attrs,
+		Bitmapset  *toast_attrs = collect_toast_attrs(tupledesc);
+		Bitmapset  *must_not_pretoast = collect_not_predetoast_attrs(splan->plan.forbid_pre_detoast_vars);
+
+		scanstate->scan_reference_attrs = bms_intersect(splan->reference_attrs,
 														toast_attrs);
 		scanstate->scan_reference_attrs = bms_del_members(scanstate->scan_reference_attrs,
 														  must_not_pretoast);
@@ -2397,25 +2399,27 @@ end_tup_output(TupOutputState *tstate)
 }
 
 void
-ExecSetInnerOuterSlotRefAttrs(PlanState *joinstate)
+ExecSetInnerOuterSlotRefAttrs(JoinState *j)
 {
-	PlanState  *outerstate = outerPlanState(joinstate);
-	PlanState  *innerstate = innerPlanState(joinstate);
-	JoinState  *j = (JoinState *) joinstate;
+	PlanState  *outerstate = outerPlanState(j);
+	PlanState  *innerstate = innerPlanState(j);
 
 	Bitmapset  *toast_attrs = collect_toast_attrs(outerstate->ps_ResultTupleDesc);
-	Bitmapset  *must_not_pretoast = collect_not_predetoast_attrs(outerstate->plan->toast_attrs);
+	Bitmapset  *must_not_pretoast = collect_not_predetoast_attrs(outerstate->plan->forbid_pre_detoast_vars);
 
-	j->outer_reference_attrs = bms_intersect(j->outer_reference_attrs, toast_attrs);
+	j->outer_reference_attrs = bms_intersect(((Join *) j->ps.plan)->outer_reference_attrs,
+											 toast_attrs);
 	j->outer_reference_attrs = bms_del_members(j->outer_reference_attrs, must_not_pretoast);
 	bms_free(toast_attrs);
 	bms_free(must_not_pretoast);
 
 	toast_attrs = collect_toast_attrs(innerstate->ps_ResultTupleDesc);
-	must_not_pretoast = collect_not_predetoast_attrs(innerstate->plan->toast_attrs);
+	must_not_pretoast = collect_not_predetoast_attrs(innerstate->plan->forbid_pre_detoast_vars);
 
-	j->inner_reference_attrs = bms_intersect(j->inner_reference_attrs, toast_attrs);
-	j->inner_reference_attrs = bms_del_members(j->inner_reference_attrs, must_not_pretoast);
+	j->inner_reference_attrs = bms_intersect(((Join *) j->ps.plan)->inner_reference_attrs,
+											 toast_attrs);
+	j->inner_reference_attrs = bms_del_members(j->inner_reference_attrs,
+											   must_not_pretoast);
 	bms_free(toast_attrs);
 	bms_free(must_not_pretoast);
 }

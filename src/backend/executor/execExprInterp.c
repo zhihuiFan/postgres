@@ -419,6 +419,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 	TupleTableSlot *resultslot;
 	TupleTableSlot *innerslot;
 	TupleTableSlot *outerslot;
+
 	TupleTableSlot *scanslot;
 
 	/*

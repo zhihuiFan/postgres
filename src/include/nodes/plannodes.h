@@ -170,8 +170,12 @@ typedef struct Plan
 	Bitmapset  *extParam;
 	Bitmapset  *allParam;
 
-	/* The attrs can't use the shared detoast datum feature. */
-	List	   *toast_attrs;
+	/*
+	 * A list of Vars which should apply the shared-detoast-datum feature
+	 * since the upper nodes like Sort/Hash want the tuples as small as
+	 * possible. Its a subset of targetlist.
+	 */
+	List	   *forbid_pre_detoast_vars;
 } Plan;
 
 /* ----------------
@@ -880,6 +884,8 @@ typedef struct HashJoin
 	 * perform lookups in the hashtable over the inner plan.
 	 */
 	List	   *hashkeys;
+
+	bool		left_small_tlist;
 } HashJoin;
 
 /* ----------------

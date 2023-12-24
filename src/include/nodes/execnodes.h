@@ -2767,5 +2767,5 @@ typedef struct LimitState
 	TupleTableSlot *last_slot;	/* slot for evaluation of ties */
 } LimitState;
 
-extern void ExecSetInnerOuterSlotRefAttrs(PlanState *joinstate);
+extern void ExecSetInnerOuterSlotRefAttrs(JoinState *joinstate);
 #endif							/* EXECNODES_H */

@@ -662,8 +662,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 								  rtoffset, NUM_EXEC_QUAL(plan),
 								  &splan->scan.reference_attrs);
 
-				splan->scan.plan.toast_attrs =
-					fix_scan_list(root, splan->scan.plan.toast_attrs,
+				splan->scan.plan.forbid_pre_detoast_vars =
+					fix_scan_list(root, splan->scan.plan.forbid_pre_detoast_vars,
 								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
 			}
 			break;
@@ -685,8 +685,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_expr(root, (Node *) splan->tablesample,
 								  rtoffset, 1,
 								  &splan->scan.reference_attrs);
-				splan->scan.plan.toast_attrs =
-					fix_scan_list(root, splan->scan.plan.toast_attrs,
+				splan->scan.plan.forbid_pre_detoast_vars =
+					fix_scan_list(root, splan->scan.plan.forbid_pre_detoast_vars,
 								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
 			}
 			break;
@@ -718,8 +718,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 				splan->indexorderbyorig =
 					fix_scan_list(root, splan->indexorderbyorig,
 								  rtoffset, NUM_EXEC_QUAL(plan), &splan->scan.reference_attrs);
-				splan->scan.plan.toast_attrs =
-					fix_scan_list(root, splan->scan.plan.toast_attrs,
+				splan->scan.plan.forbid_pre_detoast_vars =
+					fix_scan_list(root, splan->scan.plan.forbid_pre_detoast_vars,
 								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
 			}
 			break;
@@ -727,8 +727,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 			{
 				IndexOnlyScan *splan = (IndexOnlyScan *) plan;
 
-				splan->scan.plan.toast_attrs =
-					fix_scan_list(root, splan->scan.plan.toast_attrs,
+				splan->scan.plan.forbid_pre_detoast_vars =
+					fix_scan_list(root, splan->scan.plan.forbid_pre_detoast_vars,
 								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
 
 				return set_indexonlyscan_references(root, splan, rtoffset);
@@ -751,8 +751,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->indexqualorig,
 								  rtoffset, NUM_EXEC_QUAL(plan),
 								  &splan->scan.reference_attrs);
-				splan->scan.plan.toast_attrs =
-					fix_scan_list(root, splan->scan.plan.toast_attrs,
+				splan->scan.plan.forbid_pre_detoast_vars =
+					fix_scan_list(root, splan->scan.plan.forbid_pre_detoast_vars,
 								  rtoffset, NUM_EXEC_TLIST(plan), NULL);
 			}
 			break;
@@ -773,8 +773,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->bitmapqualorig,
 								  rtoffset, NUM_EXEC_QUAL(plan),
 								  &splan->scan.reference_attrs);
-				splan->scan.plan.toast_attrs =
-					fix_scan_list(root, splan->scan.plan.toast_attrs,
+				splan->scan.plan.forbid_pre_detoast_vars =
+					fix_scan_list(root, splan->scan.plan.forbid_pre_detoast_vars,
 								  rtoffset, NUM_EXEC_TLIST(plan),
 								  NULL);
 			}
@@ -796,8 +796,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->tidquals,
 								  rtoffset, 1,
 								  &splan->scan.reference_attrs);
-				splan->scan.plan.toast_attrs =
-					fix_scan_list(root, splan->scan.plan.toast_attrs,
+				splan->scan.plan.forbid_pre_detoast_vars =
+					fix_scan_list(root, splan->scan.plan.forbid_pre_detoast_vars,
 								  rtoffset, NUM_EXEC_TLIST(plan),
 								  NULL);
 			}
@@ -819,8 +819,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->tidrangequals,
 								  rtoffset, 1,
 								  &splan->scan.reference_attrs);
-				splan->scan.plan.toast_attrs =
-					fix_scan_list(root, splan->scan.plan.toast_attrs,
+				splan->scan.plan.forbid_pre_detoast_vars =
+					fix_scan_list(root, splan->scan.plan.forbid_pre_detoast_vars,
 								  rtoffset, NUM_EXEC_TLIST(plan),
 								  NULL);
 			}
@@ -902,8 +902,8 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->scan.plan.qual,
 								  rtoffset, NUM_EXEC_QUAL(plan),
 								  &splan->scan.reference_attrs);
-				splan->scan.plan.toast_attrs =
-					fix_scan_list(root, splan->scan.plan.toast_attrs,
+				splan->scan.plan.forbid_pre_detoast_vars =
+					fix_scan_list(root, splan->scan.plan.forbid_pre_detoast_vars,
 								  rtoffset, NUM_EXEC_TLIST(plan),
 								  NULL);
 			}
@@ -2547,14 +2547,18 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 									&join->outer_reference_attrs,
 									&join->inner_reference_attrs);
 
+	join->plan.forbid_pre_detoast_vars = fix_join_expr(root,
+													   join->plan.forbid_pre_detoast_vars,
+													   outer_itlist,
+													   inner_itlist,
+													   (Index) 0,
+													   rtoffset,
+													   (join->jointype == JOIN_INNER ? NRM_EQUAL : NRM_SUPERSET),
+													   NUM_EXEC_TLIST((Plan *) join),
+													   NULL,
+													   NULL);
 	pfree(outer_itlist);
 	pfree(inner_itlist);
-	join->plan.toast_attrs = fix_join_expr(root, join->plan.toast_attrs, outer_itlist, inner_itlist,
-										   (Index) 0, rtoffset,
-										   (join->jointype == JOIN_INNER ? NRM_EQUAL : NRM_SUPERSET),
-										   NUM_EXEC_TLIST((Plan *) join),
-										   NULL,
-										   NULL);
 }
 
 /*

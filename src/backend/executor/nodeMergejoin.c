@@ -1497,7 +1497,7 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 											  (eflags | EXEC_FLAG_MARK));
 	innerDesc = ExecGetResultType(innerPlanState(mergestate));
 
-	ExecSetInnerOuterSlotRefAttrs((PlanState *) mergestate);
+	ExecSetInnerOuterSlotRefAttrs((JoinState *) mergestate);
 
 	/*
 	 * For certain types of inner child nodes, it is advantageous to issue

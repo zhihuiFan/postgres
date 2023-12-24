@@ -314,7 +314,8 @@ static ModifyTable *make_modifytable(PlannerInfo *root, Plan *subplan,
 									 List *mergeActionLists, int epqParam);
 static GatherMerge *create_gather_merge_plan(PlannerInfo *root,
 											 GatherMergePath *best_path);
-
+static void set_plan_not_detoast_attrs_recurse(Plan *plan,
+											   List *recheck_list);
 
 /*
  * create_plan
@@ -345,6 +346,8 @@ create_plan(PlannerInfo *root, Path *best_path)
 
 	/* Recursively process the path tree, demanding the correct tlist result */
 	plan = create_plan_recurse(root, best_path, CP_EXACT_TLIST);
+
+	set_plan_not_detoast_attrs_recurse(plan, NIL);
 
 	/*
 	 * Make sure the topmost plan node's targetlist exposes the original
@@ -378,11 +381,21 @@ create_plan(PlannerInfo *root, Path *best_path)
 	return plan;
 }
 
+/*
+ * set_plan_not_pre_detoast_vars
+ *
+ *	set the toast_attrs according recheck_list.
+ *
+ * recheck_list = NIL means we need to do thing.
+ */
 static void
-set_plan_toast_attrs(Plan *plan, List *recheck_list)
+set_plan_not_pre_detoast_vars(Plan *plan, List *recheck_list)
 {
 	ListCell   *lc;
 	Var		   *var;
+
+	if (recheck_list == NIL)
+		return;
 
 	foreach(lc, plan->targetlist)
 	{
@@ -393,41 +406,49 @@ set_plan_toast_attrs(Plan *plan, List *recheck_list)
 		var = castNode(Var, te->expr);
 		if (var->varattno <= 0)
 			continue;
-		if (recheck_list == NIL || list_member(recheck_list, var))
-			plan->toast_attrs = lappend(plan->toast_attrs, var);
+		if (list_member(recheck_list, var))
+			/* pass the recheck */
+			plan->forbid_pre_detoast_vars = lappend(plan->forbid_pre_detoast_vars, var);
 	}
 }
 
 
-
 static void
-set_plan_toast_attrs_recurse(Plan *plan, List *existing_toast_attrs)
+set_plan_not_detoast_attrs_recurse(Plan *plan, List *recheck_list)
 {
 	if (plan == NULL)
 		return;
 
-	set_plan_toast_attrs(plan, existing_toast_attrs);
+	set_plan_not_pre_detoast_vars(plan, recheck_list);
 
-	/*
-	 * upper node, append, mergeappend, bitmapand, bitmapor, sort, groupby,
-	 * windowagg.
-	 */
-	if (IsA(plan, Sort) || IsA(plan, Memoize) || IsA(plan, Hash))
-		set_plan_toast_attrs_recurse(plan->lefttree, plan->lefttree->targetlist);
+	if (IsA(plan, Sort) || IsA(plan, Memoize) || IsA(plan, WindowAgg) ||
+		IsA(plan, Hash) || IsA(plan, Material) || IsA(plan, IncrementalSort))
+	{
+		List	   *subplan_exprs = get_tlist_exprs(plan->lefttree->targetlist, true);
+
+		set_plan_not_pre_detoast_vars(plan, subplan_exprs);
+		set_plan_not_detoast_attrs_recurse(plan->lefttree, subplan_exprs);
+	}
+	else if (IsA(plan, HashJoin) && castNode(HashJoin, plan)->left_small_tlist)
+	{
+		List	   *subplan_exprs = get_tlist_exprs(plan->lefttree->targetlist, true);
+
+		set_plan_not_detoast_attrs_recurse(plan->lefttree, subplan_exprs);
+		set_plan_not_detoast_attrs_recurse(plan->righttree, plan->forbid_pre_detoast_vars);
+	}
 	else
 	{
-		set_plan_toast_attrs_recurse(plan->lefttree, plan->toast_attrs);
-		set_plan_toast_attrs_recurse(plan->righttree, plan->toast_attrs);
+		set_plan_not_detoast_attrs_recurse(plan->lefttree, plan->forbid_pre_detoast_vars);
+		set_plan_not_detoast_attrs_recurse(plan->righttree, plan->forbid_pre_detoast_vars);
 	}
 }
-
 
 /*
  * create_plan_recurse
  *	  Recursive guts of create_plan().
  */
 static Plan *
-create_plan_recurse_old(PlannerInfo *root, Path *best_path, int flags)
+create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
 {
 	Plan	   *plan;
 
@@ -590,15 +611,6 @@ create_plan_recurse_old(PlannerInfo *root, Path *best_path, int flags)
 			break;
 	}
 
-	return plan;
-}
-
-static Plan *
-create_plan_recurse(PlannerInfo *root, Path *best_path, int flags)
-{
-	Plan	   *plan = create_plan_recurse_old(root, best_path, flags);
-
-	set_plan_toast_attrs_recurse(plan, NIL);
 	return plan;
 }
 
@@ -4936,6 +4948,9 @@ create_hashjoin_plan(PlannerInfo *root,
 							  best_path->jpath.inner_unique);
 
 	copy_generic_path_info(&join_plan->join.plan, &best_path->jpath.path);
+
+	join_plan->left_small_tlist = (best_path->num_batches > 1);
+	elog(INFO, "num_batches = %d", best_path->num_batches);
 
 	return join_plan;
 }
